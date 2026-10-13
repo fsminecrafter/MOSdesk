@@ -54,13 +54,48 @@ entries. Apps can set a 32×32 ARGB8888 icon for their own window with
 SDK README for the application API.
 
 Home opens the `0:/users/` folder and System opens the `0:/` filesystem root
-in the built-in File Browser. Navigate folders with a double-click (or one
-click when enabled), use the toolbar to jump Home/System, go up, or refresh,
-and open runnable `.run` files from the list. The Wallpapers action opens the
-bundled photo gallery; double-click a QOI image to apply it. The toolbar also
-selects fill, crop, or stretch and rotates the wallpaper 90 degrees per click.
-The Desktop section in MOSdesk Settings controls single-click opening and grid
-snapping.
+in the built-in Files window. Navigate folders with a double-click (or one
+click when enabled); the toolbar jumps Home/System, goes up, refreshes, and
+creates a folder. Entries are listed folders first, with an icon chosen from
+the file type, and the list scrolls with the mouse wheel.
+
+Right-click for actions:
+
+- a file or folder in Files: Open, Set as wallpaper (QOI images), Copy,
+  Rename, Delete;
+- the empty part of a folder: Paste, New folder, Refresh;
+- a desktop application icon: Open, Show in Files, Copy, Rename, Delete;
+- the desktop itself: Open Files, Change wallpaper, Settings, Refresh desktop.
+
+Rename and Delete ask for confirmation in a small dialog. MinimaFS has no
+rename call, so a rename is a copy followed by a delete. The folders the
+desktop is installed in (`0:/programs/mosWM`, `0:/programs/mosdesk`) and the
+top-level system folders cannot be renamed or deleted from the shell.
+
+Wallpapers are chosen in MOSdesk Settings > Appearance, which lists the six
+built-in Minimal-OS themes and the bundled photos, with fill, crop, stretch
+and rotate for photos. Double-clicking a QOI image in Files also applies it.
+Photo previews are small `.thm` files in `assets/wallpapers/thumbs/`,
+written by `mosWM/tools/generate_wallpapers.py` (`--thumbs-only` refreshes
+just those).
+
+## Rendering
+
+mosWM repaints the desktop layer (wallpaper and icons) and the composed scene
+only when something they show changes. The pointer is drawn as a small patch
+over the finished scene, so moving the mouse updates two small rectangles
+instead of the whole screen, and an idle desktop draws nothing at all.
+Applications help by presenting only when their content changes: every
+present makes the compositor rebuild the scene.
+
+Settings > Debug turns on two overlays in the top-right corner, refreshed
+once a second. The FPS meter shows main-loop frames per second and frame
+time, how often the pointer was redrawn, how many mouse-move events arrived,
+and how many full scene repaints happened. The profiler adds the average and
+peak time per frame spent in each stage of the loop (settings poll, Files
+window, window surfaces, input, cursor/hover/clock, scene draw, present,
+sleep). While either is on, the overlay itself causes one scene repaint a
+second.
 
 ## Window features
 

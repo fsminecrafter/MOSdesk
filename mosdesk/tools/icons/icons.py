@@ -434,9 +434,210 @@ def mouse():
     c.line([(32, 12), (32, 8), (36, 5), (44, 5)], '#6b8194', 1)
     return finish(c, '#2b3a46')
 
+
+def badge_plus(c, cx, cy):
+    c.ell(cx - 9, cy - 9, cx + 9, cy + 9, '#2f9e57')
+    c.ell(cx - 8, cy - 9, cx + 7, cy + 6, '#49c274')
+    c.rect(cx - 1, cy - 5, cx + 1, cy + 5, '#ffffff')
+    c.rect(cx - 5, cy - 1, cx + 5, cy + 1, '#ffffff')
+
+def newfolder():
+    c = folder()
+    badge_plus(c, 46, 45)
+    c.d.ellipse([36, 35, 56, 55], outline=hexc('#14522b'))
+    return c
+
+def trash():
+    c = Canvas()
+    # can body (tapered)
+    body = [(14, 20), (49, 20), (46, 58), (17, 58)]
+    bm = poly_mask(body)
+    c.vgrad(14, 20, 49, 58, ['#dfe7ec', '#cdd8df', '#b9c7d0', '#a3b3be', '#8d9eab'], bm)
+    for x in (23, 31, 39):
+        c.rect(x, 26, x + 2, 52, '#6f8290'); c.vline(x + 3, 26, 52, '#eef3f6')
+    c.line([(14, 20), (17, 58)], '#f4f8fa'); c.line([(49, 20), (46, 58)], '#73858f')
+    c.hline(18, 45, 58, '#5f717c')
+    # lid + handle
+    c.rrect(10, 13, 53, 20, 2, '#7d909d')
+    c.vgrad(10, 13, 53, 20, ['#b4c2cc', '#9aabb7', '#7f93a1'], rrect_mask(10, 13, 53, 20, 2))
+    c.hline(12, 51, 13, '#e3ebf0'); c.hline(11, 52, 20, '#566873')
+    c.rrect(25, 6, 38, 13, 2, '#7d909d'); c.rect(28, 9, 35, 13, '#00000000')
+    for y in range(9, 14):
+        for x in range(28, 36):
+            c.img.putpixel((x, y), (0, 0, 0, 0))
+    c.hline(26, 37, 6, '#c9d5dc')
+    return finish(c, '#26333d')
+
+def lock():
+    c = Canvas()
+    # shackle
+    for y in range(S):
+        for x in range(S):
+            d2 = (x - 31.5) ** 2 + (y - 22) ** 2
+            if 10.5 ** 2 <= d2 <= 15.5 ** 2 and y <= 22:
+                c.px(x, y, '#c9d5dc' if x < 30 else '#93a4af')
+    c.rect(16, 22, 20, 32, '#c9d5dc'); c.rect(43, 22, 47, 32, '#93a4af')
+    c.vline(17, 14, 31, '#f4f8fa')
+    # body
+    m = rrect_mask(10, 28, 53, 58, 5)
+    c.vgrad(10, 28, 53, 58, ['#ffe08a', '#fbd272', '#f5c055', '#eeae42', '#e39a33', '#d58828'], m)
+    c.hline(14, 49, 28, '#fff4c8'); c.vline(10, 33, 53, '#ffeaa8')
+    c.hline(14, 49, 58, '#a6641a'); c.vline(53, 33, 53, '#b97722')
+    c.dither(11, 30, 52, 31, '#ffe9a0', 0, m)
+    # keyhole
+    c.ell(27, 36, 36, 45, '#5a3a12'); c.poly([(29, 42), (34, 42), (36, 52), (27, 52)], '#5a3a12')
+    c.ell(29, 37, 32, 40, '#8a6126')
+    return finish(c, '#4a2f0f')
+
+def desktop():
+    c = Canvas()
+    c.rrect(4, 9, 59, 51, 4, '#46586a')
+    c.vgrad(4, 9, 59, 51, ['#6a7f93', '#566b7e', '#46586a', '#3b4b5a'], rrect_mask(4, 9, 59, 51, 4))
+    c.hline(7, 56, 9, '#9ab0c4')
+    sm = rrect_mask(8, 13, 55, 47, 1)
+    c.vgrad(8, 13, 55, 47, ['#2a76ad', '#256aa0', '#205c92', '#1b4f82', '#164171'], sm)
+    c.poly([(30, 47), (55, 20), (55, 28), (38, 47)], '#3a8fc4')
+    # icon grid
+    cols = ['#ffd45e', '#6ccf7a', '#ff8a73', '#c9a2f2', '#7fd6ff', '#f1f5f7']
+    k = 0
+    for gx in range(2):
+        for gy in range(3):
+            x = 12 + gx * 11; y = 16 + gy * 9
+            c.rect(x, y, x + 6, y + 5, cols[k]); c.hline(x, x + 6, y, lighten(cols[k], .5)); k += 1
+    c.rect(8, 43, 55, 47, '#151f29'); c.rect(10, 44, 13, 46, '#55a8dc'); c.rect(16, 44, 25, 46, '#4a5d6e')
+    c.rect(23, 52, 40, 54, '#8497a6'); c.rrect(17, 54, 46, 58, 2, '#a9b8c4'); c.hline(19, 44, 54, '#f2f6f9')
+    return finish(c, '#1c2833')
+
+def app():
+    c = Canvas()
+    m = rrect_mask(6, 6, 57, 57, 10)
+    c.vgrad(6, 6, 57, 57, ['#8f7bf2', '#7c68e6', '#6a56d6', '#5a47c2', '#4b3aab', '#3f3095'], m)
+    c.hline(13, 50, 6, '#c9bfff'); c.vline(6, 13, 50, '#a99bf7')
+    c.dither(7, 7, 56, 11, '#a08ef6', 0, m)
+    c.hline(13, 50, 57, '#2c2170'); c.vline(57, 13, 50, '#33287e')
+    # window glyph
+    c.rrect(15, 17, 48, 46, 3, '#ffffff')
+    c.rect(15, 17, 48, 24, '#dcd6ff'); c.rrect(15, 17, 48, 22, 3, '#dcd6ff')
+    for i, col in enumerate(['#ff6d66', '#ffc65a', '#57d28f']):
+        c.rect(18 + i * 5, 19, 20 + i * 5, 21, col)
+    c.rect(19, 28, 30, 30, '#8f7bf2'); c.rect(19, 33, 44, 34, '#b9c1cc'); c.rect(19, 37, 39, 38, '#b9c1cc')
+    c.rect(19, 41, 42, 42, '#b9c1cc')
+    c.hline(16, 47, 46, '#c8cdd6')
+    return finish(c, '#20174f')
+
+def edit():
+    c = Canvas()
+    # pencil pointing bottom-left
+    c.poly([(40, 8), (56, 24), (24, 56), (8, 40)], '#f2b04b')
+    c.poly([(40, 8), (45, 13), (13, 45), (8, 40)], '#ffd98a')
+    c.poly([(51, 19), (56, 24), (24, 56), (19, 51)], '#d58a2e')
+    c.poly([(44, 4), (60, 20), (56, 24), (40, 8)], '#e8667a')
+    c.poly([(44, 4), (48, 8), (44, 12), (40, 8)], '#ff97a8')
+    c.poly([(38, 10), (54, 26), (51, 29), (35, 13)], '#c6d0d8')
+    c.poly([(38, 10), (41, 13), (38, 16), (35, 13)], '#eef3f6')
+    c.poly([(8, 40), (24, 56), (5, 59)], '#f3dcb3')
+    c.poly([(5, 59), (12, 57), (7, 52)], '#34444f')
+    return finish(c, '#4a2f0f')
+
+def copy():
+    c = Canvas()
+    def sheet(x, y, top):
+        m = rrect_mask(x, y, x + 33, y + 41, 3)
+        c.rrect(x, y, x + 33, y + 41, 3, '#f1f5f7')
+        c.vgrad(x, y, x + 33, y + 41, ['#ffffff', '#f6f9fa', '#eaf0f3', '#dde6eb'], m)
+        c.hline(x + 3, x + 30, y + 41, '#b8c6cf'); c.vline(x + 33, y + 3, y + 38, '#c6d2d9')
+        if top:
+            c.rect(x + 6, y + 8, x + 20, y + 10, '#4f8fc7')
+            for i, w in enumerate([22, 18, 22, 14]):
+                c.rect(x + 6, y + 16 + i * 6, x + 6 + w, y + 17 + i * 6, '#8fa3b0')
+    sheet(8, 6, False)
+    for x in range(21, 56):
+        c.px(x, 15, '#34444f')
+    for y in range(15, 58):
+        c.px(20, y, '#34444f')
+    sheet(21, 16, True)
+    return finish(c, '#34444f')
+
+def paste():
+    c = Canvas()
+    m = rrect_mask(9, 10, 54, 58, 4)
+    c.vgrad(9, 10, 54, 58, ['#c99255', '#bb8448', '#ab753c', '#9a6631', '#895827'], m)
+    c.vline(9, 14, 54, '#e0b27a'); c.hline(13, 50, 58, '#5f3a16')
+    c.rrect(15, 17, 48, 53, 2, '#f6f9fa')
+    c.vgrad(15, 17, 48, 53, ['#ffffff', '#f4f7f9', '#e6edf1'], rrect_mask(15, 17, 48, 53, 2))
+    for i, w in enumerate([24, 20, 26, 16, 22]):
+        c.rect(19, 26 + i * 5, 19 + w, 27 + i * 5, '#8fa3b0')
+    # clip
+    c.rrect(22, 5, 41, 17, 3, '#8497a5')
+    c.vgrad(22, 5, 41, 17, ['#d4dee5', '#b7c5cf', '#93a5b2'], rrect_mask(22, 5, 41, 17, 3))
+    c.rect(27, 8, 36, 11, '#4f6272'); c.hline(24, 39, 5, '#f2f6f9'); c.hline(23, 40, 17, '#5f7384')
+    return finish(c, '#3d2410')
+
+def refresh():
+    c = Canvas()
+    m = ell_mask(5, 5, 58, 58)
+    c.vgrad(5, 5, 58, 58, ['#62bdf6', '#4aa8ec', '#3a95de', '#2c80cb', '#2169b0', '#1b5896'], m)
+    c.ell(10, 9, 22, 16, '#bfe6ff')
+    # ring arrow
+    for y in range(S):
+        for x in range(S):
+            dx, dy = x - 31.5, y - 31.5
+            d2 = dx * dx + dy * dy
+            if 11.5 ** 2 <= d2 <= 17.5 ** 2:
+                a = math.degrees(math.atan2(dy, dx)) % 360
+                if not (285 <= a <= 345) and not (105 <= a <= 165):
+                    c.px(x, y, '#ffffff')
+    c.poly([(40, 8), (52, 19), (37, 23)], '#ffffff')
+    c.poly([(23, 55), (11, 44), (26, 40)], '#ffffff')
+    return finish(c, '#0e3158')
+
+def up():
+    c = Canvas()
+    m = rrect_mask(6, 6, 57, 57, 10)
+    c.vgrad(6, 6, 57, 57, ['#7fdc9a', '#63cc84', '#4cb96f', '#3aa55c', '#2c8f4b', '#237a3e'], m)
+    c.hline(13, 50, 6, '#c4f3d2'); c.vline(6, 13, 50, '#9ae6b1')
+    c.hline(13, 50, 57, '#17592b'); c.vline(57, 13, 50, '#1b6432')
+    c.poly([(31, 13), (32, 13), (49, 31), (39, 31), (39, 49), (24, 49), (24, 31), (14, 31)], '#ffffff')
+    c.poly([(39, 31), (39, 49), (36, 49), (36, 31)], '#d5efdd')
+    c.hline(24, 39, 49, '#bfe3ca')
+    return finish(c, '#12451f')
+
+def info():
+    c = Canvas()
+    m = ell_mask(5, 5, 58, 58)
+    c.vgrad(5, 5, 58, 58, ['#62bdf6', '#4aa8ec', '#3a95de', '#2c80cb', '#2169b0', '#1b5896'], m)
+    c.ell(10, 9, 23, 17, '#bfe6ff'); c.ell(11, 10, 20, 15, '#ffffff')
+    c.ell(27, 14, 36, 23, '#ffffff')
+    c.rect(26, 27, 35, 46, '#ffffff'); c.rect(23, 27, 35, 31, '#ffffff'); c.rect(22, 45, 40, 49, '#ffffff')
+    c.vline(35, 28, 44, '#d3e9fb')
+    return finish(c, '#0e3158')
+
+def textfile():
+    c = Canvas(); paper_base(c)
+    c.rect(19, 24, 44, 28, '#4f6272'); c.rect(29, 28, 34, 50, '#4f6272')
+    c.rect(19, 28, 21, 31, '#4f6272'); c.rect(42, 28, 44, 31, '#4f6272'); c.rect(25, 50, 38, 52, '#4f6272')
+    c.hline(19, 44, 24, '#7d909c')
+    return finish(c, '#34444f')
+
+def terminal():
+    c = Canvas()
+    m = rrect_mask(5, 9, 58, 55, 4)
+    c.vgrad(5, 9, 58, 55, ['#22313f', '#1e2b38', '#1a2530', '#16202a'], m)
+    c.vgrad(5, 9, 58, 18, ['#6c859b', '#5b7389', '#4d6377'], rrect_mask(5, 9, 58, 18, 4))
+    c.rect(5, 15, 58, 18, '#4d6377'); c.hline(8, 55, 9, '#8ea6bb')
+    for i, col in enumerate(['#ff6d66', '#ffc65a', '#57d28f']):
+        c.ell(10 + i * 7, 11, 14 + i * 7, 15, col)
+    c.line([(13, 26), (24, 34), (13, 42)], '#57d28f', 4); c.line([(14, 27), (23, 34)], '#b4f2cf', 1)
+    c.rect(28, 41, 46, 44, '#e6edf1')
+    c.hline(6, 57, 55, '#0e1620')
+    return finish(c, '#0c141c')
+
 ICONS = [  # order == C enum order
     ('FOLDER', lambda: folder()), ('DRIVE', drive), ('DOCUMENT', document), ('PDF', pdf),
     ('IMAGE', image), ('AUDIO', audio), ('VIDEO', video), ('CODE', code), ('ARCHIVE', archive),
     ('SETTINGS', settings), ('NETWORK', network), ('POINTER', pointer),
     ('HOME', lambda: folder('home')), ('COMPUTER', computer), ('APPEARANCE', appearance), ('MOUSE', mouse),
+    ('TRASH', trash), ('LOCK', lock), ('DESKTOP', desktop), ('APP', app), ('EDIT', edit),
+    ('COPY', copy), ('PASTE', paste), ('REFRESH', refresh), ('UP', up), ('NEWFOLDER', newfolder),
+    ('INFO', info), ('TEXT', textfile), ('TERMINAL', terminal),
 ]

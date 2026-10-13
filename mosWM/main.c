@@ -61,6 +61,16 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define AUTH_FIRST_PASSWORD 2u
 #define AUTH_LOGIN 3u
 #define AUTH_PASSWORD_MAX 63u
+#define BROWSER_HEADER_HEIGHT 50u
+#define BROWSER_FOOTER_HEIGHT 26u
+#define BROWSER_TOOL_COUNT 5u
+#define CURSOR_PATCH_SIZE (CURSOR_MAX_SIZE * 2u)
+#define MENU_MAX_ITEMS 8u
+#define MENU_WIDTH 204
+#define MENU_ITEM_HEIGHT 30
+#define START_MENU_MAX_ROWS 9u
+#define FILE_TREE_MAX_DEPTH 6u
+#define FILE_COPY_CHUNK (64u * 1024u)
 
 #ifndef SYSCALL_CURSOR_COUNT
 /* This SDK does not expose per-window cursor state; keep the shell cursor local. */
@@ -91,6 +101,8 @@ typedef struct {
     uint32_t saved_height;
     bool icon_checked;
     bool has_icon;
+    bool announced;
+    uint32_t icon_sum;
     uint32_t icon_pixels[SYSCALL_WINDOW_ICON_PIXELS];
 } cached_window_t;
 
@@ -108,6 +120,46 @@ typedef enum {
     CLICK_ACTION_APPLICATION,
     CLICK_ACTION_BROWSER_ENTRY
 } click_action_t;
+
+typedef enum {
+    MENU_ACTION_NONE,
+    MENU_ACTION_OPEN,
+    MENU_ACTION_SHOW_IN_FILES,
+    MENU_ACTION_SET_WALLPAPER,
+    MENU_ACTION_COPY,
+    MENU_ACTION_PASTE,
+    MENU_ACTION_RENAME,
+    MENU_ACTION_DELETE,
+    MENU_ACTION_NEW_FOLDER,
+    MENU_ACTION_REFRESH,
+    MENU_ACTION_FILES,
+    MENU_ACTION_WALLPAPERS,
+    MENU_ACTION_SETTINGS
+} menu_action_t;
+
+typedef struct {
+    menu_action_t action;
+    const char* label;
+    moswm_file_icon_t icon;
+    bool separator_before;
+    bool enabled;
+} menu_item_t;
+
+typedef enum {
+    DIALOG_NONE,
+    DIALOG_RENAME,
+    DIALOG_NEW_FOLDER,
+    DIALOG_DELETE
+} dialog_kind_t;
+
+typedef struct {
+    bool valid;
+    uint32_t width;
+    uint32_t height;
+    uint32_t hotspot_x;
+    uint32_t hotspot_y;
+    uint32_t pixels[CURSOR_MAX_SIZE * CURSOR_MAX_SIZE];
+} cached_cursor_t;
 
 static syscall_graphics_info_t display;
 static uint32_t* canvas;
@@ -188,6 +240,91 @@ static uint32_t* wallpaper_source;
 static uint32_t wallpaper_source_width;
 static uint32_t wallpaper_source_height;
 
+/* Compositor caches: the desktop (wallpaper + icons) and the finished scene
+ * are only repainted when something they show changes; the pointer is drawn
+ * as a small patch on top, so moving the mouse costs almost nothing. */
+static uint32_t* desktop_layer;
+static uint64_t desktop_layer_signature;
+static uint32_t wallpaper_generation;
+static uint32_t desktop_apps_generation;
+static uint64_t scene_signature;
+static bool scene_valid;
+static uint32_t cursor_patch[CURSOR_PATCH_SIZE * CURSOR_PATCH_SIZE];
+static bool cursor_drawn;
+static int32_t cursor_drawn_x;
+static int32_t cursor_drawn_y;
+static int32_t cursor_drawn_width;
+static int32_t cursor_drawn_height;
+static uint64_t cursor_drawn_signature;
+static cached_cursor_t cursor_cache[SYSCALL_CURSOR_COUNT];
+static char cursor_cache_pack[SYSCALL_CURSOR_PACK_PATH_SIZE];
+static uint32_t hover_desktop_icon = UINT32_MAX;
+static uint32_t hover_taskbar = UINT32_MAX;
+static uint32_t hover_start_row = UINT32_MAX;
+
+/* Debug overlay (Settings > Debug): a frame-rate meter and a per-stage
+ * stopwatch for the main loop. Nothing is counted or timed while both are
+ * off, and the figures on screen change once a second, so showing them costs
+ * one scene repaint a second. */
+typedef enum {
+    PROFILE_SETTINGS,
+    PROFILE_FILES,
+    PROFILE_WINDOWS,
+    PROFILE_INPUT,
+    PROFILE_POINTER,
+    PROFILE_DRAW,
+    PROFILE_PRESENT,
+    PROFILE_SLEEP,
+    PROFILE_STAGES
+} profile_stage_t;
+
+typedef struct {
+    bool valid;
+    uint32_t fps_tenths;
+    uint32_t frame_us;
+    uint32_t pointer_per_second;
+    uint32_t mouse_per_second;
+    uint32_t repaints_per_second;
+    uint32_t average_us[PROFILE_STAGES];
+    uint32_t peak_us[PROFILE_STAGES];
+} debug_report_t;
+
+static bool debug_fps;
+static bool debug_profiler;
+static bool debug_window_open;
+static uint64_t debug_window_start_ms;
+static uint64_t debug_window_start_ticks;
+static uint64_t debug_lap_ticks;
+static uint64_t debug_stage_ticks[PROFILE_STAGES];
+static uint64_t debug_stage_peak[PROFILE_STAGES];
+static uint32_t debug_frames;
+static uint32_t debug_pointer_draws;
+static uint32_t debug_mouse_events;
+static uint32_t debug_repaints;
+static debug_report_t debug_report;
+static uint32_t debug_generation;
+
+/* Right-click menu, the small dialogs it opens, and the file clipboard. */
+static menu_item_t menu_items[MENU_MAX_ITEMS];
+static uint32_t menu_item_count;
+static bool menu_open;
+static int32_t menu_x;
+static int32_t menu_y;
+static uint32_t menu_hover = UINT32_MAX;
+static click_action_t menu_target;
+static char menu_path[BROWSER_PATH_SIZE];
+static dialog_kind_t dialog_kind;
+static char dialog_path[BROWSER_PATH_SIZE];
+static char dialog_text[SYSCALL_DIRENT_NAME_SIZE];
+static uint32_t dialog_length;
+static char dialog_error[56];
+static char clipboard_path[BROWSER_PATH_SIZE];
+static uint32_t browser_generation;
+static uint32_t browser_hover = UINT32_MAX;
+static uint32_t browser_tool_hover = UINT32_MAX;
+static uint64_t browser_drawn_signature;
+static bool browser_message_is_error;
+
 static uint8_t* wm_read_file(const char* path, size_t max_size, size_t* size);
 static void paint_wallpaper(uint32_t* target);
 static void load_wallpaper_image(const char* path);
@@ -203,6 +340,35 @@ static cached_window_t* cache_for(uint32_t id);
 static bool set_window_mode(const syscall_window_info_t* info,
                             cached_window_t* entry, uint32_t mode);
 static void post_simple_event(uint32_t id, uint32_t type);
+static void fill_rounded_rect(int32_t x, int32_t y, int32_t width,
+                              int32_t height, uint32_t radius,
+                              uint32_t color);
+static void fill_rect(int32_t x, int32_t y, int32_t width, int32_t height,
+                      uint32_t color);
+static void reload_desktop_apps(void);
+static void open_settings(const char* page);
+
+static void copy_pixels(uint32_t* destination, const uint32_t* source,
+                        size_t count) {
+    __asm__ volatile("rep movsl"
+                     : "+D"(destination), "+S"(source), "+c"(count)
+                     : : "memory");
+}
+
+static uint64_t hash_bytes(uint64_t hash, const void* data, size_t size) {
+    const uint8_t* bytes = (const uint8_t*)data;
+    for (size_t i = 0; i < size; i++)
+        hash = (hash ^ bytes[i]) * 0x100000001B3ull;
+    return hash;
+}
+
+static uint64_t hash_u64(uint64_t hash, uint64_t value) {
+    return hash_bytes(hash, &value, sizeof(value));
+}
+
+static uint64_t hash_text(uint64_t hash, const char* text) {
+    return hash_bytes(hash, text, strlen(text) + 1u);
+}
 
 static void* wm_malloc(size_t size) {
     uint64_t result = mos_syscall3(SYS_HEAP, SYS_HEAP_ALLOC, 0, size);
@@ -236,6 +402,8 @@ static void load_desktop_settings(void) {
     wallpaper_style = settings.wallpaper;
     wallpaper_mode = settings.wallpaper_mode;
     wallpaper_rotation = settings.wallpaper_rotation;
+    debug_fps = settings.debug_fps != 0u;
+    debug_profiler = settings.debug_profiler != 0u;
 }
 
 static uint16_t read_u16le(const uint8_t* bytes) {
@@ -507,6 +675,28 @@ static void ensure_cursor_loaded(const moswm_cursor_state_t* cursor_state,
         !strcmp(cached_cursor_pack, requested_pack))
         return;
 
+    /* Shapes from the system pack are decoded once and kept, so crossing a
+     * title bar does not read a cursor file from disk every time. */
+    bool system_shape = !strcmp(requested_pack, system_pack);
+    if (strcmp(cursor_cache_pack, system_pack)) {
+        memset(cursor_cache, 0, sizeof(cursor_cache));
+        strcpy(cursor_cache_pack, system_pack);
+    }
+    if (system_shape && cursor_cache[status].valid) {
+        wm_free(cursor_animation_pixels);
+        cursor_animation_pixels = NULL;
+        cursor_animation_frame_count = 0;
+        memcpy(cursor_pixels, cursor_cache[status].pixels,
+               sizeof(cursor_pixels));
+        cursor_width = cursor_cache[status].width;
+        cursor_height = cursor_cache[status].height;
+        cursor_hotspot_x = cursor_cache[status].hotspot_x;
+        cursor_hotspot_y = cursor_cache[status].hotspot_y;
+        cached_cursor_status = status;
+        strcpy(cached_cursor_pack, requested_pack);
+        return;
+    }
+
     bool loaded = try_cursor_from_pack(requested_pack, status);
     if (!loaded && strcmp(requested_pack, system_pack)) {
         strcpy(status_message, "Cursor pack could not be loaded");
@@ -518,6 +708,15 @@ static void ensure_cursor_loaded(const moswm_cursor_state_t* cursor_state,
         cursor_width = 0;
         cursor_height = 0;
         strcpy(status_message, "Cursor resource could not be loaded");
+    }
+    if (loaded && system_shape && !cursor_animation_pixels) {
+        cached_cursor_t* slot = &cursor_cache[status];
+        memcpy(slot->pixels, cursor_pixels, sizeof(slot->pixels));
+        slot->width = cursor_width;
+        slot->height = cursor_height;
+        slot->hotspot_x = cursor_hotspot_x;
+        slot->hotspot_y = cursor_hotspot_y;
+        slot->valid = true;
     }
     strcpy(cached_cursor_pack, requested_pack);
     cached_cursor_status = status;
@@ -654,10 +853,12 @@ static void load_wallpaper_image(const char* path) {
                 }
             }
         }
+        /* QOI's running index is keyed on RGBA; the canvas wants ARGB. */
         uint32_t pixel = (uint32_t)red << 24u |
                          (uint32_t)green << 16u |
                          (uint32_t)blue << 8u | alpha;
-        pixels[output++] = pixel;
+        pixels[output++] = 0xFF000000u | (uint32_t)red << 16u |
+                           (uint32_t)green << 8u | blue;
         uint32_t slot = (red * 3u + green * 5u + blue * 7u +
                          alpha * 11u) % 64u;
         index[slot] = pixel;
@@ -1032,8 +1233,16 @@ static void fill_rect(int32_t x, int32_t y, int32_t width, int32_t height,
     if (y < 0) y = 0;
     if (right > display.width) right = display.width;
     if (bottom > display.height) bottom = display.height;
+    uint32_t alpha = color >> 24;
+    if (!alpha || right <= x) return;
     for (int32_t py = y; py < bottom; py++) {
-        for (int32_t px = x; px < right; px++) put_pixel(px, py, color);
+        uint32_t* row = canvas + (size_t)py * display.width;
+        if (alpha == 255u) {
+            for (int32_t px = x; px < right; px++) row[px] = color;
+        } else {
+            for (int32_t px = x; px < right; px++)
+                row[px] = alpha_blend(color, row[px]);
+        }
     }
 }
 
@@ -1124,15 +1333,289 @@ static void fit_text_px(char* dst, size_t dst_size, const char* src,
     }
 }
 
+/* ------------------------------------------------------------ file helpers */
+
+static const char* path_name(const char* path) {
+    const char* name = path;
+    for (const char* cursor = path; *cursor; cursor++)
+        if (*cursor == '/' && cursor[1]) name = cursor + 1;
+    return name;
+}
+
+static bool path_parent(char* output, size_t capacity, const char* path) {
+    size_t length = (size_t)(path_name(path) - path);
+    if (length < 3u || length >= capacity) return false;
+    memcpy(output, path, length);
+    if (length > 3u) length--;          /* keep the slash of "0:/" only */
+    output[length] = '\0';
+    return true;
+}
+
+static bool path_has_prefix(const char* path, const char* prefix) {
+    size_t length = strlen(prefix);
+    return !strncmp(path, prefix, length) &&
+           (path[length] == '\0' || path[length] == '/');
+}
+
+static bool name_has_extension(const char* name, const char* extension) {
+    size_t name_length = strlen(name);
+    size_t extension_length = strlen(extension);
+    return name_length > extension_length &&
+           !strcmp(name + name_length - extension_length, extension);
+}
+
+/* The desktop itself, and the folders it is installed in, cannot be renamed
+ * or deleted from the shell: that would leave the system unbootable. */
+static bool path_is_protected(const char* path) {
+    static const char* const exact[] = {
+        "0:/", "0:/programs", "0:/services", MOSDESK_USERS_PATH
+    };
+    for (uint32_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++)
+        if (!strcmp(path, exact[i])) return true;
+    return path_has_prefix(path, "0:/programs/mosWM") ||
+           path_has_prefix(path, "0:/programs/mosdesk") ||
+           path_has_prefix(path, "0:/services/mosWM.service");
+}
+
+static bool fs_exists(const char* path) {
+    return mos_syscall3(SYS_EXISTS, (uint64_t)(uintptr_t)path, 0, 0) == 1u;
+}
+
+static bool fs_is_directory(const char* path) {
+    return mos_syscall3(SYS_IS_DIR, (uint64_t)(uintptr_t)path, 0, 0) == 1u;
+}
+
+static bool fs_copy_file(const char* source, const char* target) {
+    syscall_file_metadata_t metadata;
+    memset(&metadata, 0, sizeof(metadata));
+    bool has_metadata = mos_syscall3(SYS_GET_METADATA,
+        (uint64_t)(uintptr_t)source, (uint64_t)(uintptr_t)&metadata, 0) ==
+        SYS_SUCCESS;
+    long input = (long)mos_syscall3(SYS_OPEN, (uint64_t)(uintptr_t)source,
+                                    SYS_O_RDONLY, 0);
+    if (input < 0) return false;
+    long remaining = (long)mos_syscall3(SYS_SIZE, (uint64_t)input, 0, 0);
+    uint8_t* chunk = (uint8_t*)wm_malloc(FILE_COPY_CHUNK);
+    long output = -1;
+    bool ok = remaining >= 0 && chunk &&
+        mos_syscall3(SYS_CREATE, (uint64_t)(uintptr_t)target,
+            (uint64_t)(uintptr_t)(has_metadata && metadata.filetype[0]
+                ? metadata.filetype : "binary"),
+            (uint64_t)(uintptr_t)(has_metadata && metadata.fileformat[0]
+                ? metadata.fileformat : "bin")) == SYS_SUCCESS;
+    if (ok) {
+        output = (long)mos_syscall3(SYS_OPEN, (uint64_t)(uintptr_t)target,
+                                    SYS_O_RDWR, 0);
+        ok = output >= 0;
+    }
+    while (ok && remaining > 0) {
+        size_t want = (size_t)remaining > FILE_COPY_CHUNK
+            ? FILE_COPY_CHUNK : (size_t)remaining;
+        long got = (long)mos_syscall3(SYS_READ, (uint64_t)input,
+            (uint64_t)(uintptr_t)chunk, want);
+        if (got <= 0 ||
+            (long)mos_syscall3(SYS_FWRITE, (uint64_t)output,
+                (uint64_t)(uintptr_t)chunk, (uint64_t)got) != got) {
+            ok = false;
+            break;
+        }
+        remaining -= got;
+    }
+    if (output >= 0) mos_syscall3(SYS_CLOSE, (uint64_t)output, 0, 0);
+    mos_syscall3(SYS_CLOSE, (uint64_t)input, 0, 0);
+    wm_free(chunk);
+    if (!ok && output >= 0)
+        mos_syscall3(SYS_DELETE, (uint64_t)(uintptr_t)target, 0, 0);
+    return ok;
+}
+
+/* Directory listings live on the heap: the user stack is only 64 KiB. */
+static syscall_dirent_t* fs_list(const char* path, uint32_t* count) {
+    syscall_dirent_t* entries = (syscall_dirent_t*)wm_malloc(
+        sizeof(syscall_dirent_t) * DESKTOP_DIR_ENTRIES);
+    *count = 0;
+    if (!entries) return NULL;
+    uint64_t result = mos_syscall3(SYS_LISTDIR, (uint64_t)(uintptr_t)path,
+        (uint64_t)(uintptr_t)entries, DESKTOP_DIR_ENTRIES);
+    if ((int64_t)result < 0) {
+        wm_free(entries);
+        return NULL;
+    }
+    *count = result > DESKTOP_DIR_ENTRIES
+        ? DESKTOP_DIR_ENTRIES : (uint32_t)result;
+    return entries;
+}
+
+static bool fs_delete_tree(const char* path, uint32_t depth) {
+    if (!fs_is_directory(path))
+        return mos_syscall3(SYS_DELETE, (uint64_t)(uintptr_t)path, 0, 0) ==
+               SYS_SUCCESS;
+    if (depth >= FILE_TREE_MAX_DEPTH) return false;
+    uint32_t count;
+    syscall_dirent_t* entries = fs_list(path, &count);
+    if (!entries) return false;
+    bool ok = true;
+    for (uint32_t i = 0; i < count && ok; i++) {
+        char child[BROWSER_PATH_SIZE];
+        ok = path_join(child, sizeof(child), path, entries[i].name) &&
+             fs_delete_tree(child, depth + 1u);
+    }
+    wm_free(entries);
+    return ok && mos_syscall3(SYS_RMDIR, (uint64_t)(uintptr_t)path, 0, 0) ==
+                 SYS_SUCCESS;
+}
+
+static bool fs_copy_tree(const char* source, const char* target,
+                         uint32_t depth) {
+    if (!fs_is_directory(source)) return fs_copy_file(source, target);
+    if (depth >= FILE_TREE_MAX_DEPTH || path_has_prefix(target, source) ||
+        mos_syscall3(SYS_MKDIR, (uint64_t)(uintptr_t)target, 0, 0) !=
+            SYS_SUCCESS)
+        return false;
+    uint32_t count;
+    syscall_dirent_t* entries = fs_list(source, &count);
+    if (!entries) return false;
+    bool ok = true;
+    for (uint32_t i = 0; i < count && ok; i++) {
+        char from[BROWSER_PATH_SIZE];
+        char to[BROWSER_PATH_SIZE];
+        ok = path_join(from, sizeof(from), source, entries[i].name) &&
+             path_join(to, sizeof(to), target, entries[i].name) &&
+             fs_copy_tree(from, to, depth + 1u);
+    }
+    wm_free(entries);
+    return ok;
+}
+
+/* MinimaFS has no rename call, so a rename is a copy followed by a delete. */
+static bool fs_rename(const char* source, const char* target) {
+    if (!fs_copy_tree(source, target, 0)) {
+        if (fs_exists(target)) fs_delete_tree(target, 0);
+        return false;
+    }
+    return fs_delete_tree(source, 0);
+}
+
+/* "notes.txt" -> "notes copy.txt", then "notes copy 2.txt" ... */
+static bool unique_copy_path(char* output, size_t capacity,
+                             const char* directory, const char* name) {
+    if (path_join(output, capacity, directory, name) && !fs_exists(output))
+        return true;
+    size_t length = strlen(name);
+    size_t stem = length;
+    for (size_t i = length; i > 1u; i--) {
+        if (name[i - 1u] == '.') {
+            stem = i - 1u;
+            break;
+        }
+    }
+    for (uint32_t attempt = 1u; attempt <= 9u; attempt++) {
+        char candidate[SYSCALL_DIRENT_NAME_SIZE];
+        size_t used = 0;
+        if (stem + 8u + (length - stem) >= sizeof(candidate)) return false;
+        memcpy(candidate, name, stem);
+        used = stem;
+        memcpy(candidate + used, " copy", 5u);
+        used += 5u;
+        if (attempt > 1u) {
+            candidate[used++] = ' ';
+            candidate[used++] = (char)('0' + attempt);
+        }
+        memcpy(candidate + used, name + stem, length - stem + 1u);
+        if (path_join(output, capacity, directory, candidate) &&
+            !fs_exists(output))
+            return true;
+    }
+    return false;
+}
+
+static moswm_file_icon_t icon_for_entry(uint32_t type, const char* name) {
+    static const struct {
+        const char* extension;
+        moswm_file_icon_t icon;
+    } known[] = {
+        {".run", MOSWM_ICON_APP}, {".qoi", MOSWM_ICON_IMAGE},
+        {".bmp", MOSWM_ICON_IMAGE}, {".png", MOSWM_ICON_IMAGE},
+        {".jpg", MOSWM_ICON_IMAGE}, {".ico", MOSWM_ICON_IMAGE},
+        {".thm", MOSWM_ICON_IMAGE}, {".wav", MOSWM_ICON_AUDIO},
+        {".mp3", MOSWM_ICON_AUDIO}, {".mp4", MOSWM_ICON_VIDEO},
+        {".txt", MOSWM_ICON_TEXT}, {".md", MOSWM_ICON_TEXT},
+        {".log", MOSWM_ICON_TEXT}, {".otf", MOSWM_ICON_TEXT},
+        {".ttf", MOSWM_ICON_TEXT}, {".font", MOSWM_ICON_TEXT},
+        {".pdf", MOSWM_ICON_PDF}, {".mpkg", MOSWM_ICON_ARCHIVE},
+        {".pkg", MOSWM_ICON_ARCHIVE}, {".zip", MOSWM_ICON_ARCHIVE},
+        {".slib", MOSWM_ICON_ARCHIVE}, {".c", MOSWM_ICON_CODE},
+        {".h", MOSWM_ICON_CODE}, {".sh", MOSWM_ICON_TERMINAL},
+        {".py", MOSWM_ICON_CODE}, {".service", MOSWM_ICON_SETTINGS},
+        {".cfg", MOSWM_ICON_SETTINGS}, {".dat", MOSWM_ICON_SETTINGS},
+        {".conf", MOSWM_ICON_SETTINGS},
+        {".desc", MOSWM_ICON_SETTINGS}, {".cur", MOSWM_ICON_POINTER},
+        {".ani", MOSWM_ICON_POINTER}
+    };
+    if (type == SYSCALL_DIRENT_TYPE_DIR) return MOSWM_ICON_FOLDER;
+    for (uint32_t i = 0; i < sizeof(known) / sizeof(known[0]); i++)
+        if (name_has_extension(name, known[i].extension))
+            return known[i].icon;
+    return type == SYSCALL_DIRENT_TYPE_EXECUTABLE
+        ? MOSWM_ICON_APP : MOSWM_ICON_DOCUMENT;
+}
+
+static const char* kind_for_icon(moswm_file_icon_t icon) {
+    switch (icon) {
+        case MOSWM_ICON_FOLDER: return "Folder";
+        case MOSWM_ICON_APP: return "Application";
+        case MOSWM_ICON_IMAGE: return "Image";
+        case MOSWM_ICON_AUDIO: return "Audio";
+        case MOSWM_ICON_VIDEO: return "Video";
+        case MOSWM_ICON_TEXT: return "Text";
+        case MOSWM_ICON_PDF: return "PDF";
+        case MOSWM_ICON_ARCHIVE: return "Package";
+        case MOSWM_ICON_CODE: return "Source";
+        case MOSWM_ICON_TERMINAL: return "Script";
+        case MOSWM_ICON_SETTINGS: return "Settings";
+        case MOSWM_ICON_POINTER: return "Cursor";
+        default: return "File";
+    }
+}
+
+/* ------------------------------------------------------------ File Browser */
+
+static void browser_note(const char* message, bool is_error) {
+    size_t length = strlen(message);
+    if (length >= sizeof(browser_message))
+        length = sizeof(browser_message) - 1u;
+    memcpy(browser_message, message, length);
+    browser_message[length] = '\0';
+    browser_message_is_error = is_error;
+    browser_generation++;
+}
+
+static uint32_t browser_visible_rows(uint32_t height) {
+    return height > BROWSER_HEADER_HEIGHT + BROWSER_FOOTER_HEIGHT
+        ? (height - BROWSER_HEADER_HEIGHT - BROWSER_FOOTER_HEIGHT) /
+              BROWSER_ROW_HEIGHT
+        : 0u;
+}
+
+static int compare_names(const char* a, const char* b) {
+    for (;; a++, b++) {
+        char ca = *a >= 'A' && *a <= 'Z' ? (char)(*a + 32) : *a;
+        char cb = *b >= 'A' && *b <= 'Z' ? (char)(*b + 32) : *b;
+        if (ca != cb) return ca < cb ? -1 : 1;
+        if (!ca) return 0;
+    }
+}
+
 static void browser_refresh_directory(void) {
     browser_entry_count = 0;
     browser_selected = UINT32_MAX;
     browser_scroll = 0;
+    browser_generation++;
     uint64_t result = mos_syscall3(SYS_LISTDIR,
         (uint64_t)(uintptr_t)browser_path,
         (uint64_t)(uintptr_t)browser_entries, BROWSER_MAX_ENTRIES);
     if ((int64_t)result < 0) {
-        strcpy(browser_message, "Unable to list this folder");
+        browser_note("Unable to list this folder", true);
         return;
     }
     uint32_t count = result > BROWSER_MAX_ENTRIES
@@ -1143,7 +1626,34 @@ static void browser_refresh_directory(void) {
             browser_entries[browser_entry_count] = browser_entries[i];
         browser_entry_count++;
     }
+    /* Folders first, then by name. */
+    for (uint32_t i = 1; i < browser_entry_count; i++) {
+        syscall_dirent_t moving = browser_entries[i];
+        bool moving_dir = moving.type == SYSCALL_DIRENT_TYPE_DIR;
+        uint32_t slot = i;
+        while (slot > 0) {
+            const syscall_dirent_t* before = &browser_entries[slot - 1u];
+            bool before_dir = before->type == SYSCALL_DIRENT_TYPE_DIR;
+            if (before_dir != moving_dir ? before_dir
+                    : compare_names(before->name, moving.name) <= 0)
+                break;
+            browser_entries[slot] = *before;
+            slot--;
+        }
+        browser_entries[slot] = moving;
+    }
     browser_message[0] = '\0';
+}
+
+static void browser_select_name(const char* name) {
+    for (uint32_t i = 0; i < browser_entry_count; i++) {
+        if (strcmp(browser_entries[i].name, name)) continue;
+        browser_selected = i;
+        uint32_t rows = browser_visible_rows(browser_height);
+        if (rows && i >= rows) browser_scroll = i - rows + 1u;
+        break;
+    }
+    browser_generation++;
 }
 
 static void browser_close(void) {
@@ -1155,61 +1665,28 @@ static void browser_close(void) {
     browser_height = 0;
     browser_entry_count = 0;
     browser_selected = UINT32_MAX;
+    browser_drawn_signature = 0;
     last_click_valid = false;
 }
 
-static bool browser_save_wallpaper_settings(const mosdesk_settings_t* next) {
-    if (!mosdesk_settings_save(next)) {
-        strcpy(browser_message, "Unable to save wallpaper settings");
-        return false;
+static void set_wallpaper_image(const char* path) {
+    if (strlen(path) >= MOSDESK_WALLPAPER_PATH_SIZE) {
+        browser_note("Wallpaper path is too long", true);
+        return;
     }
-    desktop_settings = *next;
-    wallpaper_style = next->wallpaper;
-    wallpaper_mode = next->wallpaper_mode;
-    wallpaper_rotation = next->wallpaper_rotation;
+    mosdesk_settings_t next = desktop_settings;
+    memset(next.wallpaper_path, 0, sizeof(next.wallpaper_path));
+    memcpy(next.wallpaper_path, path, strlen(path));
+    if (!mosdesk_settings_save(&next)) {
+        browser_note("Unable to save wallpaper settings", true);
+        return;
+    }
+    desktop_settings = next;
+    load_wallpaper_image(desktop_settings.wallpaper_path);
     painted_wallpaper_style = UINT32_MAX;
-    strcpy(browser_message, "Wallpaper settings saved");
-    return true;
-}
-
-static void browser_use_selected_wallpaper(void) {
-    if (browser_selected >= browser_entry_count ||
-        browser_entries[browser_selected].type != SYSCALL_DIRENT_TYPE_FILE) {
-        strcpy(browser_message, "Select an image first");
-        return;
-    }
-    const char* name = browser_entries[browser_selected].name;
-    size_t length = strlen(name);
-    if (length < 5u || strcmp(name + length - 4u, ".qoi")) {
-        strcpy(browser_message, "Select a QOI wallpaper image");
-        return;
-    }
-    char path[MOSDESK_WALLPAPER_PATH_SIZE];
-    if (!path_join(path, sizeof(path), browser_path, name)) {
-        strcpy(browser_message, "Wallpaper path is too long");
-        return;
-    }
-    mosdesk_settings_t next = desktop_settings;
-    memcpy(next.wallpaper_path, path, strlen(path) + 1u);
-    if (browser_save_wallpaper_settings(&next) &&
-        desktop_settings.wallpaper_path[0]) {
-        load_wallpaper_image(desktop_settings.wallpaper_path);
-        if (!wallpaper_source)
-            strcpy(browser_message, "Wallpaper image could not be loaded");
-    }
-}
-
-static void browser_set_wallpaper_option(uint32_t option) {
-    mosdesk_settings_t next = desktop_settings;
-    if (option == 0u)
-        next.wallpaper_mode = MOSDESK_WALLPAPER_FILL;
-    else if (option == 1u)
-        next.wallpaper_mode = MOSDESK_WALLPAPER_CROP;
-    else if (option == 2u)
-        next.wallpaper_mode = MOSDESK_WALLPAPER_STRETCH;
-    else
-        next.wallpaper_rotation++;
-    browser_save_wallpaper_settings(&next);
+    browser_note(wallpaper_source ? "Wallpaper changed"
+                                  : "Wallpaper image could not be loaded",
+                 !wallpaper_source);
 }
 
 static void browser_open(const char* path) {
@@ -1229,18 +1706,19 @@ static void browser_open(const char* path) {
         uint32_t x = (display.width - width) / 2u;
         uint32_t y = (display.height - TASKBAR_HEIGHT - height) / 2u;
         browser_window_id = mos_window_create(0, x, y, width, height,
-                                               "File Browser");
+                                               "Files");
         if (!browser_window_id) {
-            strcpy(status_message, "Unable to open File Browser");
+            strcpy(status_message, "Unable to open Files");
             return;
         }
         browser_width = width;
         browser_height = height;
+        browser_drawn_signature = 0;
         browser_pixels = (uint32_t*)wm_malloc(
             (size_t)width * height * sizeof(uint32_t));
         if (!browser_pixels) {
             browser_close();
-            strcpy(status_message, "Unable to allocate File Browser");
+            strcpy(status_message, "Unable to allocate Files");
             return;
         }
         syscall_window_style_t style = {
@@ -1258,7 +1736,7 @@ static void browser_open(const char* path) {
         if (mos_window_set_resizable(browser_window_id, true) != SYS_SUCCESS ||
             mos_window_set_style(browser_window_id, style) != SYS_SUCCESS) {
             browser_close();
-            strcpy(status_message, "Unable to configure File Browser");
+            strcpy(status_message, "Unable to configure Files");
             return;
         }
     }
@@ -1272,29 +1750,50 @@ static void browser_open(const char* path) {
         }
         focus_window(&info);
     } else {
-        strcpy(status_message, "Unable to focus File Browser");
+        strcpy(status_message, "Unable to focus Files");
     }
 }
 
 static void browser_go_up(void) {
     if (!strcmp(browser_path, "0:/")) return;
-    size_t length = strlen(browser_path);
-    while (length > 3u && browser_path[length - 1u] == '/')
-        browser_path[--length] = '\0';
-    while (length > 3u && browser_path[length - 1u] != '/') length--;
-    if (length <= 3u) {
-        strcpy(browser_path, "0:/");
-    } else {
-        browser_path[length - 1u] = '\0';
-    }
+    char previous[SYSCALL_DIRENT_NAME_SIZE];
+    const char* name = path_name(browser_path);
+    size_t name_length = strlen(name);
+    if (name_length >= sizeof(previous)) name_length = sizeof(previous) - 1u;
+    memcpy(previous, name, name_length);
+    previous[name_length] = '\0';
+    char parent[BROWSER_PATH_SIZE];
+    if (!path_parent(parent, sizeof(parent), browser_path))
+        strcpy(parent, "0:/");
+    strcpy(browser_path, parent);
     browser_refresh_directory();
+    browser_select_name(previous);
 }
 
+static void format_count(char* output, uint32_t count, const char* noun) {
+    char digits[12];
+    uint32_t length = 0;
+    do {
+        digits[length++] = (char)('0' + count % 10u);
+        count /= 10u;
+    } while (count);
+    uint32_t used = 0;
+    while (length) output[used++] = digits[--length];
+    output[used++] = ' ';
+    while (*noun) output[used++] = *noun++;
+    output[used] = '\0';
+}
+
+static int32_t browser_tool_x(uint32_t index) {
+    return 8 + (int32_t)index * 36;
+}
+
+/* Repaints the Files window only when something it shows has changed. */
 static void browser_render(void) {
     if (!browser_window_id || !browser_pixels) return;
     syscall_window_info_t info;
     if (mos_window_get_info(browser_window_id, &info) != SYS_SUCCESS) {
-        strcpy(status_message, "File Browser window is unavailable");
+        strcpy(status_message, "Files window is unavailable");
         browser_close();
         return;
     }
@@ -1302,7 +1801,7 @@ static void browser_render(void) {
         size_t bytes = (size_t)info.width * info.height * sizeof(uint32_t);
         uint32_t* resized = (uint32_t*)wm_malloc(bytes);
         if (!resized) {
-            strcpy(status_message, "Unable to resize File Browser");
+            strcpy(status_message, "Unable to resize Files");
             return;
         }
         wm_free(browser_pixels);
@@ -1310,6 +1809,23 @@ static void browser_render(void) {
         browser_width = info.width;
         browser_height = info.height;
     }
+    uint32_t visible_rows = browser_visible_rows(browser_height);
+    uint32_t max_scroll = browser_entry_count > visible_rows
+        ? browser_entry_count - visible_rows : 0u;
+    if (browser_scroll > max_scroll) browser_scroll = max_scroll;
+
+    uint64_t signature = 0xCBF29CE484222325ull;
+    signature = hash_u64(signature, browser_generation);
+    signature = hash_u64(signature, ((uint64_t)browser_width << 32) |
+                                    browser_height);
+    signature = hash_u64(signature, ((uint64_t)browser_selected << 32) |
+                                    browser_scroll);
+    signature = hash_u64(signature, ((uint64_t)browser_hover << 32) |
+                                    browser_tool_hover);
+    signature = hash_u64(signature, accent_color);
+    signature = hash_text(signature, clipboard_path);
+    if (signature == browser_drawn_signature) return;
+    browser_drawn_signature = signature;
 
     uint32_t* screen_canvas = canvas;
     uint32_t screen_width = display.width;
@@ -1317,79 +1833,113 @@ static void browser_render(void) {
     canvas = browser_pixels;
     display.width = browser_width;
     display.height = browser_height;
-    fill_rect(0, 0, (int32_t)browser_width, (int32_t)browser_height,
-              0xFFF3F5F6u);
-    fill_rect(0, 0, (int32_t)browser_width, 44, 0xFFE6EAEDu);
-    fill_rect(0, 43, (int32_t)browser_width, 1, 0xFFD2D9DEu);
-    static const char* const controls[] = {
-        "Home", "System", "Up", "Refresh"};
-    static const uint32_t control_x[] = {8u, 76u, 144u, 212u};
-    for (uint32_t i = 0; i < 4u; i++) {
-        fill_rect((int32_t)control_x[i], 7, 62, 29,
-                  0xFFD4E4EFu);
-        wm_text((int32_t)control_x[i] + 8, 15, controls[i],
-                0xFF34434Cu, 0, 1u);
-    }
-    static const char* const wallpaper_controls[] = {
-        "Gallery", "Fill", "Crop", "Stretch", "Rotate"};
-    uint32_t button_width = browser_width > 248u
-        ? (browser_width - 48u) / 5u : 40u;
-    for (uint32_t i = 0; i < 5u; i++) {
-        int32_t x = 8 + (int32_t)i * ((int32_t)button_width + 8);
-        uint32_t selected = i == 1u
-            ? wallpaper_mode == MOSDESK_WALLPAPER_FILL
-            : i == 2u ? wallpaper_mode == MOSDESK_WALLPAPER_CROP
-            : i == 3u ? wallpaper_mode == MOSDESK_WALLPAPER_STRETCH : false;
-        fill_rect(x, 45, (int32_t)button_width, 25,
-                  selected ? accent_color : 0xFFD4E4EFu);
-        int32_t text_x = x + ((int32_t)button_width -
-            (int32_t)moswm_text_width(wallpaper_controls[i], 1u)) / 2;
-        wm_text(text_x, 52, wallpaper_controls[i],
-                selected ? 0xFFFFFFFFu : 0xFF34434Cu, 0, 1u);
-    }
-    char display_path[BROWSER_PATH_SIZE];
-    fit_text_px(display_path, sizeof(display_path), browser_path,
-                (int32_t)browser_width - 24, 1u);
-    wm_text(12, 78, display_path, 0xFF34434Cu, 0, 1u);
-    fill_rect(8, 96, (int32_t)browser_width - 16, 1, 0xFFD2D9DEu);
+    int32_t width = (int32_t)browser_width;
+    int32_t height = (int32_t)browser_height;
+    uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
+    fill_rect(0, 0, width, height, 0xFFF7F9FAu);
 
-    uint32_t visible_rows = browser_height > 106u
-        ? (browser_height - 106u) / BROWSER_ROW_HEIGHT : 0u;
-    if (browser_scroll > browser_entry_count)
-        browser_scroll = browser_entry_count;
+    /* Toolbar: icon buttons and the current location. */
+    fill_rect(0, 0, width, (int32_t)BROWSER_HEADER_HEIGHT, 0xFFE9EDF0u);
+    fill_rect(0, (int32_t)BROWSER_HEADER_HEIGHT - 1, width, 1, 0xFFD2D9DEu);
+    static const moswm_file_icon_t tools[BROWSER_TOOL_COUNT] = {
+        MOSWM_ICON_HOME, MOSWM_ICON_COMPUTER, MOSWM_ICON_UP,
+        MOSWM_ICON_REFRESH, MOSWM_ICON_NEWFOLDER
+    };
+    for (uint32_t i = 0; i < BROWSER_TOOL_COUNT; i++) {
+        int32_t x = browser_tool_x(i);
+        if (browser_tool_hover == i)
+            fill_rounded_rect(x, 9, 32, 32, 6, 0xFFD4E4EFu);
+        moswm_draw_file_icon_sized(browser_pixels, browser_width,
+            browser_height, x + 5, 14, tools[i], 22u);
+    }
+    int32_t field_x = browser_tool_x(BROWSER_TOOL_COUNT) + 6;
+    int32_t field_width = width - field_x - 10;
+    if (field_width > 60) {
+        fill_rounded_rect(field_x, 10, field_width, 30, 6, 0xFFC9D3DAu);
+        fill_rounded_rect(field_x + 1, 11, field_width - 2, 28, 5,
+                          0xFFFFFFFFu);
+        moswm_draw_file_icon_sized(browser_pixels, browser_width,
+            browser_height, field_x + 8, 16, MOSWM_ICON_FOLDER, 18u);
+        char shown[BROWSER_PATH_SIZE];
+        fit_text_px(shown, sizeof(shown), browser_path, field_width - 46, 1u);
+        wm_text(field_x + 34, 21, shown, 0xFF34434Cu, 0, 1u);
+    }
+
+    /* Entries. */
+    bool show_kind = browser_width >= 430u;
+    bool scrollable = browser_entry_count > visible_rows;
+    int32_t list_right = width - (scrollable ? 18 : 8);
     for (uint32_t row = 0; row < visible_rows; row++) {
         uint32_t index = browser_scroll + row;
         if (index >= browser_entry_count) break;
-        int32_t y = 102 + (int32_t)row * (int32_t)BROWSER_ROW_HEIGHT;
-        if (browser_selected == index)
-            fill_rect(8, y, (int32_t)browser_width - 16,
-                      (int32_t)BROWSER_ROW_HEIGHT, 0xFFD4E4EFu);
-        moswm_file_icon_t icon =
-            browser_entries[index].type == SYSCALL_DIRENT_TYPE_DIR
-                ? MOSWM_ICON_FOLDER : MOSWM_ICON_DOCUMENT;
-        if (browser_entries[index].type == SYSCALL_DIRENT_TYPE_EXECUTABLE)
-            icon = MOSWM_ICON_CODE;
-        size_t name_length = strlen(browser_entries[index].name);
-        if (name_length >= 4u &&
-            !strcmp(browser_entries[index].name + name_length - 4u, ".qoi"))
-            icon = MOSWM_ICON_IMAGE;
+        const syscall_dirent_t* entry = &browser_entries[index];
+        int32_t y = (int32_t)BROWSER_HEADER_HEIGHT + 4 +
+                    (int32_t)row * (int32_t)BROWSER_ROW_HEIGHT;
+        if (browser_selected == index) {
+            fill_rounded_rect(8, y, list_right - 8,
+                              (int32_t)BROWSER_ROW_HEIGHT - 2, 5,
+                              0x38000000u | (accent & 0x00FFFFFFu));
+            fill_rect(8, y + 5, 3, (int32_t)BROWSER_ROW_HEIGHT - 12, accent);
+        } else if (browser_hover == index) {
+            fill_rounded_rect(8, y, list_right - 8,
+                              (int32_t)BROWSER_ROW_HEIGHT - 2, 5,
+                              0xFFE7EDF1u);
+        }
+        moswm_file_icon_t icon = icon_for_entry(entry->type, entry->name);
         moswm_draw_file_icon_sized(browser_pixels, browser_width,
-            browser_height, 14, y + 4, icon, 20u);
+            browser_height, 18, y + 3, icon, 20u);
         char label[SYSCALL_DIRENT_NAME_SIZE];
-        fit_text_px(label, sizeof(label), browser_entries[index].name,
-                    (int32_t)browser_width - 64, 1u);
-        wm_text(44, y + 9, label, 0xFF273640u, 0, 1u);
+        fit_text_px(label, sizeof(label), entry->name,
+                    list_right - 56 - (show_kind ? 110 : 0), 1u);
+        wm_text(48, y + 9, label, 0xFF273640u, 0, 1u);
+        if (show_kind)
+            wm_text(list_right - 104, y + 9, kind_for_icon(icon),
+                    0xFF7A8A95u, 0, 1u);
     }
-    if (browser_message[0])
-        wm_text(12, (int32_t)browser_height - 22, browser_message,
-                0xFFB43A32u, 0, 1u);
+    if (!browser_entry_count && visible_rows)
+        wm_text(20, (int32_t)BROWSER_HEADER_HEIGHT + 18,
+                "This folder is empty", 0xFF7A8A95u, 0, 1u);
+    if (scrollable && visible_rows) {
+        int32_t track_y = (int32_t)BROWSER_HEADER_HEIGHT + 6;
+        int32_t track_height = (int32_t)(visible_rows * BROWSER_ROW_HEIGHT) - 8;
+        int32_t thumb_height = track_height * (int32_t)visible_rows /
+                               (int32_t)browser_entry_count;
+        if (thumb_height < 24) thumb_height = 24;
+        int32_t thumb_y = track_y + (track_height - thumb_height) *
+            (int32_t)browser_scroll / (int32_t)(max_scroll ? max_scroll : 1u);
+        fill_rounded_rect(width - 12, track_y, 6, track_height, 3,
+                          0xFFE3E9EDu);
+        fill_rounded_rect(width - 12, thumb_y, 6, thumb_height, 3,
+                          0xFFA9B8C3u);
+    }
+
+    /* Status bar. */
+    int32_t footer_y = height - (int32_t)BROWSER_FOOTER_HEIGHT;
+    fill_rect(0, footer_y, width, (int32_t)BROWSER_FOOTER_HEIGHT,
+              0xFFE9EDF0u);
+    fill_rect(0, footer_y, width, 1, 0xFFD2D9DEu);
+    if (browser_message[0]) {
+        wm_text(12, footer_y + 9, browser_message,
+                browser_message_is_error ? 0xFFB43A32u : 0xFF4D5E69u, 0, 1u);
+    } else {
+        char summary[32];
+        format_count(summary, browser_entry_count,
+                     browser_entry_count == 1u ? "item" : "items");
+        wm_text(12, footer_y + 9, summary, 0xFF667680u, 0, 1u);
+    }
+    if (clipboard_path[0] && browser_width >= 430u) {
+        const char* note = "Copied - right-click to paste";
+        wm_text(width - 12 - (int32_t)moswm_text_width(note, 1u),
+                footer_y + 9, note, 0xFF7A8A95u, 0, 1u);
+    }
+
     canvas = screen_canvas;
     display.width = screen_width;
     display.height = screen_height;
     if (mos_window_present(browser_window_id, browser_pixels,
             browser_width * sizeof(uint32_t), 0, 0,
             browser_width, browser_height) != SYS_SUCCESS)
-        strcpy(status_message, "Unable to update File Browser");
+        strcpy(status_message, "Unable to update Files");
 }
 
 static void queue_open_click(click_action_t action, const char* path) {
@@ -1400,52 +1950,106 @@ static void queue_open_click(click_action_t action, const char* path) {
     pending_click_y = cursor_y;
 }
 
+static void open_dialog(dialog_kind_t kind, const char* path,
+                        const char* initial_text) {
+    if (strlen(path) >= sizeof(dialog_path)) return;
+    dialog_kind = kind;
+    strcpy(dialog_path, path);
+    dialog_length = (uint32_t)strlen(initial_text);
+    if (dialog_length >= sizeof(dialog_text))
+        dialog_length = sizeof(dialog_text) - 1u;
+    memcpy(dialog_text, initial_text, dialog_length);
+    dialog_text[dialog_length] = '\0';
+    dialog_error[0] = '\0';
+}
+
+static uint32_t browser_tool_at(int32_t x, int32_t y) {
+    if (y < 9 || y >= 41 || x < 8) return UINT32_MAX;
+    uint32_t index = (uint32_t)(x - 8) / 36u;
+    if (index >= BROWSER_TOOL_COUNT || x >= browser_tool_x(index) + 32)
+        return UINT32_MAX;
+    return index;
+}
+
+/* Row under a point in Files content coordinates, or UINT32_MAX. */
+static uint32_t browser_row_at(int32_t x, int32_t y) {
+    (void)x;
+    int32_t top = (int32_t)BROWSER_HEADER_HEIGHT + 4;
+    if (y < top) return UINT32_MAX;
+    uint32_t row = (uint32_t)(y - top) / BROWSER_ROW_HEIGHT;
+    uint32_t index = browser_scroll + row;
+    if (row >= browser_visible_rows(browser_height) ||
+        index >= browser_entry_count)
+        return UINT32_MAX;
+    return index;
+}
+
 static void browser_mouse_down(int32_t x, int32_t y,
                                const syscall_window_info_t* info) {
-    if (y >= 7 && y < 36) {
+    (void)info;
+    if (y < (int32_t)BROWSER_HEADER_HEIGHT) {
         last_click_valid = false;
-        if (x >= 8 && x < 70)
-            browser_open(MOSDESK_USERS_PATH);
-        else if (x >= 76 && x < 138)
-            browser_open("0:/");
-        else if (x >= 144 && x < 206)
-            browser_go_up();
-        else if (x >= 212 && x < 274)
-            browser_refresh_directory();
+        uint32_t tool = browser_tool_at(x, y);
+        if (tool == 0u) browser_open(MOSDESK_USERS_PATH);
+        else if (tool == 1u) browser_open("0:/");
+        else if (tool == 2u) browser_go_up();
+        else if (tool == 3u) browser_refresh_directory();
+        else if (tool == 4u)
+            open_dialog(DIALOG_NEW_FOLDER, browser_path, "New folder");
         return;
     }
-    if (y >= 45 && y < 72) {
-        last_click_valid = false;
-        uint32_t width = info->width > 248u
-            ? (info->width - 48u) / 5u : 40u;
-        uint32_t index = x >= 8
-            ? (uint32_t)(x - 8) / (width + 8u) : UINT32_MAX;
-        if (index > 4u || x >= 8 + (int32_t)index *
-                ((int32_t)width + 8) + (int32_t)width)
-            return;
-        if (index == 0u)
-            browser_open("0:/programs/mosWM/assets/wallpapers");
-        else
-            browser_set_wallpaper_option(index - 1u);
-        return;
-    }
-    if (y < 102) {
+    uint32_t index = browser_row_at(x, y);
+    if (index == UINT32_MAX) {
+        if (browser_selected != UINT32_MAX) browser_generation++;
+        browser_selected = UINT32_MAX;
         last_click_valid = false;
         return;
     }
-    uint32_t row = (uint32_t)(y - 102) / BROWSER_ROW_HEIGHT;
-    uint32_t index = browser_scroll + row;
-    uint32_t visible_rows = info->height > 106u
-        ? (info->height - 106u) / BROWSER_ROW_HEIGHT : 0u;
-    if (row >= visible_rows || index >= browser_entry_count) return;
     browser_selected = index;
+    browser_generation++;
     char entry_path[BROWSER_PATH_SIZE];
     if (!path_join(entry_path, sizeof(entry_path), browser_path,
                    browser_entries[index].name)) {
-        strcpy(browser_message, "Folder path is too long");
+        browser_note("Folder path is too long", true);
         return;
     }
     queue_open_click(CLICK_ACTION_BROWSER_ENTRY, entry_path);
+}
+
+static void open_path(click_action_t action, const char* path) {
+    if (action == CLICK_ACTION_HOME) {
+        browser_open(MOSDESK_USERS_PATH);
+    } else if (action == CLICK_ACTION_SYSTEM) {
+        browser_open("0:/");
+    } else if (action == CLICK_ACTION_APPLICATION) {
+        if ((int64_t)mos_syscall3(SYS_EXEC,
+                (uint64_t)(uintptr_t)path, 0, 0) < 0)
+            strcpy(status_message, "Unable to open desktop application");
+    } else if (action == CLICK_ACTION_BROWSER_ENTRY) {
+        if (fs_is_directory(path)) {
+            browser_open(path);
+            return;
+        }
+        const char* name = path_name(path);
+        if (name_has_extension(name, ".qoi")) {
+            set_wallpaper_image(path);
+            return;
+        }
+        bool runnable = is_run_name(name);
+        for (uint32_t i = 0; i < browser_entry_count && !runnable; i++) {
+            char entry_path[BROWSER_PATH_SIZE];
+            runnable = browser_entries[i].type ==
+                           SYSCALL_DIRENT_TYPE_EXECUTABLE &&
+                path_join(entry_path, sizeof(entry_path), browser_path,
+                          browser_entries[i].name) &&
+                !strcmp(entry_path, path);
+        }
+        if (!runnable)
+            browser_note("Nothing is set up to open this file", false);
+        else if ((int64_t)mos_syscall3(SYS_EXEC,
+                     (uint64_t)(uintptr_t)path, 0, 0) < 0)
+            browser_note("Unable to run this item", true);
+    }
 }
 
 static void activate_pending_click(uint32_t time_ms) {
@@ -1466,51 +2070,7 @@ static void activate_pending_click(uint32_t time_ms) {
         last_click_time = time_ms;
         last_click_valid = true;
     }
-    if (!activate) return;
-
-    if (action == CLICK_ACTION_HOME) {
-        browser_open(MOSDESK_USERS_PATH);
-    } else if (action == CLICK_ACTION_SYSTEM) {
-        browser_open("0:/");
-    } else if (action == CLICK_ACTION_APPLICATION) {
-        if ((int64_t)mos_syscall3(SYS_EXEC,
-                (uint64_t)(uintptr_t)path, 0, 0) < 0)
-            strcpy(status_message, "Unable to open desktop application");
-    } else if (action == CLICK_ACTION_BROWSER_ENTRY) {
-        uint64_t is_directory = mos_syscall3(SYS_IS_DIR,
-            (uint64_t)(uintptr_t)path, 0, 0);
-        if (is_directory == 1u) {
-            browser_open(path);
-        } else {
-            const char* name = path;
-            for (const char* cursor = path; *cursor; cursor++)
-                if (*cursor == '/') name = cursor + 1;
-            size_t name_length = strlen(name);
-            if (name_length >= 4u &&
-                !strcmp(name + name_length - 4u, ".qoi")) {
-                browser_use_selected_wallpaper();
-                return;
-            }
-            bool runnable = is_run_name(name);
-            for (uint32_t i = 0; i < browser_entry_count; i++) {
-                char entry_path[BROWSER_PATH_SIZE];
-                if (browser_entries[i].type ==
-                        SYSCALL_DIRENT_TYPE_EXECUTABLE &&
-                    path_join(entry_path, sizeof(entry_path), browser_path,
-                              browser_entries[i].name) &&
-                    !strcmp(entry_path, path)) {
-                    runnable = true;
-                    break;
-                }
-            }
-            if (!runnable) {
-                strcpy(browser_message, "This item is not runnable");
-            } else if ((int64_t)mos_syscall3(SYS_EXEC,
-                           (uint64_t)(uintptr_t)path, 0, 0) < 0) {
-                strcpy(browser_message, "Unable to run this item");
-            }
-        }
-    }
+    if (activate) open_path(action, path);
 }
 
 static uint32_t isqrt_u64(uint64_t value) {
@@ -1754,14 +2314,57 @@ static void paint_wallpaper(uint32_t* target) {
     canvas = saved;
 }
 
-static void draw_wallpaper(void) {
-    if (painted_wallpaper_style != wallpaper_style) {
-        paint_wallpaper(wallpaper ? wallpaper : canvas);
-        painted_wallpaper_style = wallpaper_style;
-    }
+static void draw_desktop_icons(void);
+
+static void ensure_wallpaper(void) {
+    if (!wallpaper || painted_wallpaper_style == wallpaper_style) return;
+    paint_wallpaper(wallpaper);
+    painted_wallpaper_style = wallpaper_style;
+    wallpaper_generation++;
+}
+
+static void copy_wallpaper(uint32_t* target) {
     if (wallpaper)
-        memcpy(canvas, wallpaper,
-               (size_t)display.width * display.height * sizeof(uint32_t));
+        copy_pixels(target, wallpaper,
+                    (size_t)display.width * display.height);
+    else
+        paint_wallpaper(target);
+}
+
+static uint64_t desktop_signature(void) {
+    uint64_t hash = 0xCBF29CE484222325ull;
+    hash = hash_u64(hash, wallpaper_generation);
+    hash = hash_u64(hash, desktop_apps_generation);
+    hash = hash_u64(hash, ((uint64_t)display.width << 32) | display.height);
+    hash = hash_u64(hash, hover_desktop_icon);
+    hash = hash_bytes(hash, desktop_settings.desktop_icon_x,
+                      sizeof(desktop_settings.desktop_icon_x));
+    hash = hash_bytes(hash, desktop_settings.desktop_icon_y,
+                      sizeof(desktop_settings.desktop_icon_y));
+    return hash;
+}
+
+static void draw_desktop(uint32_t* target) {
+    uint32_t* saved = canvas;
+    copy_wallpaper(target);
+    canvas = target;
+    draw_desktop_icons();
+    canvas = saved;
+}
+
+/* Wallpaper and icons into the canvas, repainting them only on change. */
+static void compose_desktop(void) {
+    if (!desktop_layer) {
+        draw_desktop(canvas);
+        return;
+    }
+    uint64_t signature = desktop_signature();
+    if (signature != desktop_layer_signature) {
+        draw_desktop(desktop_layer);
+        desktop_layer_signature = signature;
+    }
+    copy_pixels(canvas, desktop_layer,
+                (size_t)display.width * display.height);
 }
 
 static void draw_custom_icon(const uint32_t* icon, int32_t x, int32_t y,
@@ -1810,73 +2413,52 @@ static void desktop_icon_position(uint32_t index, int32_t* x, int32_t* y) {
     *y = 14 + (int32_t)row * 98;
 }
 
-static void desktop_app_position(uint32_t index, int32_t* x, int32_t* y) {
-    desktop_icon_position(index + 2u, x, y);
-}
-
-static bool desktop_app_at(int32_t px, int32_t py, uint32_t* app_index) {
-    for (uint32_t i = 0; i < desktop_app_count; i++) {
+/* Index of the desktop icon under a point (0 Home, 1 System, then apps). */
+static uint32_t desktop_icon_at(int32_t px, int32_t py) {
+    for (uint32_t i = 0; i < desktop_app_count + 2u; i++) {
         int32_t x, y;
-        desktop_app_position(i, &x, &y);
-        if (px >= x && px < x + (int32_t)DESKTOP_ICON_SIZE &&
-            py >= y && py < y + 90) {
-            if (app_index) *app_index = i;
-            return true;
-        }
+        desktop_icon_position(i, &x, &y);
+        if (px >= x - 10 && px < x + 74 && py >= y - 4 && py < y + 90)
+            return i;
     }
-    return false;
+    return UINT32_MAX;
 }
 
 static click_action_t desktop_shortcut_at(int32_t px, int32_t py,
                                           uint32_t* app_index) {
-    int32_t x, y;
-    desktop_icon_position(0u, &x, &y);
-    if (px >= x - 16 && px < x + 80 && py >= y && py < y + 90)
-        return CLICK_ACTION_HOME;
-    desktop_icon_position(1u, &x, &y);
-    if (px >= x - 16 && px < x + 80 && py >= y && py < y + 90)
-        return CLICK_ACTION_SYSTEM;
-    if (desktop_app_at(px, py, app_index))
-        return CLICK_ACTION_APPLICATION;
-    return CLICK_ACTION_NONE;
+    uint32_t index = desktop_icon_at(px, py);
+    if (index == UINT32_MAX) return CLICK_ACTION_NONE;
+    if (index == 0u) return CLICK_ACTION_HOME;
+    if (index == 1u) return CLICK_ACTION_SYSTEM;
+    if (app_index) *app_index = index - 2u;
+    return CLICK_ACTION_APPLICATION;
 }
 
 static void draw_desktop_icons(void) {
-    static const struct {
-        moswm_file_icon_t icon;
-        const char* label;
-    } items[] = {
-        {MOSWM_ICON_HOME, "Home"},
-        {MOSWM_ICON_COMPUTER, "System"}
-    };
-    for (uint32_t i = 0; i < sizeof(items) / sizeof(items[0]); i++)
-    {
-        int32_t icon_x, icon_y;
-        desktop_icon_position(i, &icon_x, &icon_y);
-        moswm_draw_file_icon_sized(canvas, display.width, display.height,
-                                   icon_x, icon_y, items[i].icon, 64u);
-        int32_t label_x = icon_x + 32 -
-            (int32_t)moswm_text_width(items[i].label, 2) / 2;
-        if (label_x < 4) label_x = 4;
-        wm_text(label_x, icon_y + 68, items[i].label, 0xFFF2F6F8u,
-                0x99000000u, 2);
-    }
-    for (uint32_t i = 0; i < desktop_app_count; i++) {
-        int32_t icon_x, icon_y;
-        desktop_app_position(i, &icon_x, &icon_y);
-        if (desktop_apps[i].has_icon)
-            draw_custom_icon(desktop_apps[i].icon_pixels,
-                             icon_x, icon_y, DESKTOP_ICON_SIZE);
-        else
+    for (uint32_t i = 0; i < desktop_app_count + 2u; i++) {
+        int32_t x, y;
+        desktop_icon_position(i, &x, &y);
+        if (hover_desktop_icon == i) {
+            fill_rounded_rect(x - 10, y - 4, 84, 94, 8, 0x30FFFFFFu);
+            fill_rounded_rect(x - 9, y - 3, 82, 92, 7, 0x18000000u);
+        }
+        const char* name = i == 0u ? "Home" : i == 1u ? "System"
+            : desktop_apps[i - 2u].name;
+        if (i < 2u) {
             moswm_draw_file_icon_sized(canvas, display.width, display.height,
-                icon_x, icon_y, MOSWM_ICON_CODE, DESKTOP_ICON_SIZE);
+                x, y, i == 0u ? MOSWM_ICON_HOME : MOSWM_ICON_COMPUTER, 64u);
+        } else if (desktop_apps[i - 2u].has_icon) {
+            draw_custom_icon(desktop_apps[i - 2u].icon_pixels, x + 8, y + 6,
+                             48u);
+        } else {
+            moswm_draw_file_icon_sized(canvas, display.width, display.height,
+                x + 4, y + 2, MOSWM_ICON_APP, 56u);
+        }
         char label[DESKTOP_APP_NAME_SIZE];
-        fit_text_px(label, sizeof(label), desktop_apps[i].name, 84u, 1u);
-        int32_t label_x = icon_x +
-            ((int32_t)DESKTOP_ICON_SIZE -
-             (int32_t)moswm_text_width(label, 1u)) / 2;
-        wm_text(label_x, icon_y + 68, label,
-                0xFFF2F6F8u, 0x99000000u, 1);
+        fit_text_px(label, sizeof(label), name, 86, 2u);
+        int32_t label_x = x + 32 - (int32_t)moswm_text_width(label, 2u) / 2;
+        if (label_x < 2) label_x = 2;
+        wm_text(label_x, y + 68, label, 0xFFF2F6F8u, 0x99000000u, 2u);
     }
 }
 
@@ -1944,10 +2526,11 @@ static void refresh_window_icon(cached_window_t* entry, bool force) {
     uint64_t result = mos_window_get_icon(entry->id, entry->icon_pixels);
     if (result == SYS_SUCCESS) {
         entry->has_icon = true;
-    } else if (result == SYS_ERR_NOTFOUND) {
-        entry->has_icon = false;
+        entry->icon_sum = 0;
+        for (uint32_t i = 0; i < SYSCALL_WINDOW_ICON_PIXELS; i++)
+            entry->icon_sum = entry->icon_sum * 31u + entry->icon_pixels[i];
     } else {
-        strcpy(status_message, "Unable to read application icon");
+        /* No icon set, or a kernel without window icons: use the default. */
         entry->has_icon = false;
     }
     entry->icon_checked = true;
@@ -2076,28 +2659,41 @@ static void composite_window(const syscall_window_info_t* info,
     if (entry && entry->pixels) {
         int32_t content_x = x + 1;
         int32_t content_y = y + (int32_t)TITLE_HEIGHT + 1;
+        int32_t first = content_x < 0 ? -content_x : 0;
+        int32_t last = (int32_t)info->width;
+        if (content_x + last > (int32_t)display.width)
+            last = (int32_t)display.width - content_x;
         for (uint32_t py = 0; py < info->height; py++) {
             int32_t dy = content_y + (int32_t)py;
             if (dy < 0 || (uint32_t)dy >= display.height) continue;
-            for (uint32_t px = 0; px < info->width; px++) {
-                int32_t dx = content_x + (int32_t)px;
-                if (dx < 0 || (uint32_t)dx >= display.width) continue;
-                if (py >= info->height - CORNER_RADIUS &&
-                    (px < CORNER_RADIUS ||
-                     px + CORNER_RADIUS >= info->width)) {
-                    int32_t corner_x = px < CORNER_RADIUS
+            const uint32_t* source =
+                entry->pixels + (size_t)py * info->width;
+            uint32_t* target = canvas + (size_t)dy * display.width +
+                               content_x;
+            if (py + CORNER_RADIUS < info->height) {
+                /* Straight rows: no per-pixel bounds or corner tests. */
+                for (int32_t px = first; px < last; px++) {
+                    uint32_t color = source[px];
+                    target[px] = color >> 24 == 255u
+                        ? color : alpha_blend(color, target[px]);
+                }
+                continue;
+            }
+            for (int32_t px = first; px < last; px++) {
+                if ((uint32_t)px < CORNER_RADIUS ||
+                    (uint32_t)px + CORNER_RADIUS >= info->width) {
+                    int32_t corner_x = (uint32_t)px < CORNER_RADIUS
                         ? (int32_t)CORNER_RADIUS - 1
                         : (int32_t)info->width - (int32_t)CORNER_RADIUS;
                     int32_t corner_y =
                         (int32_t)info->height - (int32_t)CORNER_RADIUS;
-                    int32_t dxr = (int32_t)px - corner_x;
+                    int32_t dxr = px - corner_x;
                     int32_t dyr = (int32_t)py - corner_y;
                     if (dxr * dxr + dyr * dyr >
                         (int32_t)(CORNER_RADIUS * CORNER_RADIUS))
                         continue;
                 }
-                put_pixel(dx, dy,
-                    entry->pixels[(size_t)py * info->width + px]);
+                target[px] = alpha_blend(source[px], target[px]);
             }
         }
     }
@@ -2154,51 +2750,150 @@ static void draw_chrome_text(const syscall_window_info_t* info,
     fill_rect(min_x + 5, by + 11, 8, 2, opaque(info->style.minimize_icon));
 }
 
-static void draw_cursor(void) {
-    if (!cursor_width || !cursor_height) {
-        static const char* fallback[] = {
-            "#...........", "##..........", "#x#.........",
-            "#xx#........", "#xxx#.......", "#xxxx#......",
-            "#xxxxx#.....", "#xxxxxx#....", "#xxxxxxx#...",
-            "#xxxxxxxx#..", "#xxxxx###...", "#xx#xx#......"
-        };
-        cursor_width = 12;
-        cursor_height = 12;
-        memset(cursor_pixels, 0, sizeof(cursor_pixels));
-        for (uint32_t y = 0; y < cursor_height; y++) {
-            for (uint32_t x = 0; x < cursor_width; x++) {
-                char pixel = fallback[y][x];
-                if (pixel == '#')
-                    cursor_pixels[y * CURSOR_MAX_SIZE + x] = 0xFF10191Du;
-                else if (pixel == 'x')
-                    cursor_pixels[y * CURSOR_MAX_SIZE + x] = 0xFFFFFFFFu;
-            }
+static void prepare_cursor_pixels(void) {
+    if (cursor_width && cursor_height) return;
+    static const char* fallback[] = {
+        "#...........", "##..........", "#x#.........",
+        "#xx#........", "#xxx#.......", "#xxxx#......",
+        "#xxxxx#.....", "#xxxxxx#....", "#xxxxxxx#...",
+        "#xxxxxxxx#..", "#xxxxx###...", "#xx#xx#......"
+    };
+    cursor_width = 12;
+    cursor_height = 12;
+    memset(cursor_pixels, 0, sizeof(cursor_pixels));
+    for (uint32_t y = 0; y < cursor_height; y++) {
+        for (uint32_t x = 0; x < cursor_width; x++) {
+            char pixel = fallback[y][x];
+            if (pixel == '#')
+                cursor_pixels[y * CURSOR_MAX_SIZE + x] = 0xFF10191Du;
+            else if (pixel == 'x')
+                cursor_pixels[y * CURSOR_MAX_SIZE + x] = 0xFFFFFFFFu;
         }
+    }
+}
+
+static bool blit_canvas_rect(int32_t x, int32_t y, int32_t width,
+                             int32_t height) {
+    return mos_graphics_blit_surface(canvas, display.width, display.height,
+        display.width * sizeof(uint32_t), x, y, width, height, x, y,
+        SYS_GRAPHICS_BLIT_OPAQUE) == SYS_SUCCESS;
+}
+
+/* Sends the finished scene to the screen with the pointer on top. `full`
+ * pushes the whole canvas; otherwise only the pixels the pointer left and
+ * the ones it now covers are updated, and nothing at all if it is still. */
+static void present_frame(bool full) {
+    prepare_cursor_pixels();
+    uint32_t scale = cursor_scale ? cursor_scale : 1u;
+    uint32_t frame = 0;
+    if (cursor_animation_pixels) {
+        cursor_animation_elapsed_ms = mos_syscall1(SYS_UPTIME, 0);
+        frame = (uint32_t)((cursor_animation_elapsed_ms /
+                            cursor_animation_frame_delay_ms) %
+                           cursor_animation_frame_count);
     }
     const uint32_t* pixels = cursor_animation_pixels
         ? cursor_animation_pixels +
-            (size_t)((cursor_animation_elapsed_ms /
-                      cursor_animation_frame_delay_ms) %
-                     cursor_animation_frame_count) *
-                CURSOR_MAX_SIZE * CURSOR_MAX_SIZE
+              (size_t)frame * CURSOR_MAX_SIZE * CURSOR_MAX_SIZE
         : cursor_pixels;
-    int32_t origin_x = cursor_x - (int32_t)(cursor_hotspot_x * cursor_scale);
-    int32_t origin_y = cursor_y - (int32_t)(cursor_hotspot_y * cursor_scale);
-    for (uint32_t y = 0; y < cursor_height; y++) {
-        for (uint32_t x = 0; x < cursor_width; x++) {
-            uint32_t color = pixels[y * CURSOR_MAX_SIZE + x];
-            if (!(color >> 24u)) continue;
-            if (((color >> 16u) & 255u) > 210u &&
-                ((color >> 8u) & 255u) > 210u && (color & 255u) > 210u)
-                color = (color & 0xFF000000u) | (cursor_fill_color & 0x00FFFFFFu);
-            for (uint32_t sy = 0; sy < cursor_scale; sy++) {
-                for (uint32_t sx = 0; sx < cursor_scale; sx++) {
-                    put_pixel(origin_x + (int32_t)(x * cursor_scale + sx),
-                              origin_y + (int32_t)(y * cursor_scale + sy), color);
+    int32_t origin_x = cursor_x - (int32_t)(cursor_hotspot_x * scale);
+    int32_t origin_y = cursor_y - (int32_t)(cursor_hotspot_y * scale);
+
+    uint64_t signature = 0xCBF29CE484222325ull;
+    signature = hash_u64(signature, ((uint64_t)(uint32_t)origin_x << 32) |
+                                    (uint32_t)origin_y);
+    signature = hash_u64(signature, ((uint64_t)cursor_width << 32) |
+                                    cursor_height);
+    signature = hash_u64(signature, ((uint64_t)cached_cursor_status << 32) |
+                                    frame);
+    signature = hash_u64(signature, ((uint64_t)cursor_fill_color << 32) |
+                                    scale);
+    signature = hash_text(signature, cached_cursor_pack);
+    if (!full && cursor_drawn && signature == cursor_drawn_signature) return;
+
+    bool ok = true;
+    if (full) {
+        ok = blit_canvas_rect(0, 0, (int32_t)display.width,
+                              (int32_t)display.height);
+    } else if (cursor_drawn && cursor_drawn_width > 0 &&
+               cursor_drawn_height > 0) {
+        ok = blit_canvas_rect(cursor_drawn_x, cursor_drawn_y,
+                              cursor_drawn_width, cursor_drawn_height);
+    }
+
+    int32_t left = origin_x < 0 ? 0 : origin_x;
+    int32_t top = origin_y < 0 ? 0 : origin_y;
+    int32_t right = origin_x + (int32_t)(cursor_width * scale);
+    int32_t bottom = origin_y + (int32_t)(cursor_height * scale);
+    if (right > (int32_t)display.width) right = (int32_t)display.width;
+    if (bottom > (int32_t)display.height) bottom = (int32_t)display.height;
+    int32_t width = right - left;
+    int32_t height = bottom - top;
+    if (width > (int32_t)CURSOR_PATCH_SIZE) width = (int32_t)CURSOR_PATCH_SIZE;
+    if (height > (int32_t)CURSOR_PATCH_SIZE)
+        height = (int32_t)CURSOR_PATCH_SIZE;
+    if (width > 0 && height > 0) {
+        for (int32_t row = 0; row < height; row++)
+            copy_pixels(cursor_patch + (size_t)row * CURSOR_PATCH_SIZE,
+                canvas + (size_t)(top + row) * display.width + left,
+                (size_t)width);
+        for (uint32_t y = 0; y < cursor_height; y++) {
+            for (uint32_t x = 0; x < cursor_width; x++) {
+                uint32_t color = pixels[y * CURSOR_MAX_SIZE + x];
+                if (!(color >> 24u)) continue;
+                if (((color >> 16u) & 255u) > 210u &&
+                    ((color >> 8u) & 255u) > 210u && (color & 255u) > 210u)
+                    color = (color & 0xFF000000u) |
+                            (cursor_fill_color & 0x00FFFFFFu);
+                for (uint32_t sy = 0; sy < scale; sy++) {
+                    int32_t py = origin_y + (int32_t)(y * scale + sy) - top;
+                    if (py < 0 || py >= height) continue;
+                    for (uint32_t sx = 0; sx < scale; sx++) {
+                        int32_t px = origin_x + (int32_t)(x * scale + sx) -
+                                     left;
+                        if (px < 0 || px >= width) continue;
+                        uint32_t* target = cursor_patch +
+                            (size_t)py * CURSOR_PATCH_SIZE + px;
+                        *target = alpha_blend(color, *target);
+                    }
                 }
             }
         }
+        ok = ok && mos_graphics_blit_surface(cursor_patch, CURSOR_PATCH_SIZE,
+            (uint32_t)height, CURSOR_PATCH_SIZE * sizeof(uint32_t), 0, 0,
+            width, height, left, top, SYS_GRAPHICS_BLIT_OPAQUE) ==
+            SYS_SUCCESS;
     }
+    if (!ok) {
+        strcpy(status_message, "Framebuffer update failed");
+        scene_valid = false;
+        return;
+    }
+
+    if (full) {
+        ok = mos_graphics_present(0, 0, (int32_t)display.width,
+                                  (int32_t)display.height) == SYS_SUCCESS;
+    } else {
+        if (cursor_drawn && cursor_drawn_width > 0 && cursor_drawn_height > 0)
+            ok = mos_graphics_present(cursor_drawn_x, cursor_drawn_y,
+                cursor_drawn_width, cursor_drawn_height) == SYS_SUCCESS;
+        if (width > 0 && height > 0)
+            ok = mos_graphics_present(left, top, width, height) ==
+                 SYS_SUCCESS && ok;
+    }
+    if (!ok) {
+        strcpy(status_message, "Display present failed");
+        scene_valid = false;
+        return;
+    }
+    if (full) debug_repaints++;
+    else debug_pointer_draws++;
+    cursor_drawn = true;
+    cursor_drawn_x = left;
+    cursor_drawn_y = top;
+    cursor_drawn_width = width;
+    cursor_drawn_height = height;
+    cursor_drawn_signature = signature;
 }
 
 typedef struct {
@@ -2217,12 +2912,10 @@ static void update_clock(void) {
     memset(&now, 0, sizeof(now));
     clock_valid = mos_syscall1(SYS_GETTIME, (uint64_t)(uintptr_t)&now) ==
                   SYS_SUCCESS && now.month >= 1 && now.month <= 12;
+    /* The panel shows hours and minutes; a ticking seconds field would
+     * change the scene signature and repaint everything once a second. */
+    now.second = 0;
     if (clock_valid) clock_time = now;
-}
-
-static bool pointer_in(int32_t x, int32_t y, int32_t w, int32_t h) {
-    return cursor_x >= x && cursor_x < x + w && cursor_y >= y &&
-           cursor_y < y + h;
 }
 
 /* The Minimal-OS hourglass at panel size: same geometry as the wallpaper. */
@@ -2236,6 +2929,45 @@ static void draw_mini_logo(int32_t x, int32_t y, uint32_t color) {
     }
 }
 
+/* Launcher rows: three fixed entries, then the installed applications. */
+static uint32_t start_menu_rows(uint32_t* apps) {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < desktop_app_count &&
+         count + 3u < START_MENU_MAX_ROWS; i++) {
+        if (!strcmp(desktop_apps[i].name, "mosdesk")) continue;
+        if (apps) apps[count] = i;
+        count++;
+    }
+    return count;
+}
+
+static void start_menu_bounds(int32_t* x, int32_t* y, int32_t* width,
+                              int32_t* height) {
+    uint32_t apps = start_menu_rows(NULL);
+    *width = 286;
+    *height = 66 + 26 + 3 * 38 + (apps ? 30 + (int32_t)apps * 38 : 0) + 40;
+    *x = 12;
+    *y = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 10 - *height;
+}
+
+static int32_t start_menu_row_y(uint32_t row) {
+    int32_t x, y, width, height;
+    start_menu_bounds(&x, &y, &width, &height);
+    return y + 66 + 26 + (int32_t)row * 38 + (row >= 3u ? 30 : 0);
+}
+
+static uint32_t start_menu_row_at(int32_t px, int32_t py) {
+    int32_t x, y, width, height;
+    start_menu_bounds(&x, &y, &width, &height);
+    if (px < x + 8 || px >= x + width - 8) return UINT32_MAX;
+    uint32_t rows = 3u + start_menu_rows(NULL);
+    for (uint32_t row = 0; row < rows; row++) {
+        int32_t row_y = start_menu_row_y(row);
+        if (py >= row_y && py < row_y + 36) return row;
+    }
+    return UINT32_MAX;
+}
+
 static void draw_taskbar(const syscall_window_info_t* windows,
                          uint64_t count) {
     static const char* const months[] = {
@@ -2245,15 +2977,13 @@ static void draw_taskbar(const syscall_window_info_t* windows,
     int32_t top = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT;
     int32_t width = (int32_t)display.width;
     uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
-    update_clock();
 
     /* Panel: dark, slightly translucent, with a faint highlight edge. */
     fill_rect(0, top, width, (int32_t)TASKBAR_HEIGHT, 0xEC1B1E20u);
     fill_rect(0, top, width, 1, 0x2CFFFFFFu);
 
     /* Application launcher button. */
-    bool menu_hover = pointer_in(0, top, 44, (int32_t)TASKBAR_HEIGHT);
-    if (start_menu_open || menu_hover)
+    if (start_menu_open || hover_taskbar == 0u)
         fill_rounded_rect(4, top + 4, 40, 40, 8,
                           start_menu_open ? (0x66000000u | (accent & 0xFFFFFFu))
                                           : 0x26FFFFFFu);
@@ -2267,10 +2997,9 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         const syscall_window_info_t* info = &windows[i];
         bool focused = info->id == focused_id;
         bool minimized = (info->flags & SYSCALL_WINDOW_MINIMIZED) != 0;
-        bool hovered = pointer_in(x, top + 5, 176, 38);
         if (focused)
             fill_rounded_rect(x, top + 5, 176, 38, 6, 0x38FFFFFFu);
-        else if (hovered)
+        else if (hover_taskbar == i + 1u)
             fill_rounded_rect(x, top + 5, 176, 38, 6, 0x24FFFFFFu);
         if (focused)
             fill_rect(x + 6, top + 44, 164, 3, accent);
@@ -2280,16 +3009,19 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         char label[SYSCALL_WINDOW_MAX_TITLE];
         cached_window_t* entry = cache_for(info->id);
         bool has_icon = entry && entry->has_icon;
-        fit_text_px(label, sizeof(label), info->title,
-                    has_icon ? 126u : 156u, 2);
+        fit_text_px(label, sizeof(label), info->title, 126u, 2);
         if (has_icon)
             draw_custom_icon(entry->icon_pixels, x + 8, top + 12, 24u);
-        wm_text(x + (has_icon ? 40 : 10), top + 16, label,
+        else
+            moswm_draw_file_icon_sized(canvas, display.width, display.height,
+                x + 8, top + 12, info->id == browser_window_id
+                    ? MOSWM_ICON_FOLDER : MOSWM_ICON_APP, 24u);
+        wm_text(x + 40, top + 16, label,
                 minimized ? 0xFF8C9BA6u : 0xFFEAF2F8u, 0, 2);
         x += 180;
     }
     if (!count)
-        wm_text(60, top + 16, "MOSDESK", 0x80EAF2F8u, 0, 2);
+        wm_text(60, top + 16, "MOSdesk", 0x80EAF2F8u, 0, 2);
 
     /* System tray: separator + two-line clock. */
     if (clock_valid) {
@@ -2315,28 +3047,435 @@ static void draw_taskbar(const syscall_window_info_t* windows,
     }
 
     if (start_menu_open) {
-        /* Kickoff-style launcher: header, category, item list, footer. */
-        fill_rounded_rect(7, top - 271, 296, 268, 12, 0x2E000000u);
-        fill_rounded_rect(12, top - 268, 286, 258, 8, 0xFF3A4249u);
-        fill_rounded_rect(13, top - 267, 284, 256, 7, 0xFF1D2125u);
-        fill_rounded_rect(24, top - 260, 30, 30, 15, accent);
-        wm_text(32, top - 253, "M", 0xFFFFFFFFu, 0, 2);
-        wm_text(64, top - 262, "MOSdesk", 0xFFF2F6F9u, 0, 2);
-        wm_text(64, top - 242, "Minimal-OS", 0xFF9BAFBCu, 0, 1);
-        fill_rect(30, top - 223, 250, 1, 0xFF353C42u);
-        wm_text(30, top - 212, "SYSTEM", accent, 0, 1);
-        bool item_hover = pointer_in(18, top - 192, 274, 36);
-        if (item_hover)
-            fill_rounded_rect(20, top - 192, 270, 36, 6,
-                              0x55000000u | (accent & 0xFFFFFFu));
-        moswm_draw_file_icon_sized(canvas, display.width, display.height,
-                                   28, top - 190, MOSWM_ICON_SETTINGS, 32u);
-        wm_text(80, top - 182, "Settings", 0xFFF2F6F9u, 0, 2);
-        fill_rect(30, top - 46, 250, 1, 0xFF353C42u);
-        wm_text(30, top - 33, "Open windows from the panel", 0xFF8A9AA6u, 0, 1);
+        /* Kickoff-style launcher: header, system entries, applications. */
+        static const struct {
+            const char* label;
+            moswm_file_icon_t icon;
+        } fixed[3] = {
+            {"Files", MOSWM_ICON_FOLDER},
+            {"Settings", MOSWM_ICON_SETTINGS},
+            {"Wallpaper", MOSWM_ICON_IMAGE}
+        };
+        int32_t mx, my, mw, mh;
+        start_menu_bounds(&mx, &my, &mw, &mh);
+        uint32_t apps[START_MENU_MAX_ROWS];
+        uint32_t app_count = start_menu_rows(apps);
+        fill_rounded_rect(mx - 5, my - 3, mw + 10, mh + 10, 12, 0x2E000000u);
+        fill_rounded_rect(mx, my, mw, mh, 8, 0xFF3A4249u);
+        fill_rounded_rect(mx + 1, my + 1, mw - 2, mh - 2, 7, 0xFF1D2125u);
+        fill_rounded_rect(mx + 12, my + 12, 30, 30, 15, accent);
+        wm_text(mx + 20, my + 19, "M", 0xFFFFFFFFu, 0, 2);
+        wm_text(mx + 52, my + 10, "MOSdesk", 0xFFF2F6F9u, 0, 2);
+        wm_text(mx + 52, my + 30, "Minimal-OS", 0xFF9BAFBCu, 0, 1);
+        fill_rect(mx + 18, my + 56, mw - 36, 1, 0xFF353C42u);
+        wm_text(mx + 18, my + 72, "SYSTEM", accent, 0, 1);
+        if (app_count)
+            wm_text(mx + 18, start_menu_row_y(3u) - 22, "APPLICATIONS",
+                    accent, 0, 1);
+        for (uint32_t row = 0; row < 3u + app_count; row++) {
+            int32_t row_y = start_menu_row_y(row);
+            if (hover_start_row == row)
+                fill_rounded_rect(mx + 8, row_y, mw - 16, 36, 6,
+                                  0x55000000u | (accent & 0xFFFFFFu));
+            const char* label;
+            if (row < 3u) {
+                label = fixed[row].label;
+                moswm_draw_file_icon_sized(canvas, display.width,
+                    display.height, mx + 16, row_y + 4, fixed[row].icon,
+                    28u);
+            } else {
+                const desktop_app_t* app = &desktop_apps[apps[row - 3u]];
+                label = app->name;
+                if (app->has_icon)
+                    draw_custom_icon(app->icon_pixels, mx + 16, row_y + 4,
+                                     28u);
+                else
+                    moswm_draw_file_icon_sized(canvas, display.width,
+                        display.height, mx + 16, row_y + 4, MOSWM_ICON_APP,
+                        28u);
+            }
+            char shown[DESKTOP_APP_NAME_SIZE];
+            fit_text_px(shown, sizeof(shown), label, mw - 80, 2u);
+            wm_text(mx + 56, row_y + 10, shown, 0xFFF2F6F9u, 0, 2);
+        }
+        fill_rect(mx + 18, my + mh - 34, mw - 36, 1, 0xFF353C42u);
+        wm_text(mx + 18, my + mh - 22, "Right-click icons for more actions",
+                0xFF8A9AA6u, 0, 1);
     }
     if (status_message[0])
         wm_text(8, 8, status_message, 0xFFFFE696u, 0xAA000000u, 2);
+}
+
+/* ------------------------------------------- right-click menu and dialogs */
+
+static void menu_add(menu_action_t action, const char* label,
+                     moswm_file_icon_t icon, bool separator_before,
+                     bool enabled) {
+    if (menu_item_count >= MENU_MAX_ITEMS) return;
+    menu_items[menu_item_count++] = (menu_item_t){
+        action, label, icon, separator_before, enabled};
+}
+
+static int32_t menu_height(void) {
+    int32_t height = 12;
+    for (uint32_t i = 0; i < menu_item_count; i++)
+        height += MENU_ITEM_HEIGHT + (menu_items[i].separator_before ? 9 : 0);
+    return height;
+}
+
+static void menu_show(click_action_t target, const char* path) {
+    menu_target = target;
+    strcpy(menu_path, path);
+    menu_x = cursor_x;
+    menu_y = cursor_y;
+    int32_t height = menu_height();
+    if (menu_x + MENU_WIDTH + 4 > (int32_t)display.width)
+        menu_x = (int32_t)display.width - MENU_WIDTH - 4;
+    if (menu_y + height + 4 > (int32_t)display.height)
+        menu_y = (int32_t)display.height - height - 4;
+    if (menu_x < 4) menu_x = 4;
+    if (menu_y < 4) menu_y = 4;
+    menu_hover = UINT32_MAX;
+    menu_open = menu_item_count != 0u;
+}
+
+/* Menu for one item: a Files entry, or a Home/System/application icon. */
+static void menu_show_for_item(click_action_t target, const char* path) {
+    if (strlen(path) >= sizeof(menu_path)) return;
+    menu_item_count = 0;
+    bool editable = !path_is_protected(path);
+    menu_add(MENU_ACTION_OPEN, "Open", MOSWM_ICON_FOLDER, false, true);
+    if (target == CLICK_ACTION_APPLICATION)
+        menu_add(MENU_ACTION_SHOW_IN_FILES, "Show in Files",
+                 MOSWM_ICON_COMPUTER, false, true);
+    if (name_has_extension(path, ".qoi"))
+        menu_add(MENU_ACTION_SET_WALLPAPER, "Set as wallpaper",
+                 MOSWM_ICON_IMAGE, false, true);
+    if (target == CLICK_ACTION_APPLICATION ||
+        target == CLICK_ACTION_BROWSER_ENTRY) {
+        menu_add(MENU_ACTION_COPY, "Copy", MOSWM_ICON_COPY, true, true);
+        menu_add(MENU_ACTION_RENAME, "Rename", MOSWM_ICON_EDIT, false,
+                 editable);
+        menu_add(MENU_ACTION_DELETE, "Delete", MOSWM_ICON_TRASH, false,
+                 editable);
+    }
+    menu_show(target, path);
+}
+
+/* Menu for the empty part of a folder shown in Files. */
+static void menu_show_for_folder(const char* directory) {
+    menu_item_count = 0;
+    menu_add(MENU_ACTION_PASTE, "Paste", MOSWM_ICON_PASTE, false,
+             clipboard_path[0] != '\0');
+    menu_add(MENU_ACTION_NEW_FOLDER, "New folder", MOSWM_ICON_NEWFOLDER,
+             false, true);
+    menu_add(MENU_ACTION_REFRESH, "Refresh", MOSWM_ICON_REFRESH, true, true);
+    menu_show(CLICK_ACTION_NONE, directory);
+}
+
+static void menu_show_for_desktop(void) {
+    menu_item_count = 0;
+    menu_add(MENU_ACTION_FILES, "Open Files", MOSWM_ICON_FOLDER, false, true);
+    menu_add(MENU_ACTION_WALLPAPERS, "Change wallpaper", MOSWM_ICON_IMAGE,
+             false, true);
+    menu_add(MENU_ACTION_SETTINGS, "Settings", MOSWM_ICON_SETTINGS, false,
+             true);
+    menu_add(MENU_ACTION_REFRESH, "Refresh desktop", MOSWM_ICON_REFRESH,
+             true, true);
+    menu_show(CLICK_ACTION_NONE, "");
+}
+
+static uint32_t menu_item_at(int32_t px, int32_t py) {
+    if (!menu_open || px < menu_x || px >= menu_x + MENU_WIDTH)
+        return UINT32_MAX;
+    int32_t y = menu_y + 6;
+    for (uint32_t i = 0; i < menu_item_count; i++) {
+        if (menu_items[i].separator_before) y += 9;
+        if (py >= y && py < y + MENU_ITEM_HEIGHT) return i;
+        y += MENU_ITEM_HEIGHT;
+    }
+    return UINT32_MAX;
+}
+
+static void draw_context_menu(void) {
+    if (!menu_open) return;
+    uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
+    int32_t height = menu_height();
+    fill_rounded_rect(menu_x - 4, menu_y - 2, MENU_WIDTH + 8, height + 8, 11,
+                      0x30000000u);
+    fill_rounded_rect(menu_x, menu_y, MENU_WIDTH, height, 8, 0xFF3A4249u);
+    fill_rounded_rect(menu_x + 1, menu_y + 1, MENU_WIDTH - 2, height - 2, 7,
+                      0xFF1F2428u);
+    int32_t y = menu_y + 6;
+    for (uint32_t i = 0; i < menu_item_count; i++) {
+        const menu_item_t* item = &menu_items[i];
+        if (item->separator_before) {
+            fill_rect(menu_x + 12, y + 4, MENU_WIDTH - 24, 1, 0xFF3A4249u);
+            y += 9;
+        }
+        if (menu_hover == i)
+            fill_rounded_rect(menu_x + 5, y, MENU_WIDTH - 10,
+                              MENU_ITEM_HEIGHT, 5,
+                              0x66000000u | (accent & 0x00FFFFFFu));
+        moswm_draw_file_icon_sized(canvas, display.width, display.height,
+                                   menu_x + 13, y + 6, item->icon, 18u);
+        wm_text(menu_x + 42, y + 10, item->label,
+                item->enabled ? 0xFFF2F6F9u : 0xFF6F7C86u, 0, 1u);
+        y += MENU_ITEM_HEIGHT;
+    }
+}
+
+static void dialog_bounds(int32_t* x, int32_t* y, int32_t* width,
+                          int32_t* height) {
+    *width = display.width > 452u ? 420 : (int32_t)display.width - 32;
+    *height = 186;
+    *x = ((int32_t)display.width - *width) / 2;
+    *y = ((int32_t)display.height - (int32_t)TASKBAR_HEIGHT - *height) / 2;
+    if (*y < 8) *y = 8;
+}
+
+static void draw_dialog(void) {
+    if (dialog_kind == DIALOG_NONE) return;
+    int32_t x, y, width, height;
+    dialog_bounds(&x, &y, &width, &height);
+    bool deleting = dialog_kind == DIALOG_DELETE;
+    fill_rect(0, 0, (int32_t)display.width, (int32_t)display.height,
+              0x660A1218u);
+    fill_rounded_rect(x - 4, y - 2, width + 8, height + 10, 14, 0x30000000u);
+    fill_rounded_rect(x, y, width, height, 12, 0xFF3A4249u);
+    fill_rounded_rect(x + 2, y + 2, width - 4, height - 4, 10, 0xFFF3F5F6u);
+    moswm_draw_file_icon_sized(canvas, display.width, display.height,
+        x + 22, y + 18, deleting ? MOSWM_ICON_TRASH
+            : dialog_kind == DIALOG_RENAME ? MOSWM_ICON_EDIT
+            : MOSWM_ICON_NEWFOLDER, 28u);
+    wm_text(x + 62, y + 24,
+            deleting ? "Delete this item?"
+                : dialog_kind == DIALOG_RENAME ? "Rename" : "New folder",
+            0xFF273640u, 0, 2);
+    if (deleting) {
+        char name[SYSCALL_DIRENT_NAME_SIZE];
+        fit_text_px(name, sizeof(name), path_name(dialog_path), width - 48,
+                    2u);
+        wm_text(x + 24, y + 68, name, 0xFF34434Cu, 0, 2);
+        wm_text(x + 24, y + 96,
+                fs_is_directory(dialog_path)
+                    ? "The folder and everything in it will be removed."
+                    : "It will be removed permanently.",
+                0xFF667680u, 0, 1);
+    } else {
+        fill_rounded_rect(x + 24, y + 62, width - 48, 36, 6, 0xFFBCC6CDu);
+        fill_rounded_rect(x + 25, y + 63, width - 50, 34, 5, 0xFFFFFFFFu);
+        char shown[SYSCALL_DIRENT_NAME_SIZE];
+        fit_text_px(shown, sizeof(shown), dialog_text, width - 80, 1u);
+        wm_text(x + 36, y + 76, shown, 0xFF273640u, 0, 1);
+        fill_rect(x + 38 + (int32_t)moswm_text_width(shown, 1u), y + 70, 1,
+                  20, accent_color | 0xFF000000u);
+    }
+    if (dialog_error[0])
+        wm_text(x + 24, y + 110, dialog_error, 0xFFB43A32u, 0, 1);
+    else if (!deleting)
+        wm_text(x + 24, y + 110, "Enter to confirm, Esc to cancel",
+                0xFF7A8A95u, 0, 1);
+    int32_t button_y = y + height - 52;
+    int32_t confirm_x = x + width - 24 - 112;
+    int32_t cancel_x = confirm_x - 10 - 100;
+    const char* confirm = deleting ? "Delete"
+        : dialog_kind == DIALOG_RENAME ? "Rename" : "Create";
+    fill_rounded_rect(cancel_x, button_y, 100, 34, 7, 0xFFDCE2E6u);
+    wm_text(cancel_x + (100 - (int32_t)moswm_text_width("Cancel", 1u)) / 2,
+            button_y + 11, "Cancel", 0xFF34434Cu, 0, 1);
+    fill_rounded_rect(confirm_x, button_y, 112, 34, 7,
+                      deleting ? 0xFFC8383Du : (accent_color | 0xFF000000u));
+    wm_text(confirm_x + (112 - (int32_t)moswm_text_width(confirm, 1u)) / 2,
+            button_y + 11, confirm, 0xFFFFFFFFu, 0, 1);
+}
+
+static void reload_desktop_apps(void) {
+    desktop_app_count = 0;
+    load_desktop_apps();
+    desktop_apps_generation++;
+}
+
+/* Brings Files and the desktop up to date after a file operation. */
+static void after_file_change(const char* directory, const char* select) {
+    if (browser_window_id && !strcmp(browser_path, directory)) {
+        browser_refresh_directory();
+        if (select) browser_select_name(select);
+    }
+    if (path_has_prefix(directory, "0:/programs")) reload_desktop_apps();
+}
+
+static void dialog_confirm(void) {
+    char parent[BROWSER_PATH_SIZE];
+    char target[BROWSER_PATH_SIZE];
+    if (dialog_kind == DIALOG_DELETE) {
+        if (!path_parent(parent, sizeof(parent), dialog_path) ||
+            !fs_delete_tree(dialog_path, 0)) {
+            strcpy(dialog_error, "Unable to delete this item.");
+            return;
+        }
+        if (path_has_prefix(clipboard_path, dialog_path))
+            clipboard_path[0] = '\0';
+        dialog_kind = DIALOG_NONE;
+        after_file_change(parent, NULL);
+        browser_note("Deleted", false);
+        return;
+    }
+    if (!dialog_length || !strcmp(dialog_text, ".") ||
+        !strcmp(dialog_text, "..")) {
+        strcpy(dialog_error, "Type a name first.");
+        return;
+    }
+    if (dialog_kind == DIALOG_NEW_FOLDER) {
+        if (!path_join(target, sizeof(target), dialog_path, dialog_text)) {
+            strcpy(dialog_error, "That name is too long.");
+        } else if (fs_exists(target)) {
+            strcpy(dialog_error, "That name is already used here.");
+        } else if (mos_syscall3(SYS_MKDIR, (uint64_t)(uintptr_t)target, 0,
+                                0) != SYS_SUCCESS) {
+            strcpy(dialog_error, "Unable to create the folder.");
+        } else {
+            dialog_kind = DIALOG_NONE;
+            after_file_change(dialog_path, dialog_text);
+        }
+        return;
+    }
+    if (!path_parent(parent, sizeof(parent), dialog_path) ||
+        !path_join(target, sizeof(target), parent, dialog_text)) {
+        strcpy(dialog_error, "That name is too long.");
+        return;
+    }
+    if (!strcmp(target, dialog_path)) {
+        dialog_kind = DIALOG_NONE;
+        return;
+    }
+    if (fs_exists(target)) {
+        strcpy(dialog_error, "That name is already used here.");
+        return;
+    }
+    if (!fs_rename(dialog_path, target)) {
+        strcpy(dialog_error, "Unable to rename this item.");
+        return;
+    }
+    if (path_has_prefix(clipboard_path, dialog_path)) clipboard_path[0] = '\0';
+    dialog_kind = DIALOG_NONE;
+    after_file_change(parent, dialog_text);
+}
+
+static void dialog_key(const syscall_input_event_t* input) {
+    if (input->key == 41u) {
+        dialog_kind = DIALOG_NONE;
+        return;
+    }
+    if (input->key == 40u) {
+        dialog_confirm();
+        return;
+    }
+    if (dialog_kind == DIALOG_DELETE) return;
+    if (input->key == 42u) {
+        if (dialog_length) dialog_text[--dialog_length] = '\0';
+        dialog_error[0] = '\0';
+        return;
+    }
+    char character = (char)mos_syscall3(SYS_USB, SYS_USB_KEY_TO_ASCII,
+        input->key, mosdesk_usb_modifiers(input->mods));
+    if (character >= 32 && character <= 126 && character != '/' &&
+        character != ':' && character != '\\' &&
+        dialog_length + 1u < sizeof(dialog_text)) {
+        dialog_text[dialog_length++] = character;
+        dialog_text[dialog_length] = '\0';
+        dialog_error[0] = '\0';
+    }
+}
+
+static void dialog_click(void) {
+    int32_t x, y, width, height;
+    dialog_bounds(&x, &y, &width, &height);
+    int32_t button_y = y + height - 52;
+    int32_t confirm_x = x + width - 24 - 112;
+    int32_t cancel_x = confirm_x - 10 - 100;
+    if (cursor_y < button_y || cursor_y >= button_y + 34) return;
+    if (cursor_x >= confirm_x && cursor_x < confirm_x + 112)
+        dialog_confirm();
+    else if (cursor_x >= cancel_x && cursor_x < cancel_x + 100)
+        dialog_kind = DIALOG_NONE;
+}
+
+/* Opens MOSdesk Settings, optionally on a named page ("wallpaper"). */
+static void open_settings(const char* page) {
+    const char* settings_path = "0:/programs/mosdesk/mosdesk.run";
+    const char* arguments[1] = {page};
+    if ((int64_t)mos_syscall3(SYS_EXEC, (uint64_t)(uintptr_t)settings_path,
+            page ? (uint64_t)(uintptr_t)arguments : 0, page ? 1u : 0u) < 0)
+        strcpy(status_message, "Unable to open MOSdesk Settings");
+}
+
+static void paste_into(const char* directory) {
+    char target[BROWSER_PATH_SIZE];
+    const char* name = path_name(clipboard_path);
+    if (!clipboard_path[0] || !fs_exists(clipboard_path)) {
+        clipboard_path[0] = '\0';
+        browser_note("The copied item no longer exists", true);
+    } else if (path_has_prefix(directory, clipboard_path)) {
+        browser_note("A folder cannot be pasted into itself", true);
+    } else if (!unique_copy_path(target, sizeof(target), directory, name)) {
+        browser_note("Unable to choose a name for the copy", true);
+    } else if (!fs_copy_tree(clipboard_path, target, 0)) {
+        if (fs_exists(target)) fs_delete_tree(target, 0);
+        browser_note("Unable to paste here", true);
+    } else {
+        after_file_change(directory, path_name(target));
+        browser_note("Pasted", false);
+    }
+}
+
+static void run_menu_action(menu_action_t action) {
+    char parent[BROWSER_PATH_SIZE];
+    switch (action) {
+        case MENU_ACTION_OPEN:
+            open_path(menu_target, menu_path);
+            break;
+        case MENU_ACTION_SHOW_IN_FILES:
+            if (path_parent(parent, sizeof(parent), menu_path)) {
+                browser_open(parent);
+                browser_select_name(path_name(menu_path));
+            }
+            break;
+        case MENU_ACTION_SET_WALLPAPER:
+            set_wallpaper_image(menu_path);
+            break;
+        case MENU_ACTION_COPY:
+            strcpy(clipboard_path, menu_path);
+            browser_note("Copied", false);
+            break;
+        case MENU_ACTION_PASTE:
+            paste_into(menu_path);
+            break;
+        case MENU_ACTION_RENAME:
+            open_dialog(DIALOG_RENAME, menu_path, path_name(menu_path));
+            break;
+        case MENU_ACTION_DELETE:
+            open_dialog(DIALOG_DELETE, menu_path, "");
+            break;
+        case MENU_ACTION_NEW_FOLDER:
+            open_dialog(DIALOG_NEW_FOLDER, menu_path, "New folder");
+            break;
+        case MENU_ACTION_REFRESH:
+            if (menu_path[0]) browser_refresh_directory();
+            else reload_desktop_apps();
+            break;
+        case MENU_ACTION_FILES:
+            browser_open(MOSDESK_USERS_PATH);
+            break;
+        case MENU_ACTION_WALLPAPERS:
+            open_settings("wallpaper");
+            break;
+        case MENU_ACTION_SETTINGS:
+            open_settings(NULL);
+            break;
+        default:
+            break;
+    }
 }
 
 static void auth_dialog_bounds(int32_t* x, int32_t* y,
@@ -2348,7 +3487,7 @@ static void auth_dialog_bounds(int32_t* x, int32_t* y,
 }
 
 static void draw_auth_screen(void) {
-    draw_wallpaper();
+    copy_wallpaper(canvas);
     fill_rect(0, 0, (int32_t)display.width, (int32_t)display.height,
               0x660A1218u);
     int32_t x, y, width, height;
@@ -2407,18 +3546,6 @@ static void draw_auth_screen(void) {
     if (auth_message[0])
         wm_text(x + 28, y + height - 78, auth_message,
                 0xFFB43A32u, 0, 1);
-    cursor_animation_elapsed_ms = mos_syscall1(SYS_UPTIME, 0);
-    draw_cursor();
-    if (mos_graphics_blit_surface(canvas, display.width, display.height,
-            display.width * sizeof(uint32_t), 0, 0,
-            (int32_t)display.width, (int32_t)display.height, 0, 0,
-            SYS_GRAPHICS_BLIT_OPAQUE) != SYS_SUCCESS) {
-        strcpy(status_message, "Framebuffer update failed");
-        return;
-    }
-    if (mos_graphics_present(0, 0, (int32_t)display.width,
-                             (int32_t)display.height) != SYS_SUCCESS)
-        strcpy(status_message, "Display present failed");
 }
 
 static bool save_auth_preferences(bool password_enabled) {
@@ -2536,39 +3663,271 @@ static void handle_auth_click(void) {
     }
 }
 
-static void render(const syscall_window_info_t* windows, uint64_t count) {
-    if (auth_state != AUTH_NONE) {
-        draw_auth_screen();
+/* ---------------------------------------------------------- debug overlay */
+
+static uint64_t read_tsc(void) {
+    uint32_t low, high;
+    __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
+    return ((uint64_t)high << 32) | low;
+}
+
+/* Charges the time since the previous lap to `stage`. */
+static void debug_lap(profile_stage_t stage) {
+    if (!debug_fps && !debug_profiler) return;
+    uint64_t now = read_tsc();
+    uint64_t spent = now - debug_lap_ticks;
+    debug_lap_ticks = now;
+    debug_stage_ticks[stage] += spent;
+    if (spent > debug_stage_peak[stage]) debug_stage_peak[stage] = spent;
+}
+
+static void debug_restart_window(uint64_t now_ms) {
+    debug_window_start_ms = now_ms;
+    debug_window_start_ticks = debug_lap_ticks;
+    memset(debug_stage_ticks, 0, sizeof(debug_stage_ticks));
+    memset(debug_stage_peak, 0, sizeof(debug_stage_peak));
+    debug_frames = 0;
+    debug_pointer_draws = 0;
+    debug_mouse_events = 0;
+    debug_repaints = 0;
+}
+
+/* Called once per trip round the main loop; publishes a report every second.
+ * The stopwatch counts CPU timestamp ticks and is scaled against the kernel's
+ * millisecond clock over the same second. */
+static void debug_frame_end(void) {
+    if (!debug_fps && !debug_profiler) {
+        if (debug_window_open) {
+            debug_window_open = false;
+            debug_report.valid = false;
+        }
         return;
     }
-    draw_wallpaper();
-    draw_desktop_icons();
-    for (uint32_t focus_pass = 0; focus_pass < 2; focus_pass++) {
-        for (uint64_t i = 0; i < count; i++) {
-            const syscall_window_info_t* info = &windows[i];
-            bool focused = info->id == focused_id;
-            if ((focus_pass == 0 && focused) || (focus_pass == 1 && !focused))
-                continue;
-            if (!(info->flags & SYSCALL_WINDOW_VISIBLE) ||
-                (info->flags & SYSCALL_WINDOW_MINIMIZED))
-                continue;
-            cached_window_t* entry = cache_for(info->id);
-            if (entry) composite_window(info, entry);
+    uint64_t now_ms = mos_syscall1(SYS_UPTIME, 0);
+    if (!debug_window_open) {
+        /* The laps of the frame that switched the overlay on are partial. */
+        debug_window_open = true;
+        debug_restart_window(now_ms);
+        return;
+    }
+    debug_frames++;
+    uint64_t elapsed_ms = now_ms - debug_window_start_ms;
+    if (elapsed_ms < 1000u) return;
+
+    uint64_t ticks_per_us = (debug_lap_ticks - debug_window_start_ticks) /
+                            (elapsed_ms * 1000u);
+    if (!ticks_per_us) ticks_per_us = 1u;
+    debug_report.valid = true;
+    debug_report.fps_tenths =
+        (uint32_t)((uint64_t)debug_frames * 10000u / elapsed_ms);
+    debug_report.frame_us = (uint32_t)(elapsed_ms * 1000u / debug_frames);
+    debug_report.pointer_per_second =
+        (uint32_t)(((uint64_t)debug_pointer_draws * 1000u + elapsed_ms / 2u) /
+                   elapsed_ms);
+    debug_report.mouse_per_second =
+        (uint32_t)(((uint64_t)debug_mouse_events * 1000u + elapsed_ms / 2u) /
+                   elapsed_ms);
+    debug_report.repaints_per_second =
+        (uint32_t)(((uint64_t)debug_repaints * 1000u + elapsed_ms / 2u) /
+                   elapsed_ms);
+    for (uint32_t i = 0; i < PROFILE_STAGES; i++) {
+        debug_report.average_us[i] =
+            (uint32_t)(debug_stage_ticks[i] / debug_frames / ticks_per_us);
+        debug_report.peak_us[i] =
+            (uint32_t)(debug_stage_peak[i] / ticks_per_us);
+    }
+    debug_generation++;
+    debug_restart_window(now_ms);
+}
+
+static char* append_text(char* output, const char* text) {
+    while (*text) *output++ = *text++;
+    *output = '\0';
+    return output;
+}
+
+static char* append_number(char* output, uint32_t value) {
+    char digits[12];
+    uint32_t length = 0;
+    do {
+        digits[length++] = (char)('0' + value % 10u);
+        value /= 10u;
+    } while (value);
+    while (length) *output++ = digits[--length];
+    *output = '\0';
+    return output;
+}
+
+/* Microseconds as milliseconds with two decimals: 16670 -> "16.67". */
+static char* append_ms(char* output, uint32_t microseconds) {
+    uint32_t hundredths = (microseconds + 5u) / 10u;
+    output = append_number(output, hundredths / 100u);
+    *output++ = '.';
+    *output++ = (char)('0' + hundredths / 10u % 10u);
+    *output++ = (char)('0' + hundredths % 10u);
+    *output = '\0';
+    return output;
+}
+
+static void debug_text_right(int32_t right, int32_t y, const char* text,
+                             uint32_t color) {
+    wm_text(right - (int32_t)moswm_text_width(text, 1u), y, text, color, 0,
+            1);
+}
+
+static void draw_debug_overlay(void) {
+    if (!debug_fps && !debug_profiler) return;
+    static const char* const stage_names[PROFILE_STAGES] = {
+        "Settings poll", "Files window", "Window surfaces", "Input",
+        "Cursor, hover, clock", "Scene draw", "Present", "Sleep"
+    };
+    const debug_report_t* report = &debug_report;
+    const int32_t width = 268, row = 17;
+    uint32_t rows = 0;
+    if (!report->valid) rows = 1u;
+    else rows = (debug_fps ? 4u : 0u) +
+                (debug_profiler ? PROFILE_STAGES + 1u : 0u);
+    int32_t height = (int32_t)rows * row + 15 +
+                     (report->valid && debug_fps && debug_profiler ? 9 : 0);
+    int32_t x = (int32_t)display.width - width - 8;
+    int32_t y = 8;
+    int32_t right = x + width - 12;
+    int32_t peak_right = right;
+    int32_t average_right = right - 64;
+    fill_rounded_rect(x, y, width, height, 6, 0xD910161Bu);
+    y += 10;
+    if (!report->valid) {
+        wm_text(x + 12, y, "Measuring...", 0xFFB7C4CEu, 0, 1);
+        return;
+    }
+    char line[48];
+    if (debug_fps) {
+        char* end = append_number(line, report->fps_tenths / 10u);
+        *end++ = '.';
+        *end++ = (char)('0' + report->fps_tenths % 10u);
+        append_text(end, " fps");
+        /* Green at a full 60 Hz loop, amber when it sags, red when it crawls. */
+        wm_text(x + 12, y, line,
+                report->fps_tenths >= 450u ? 0xFF7FE0A0u
+                    : report->fps_tenths >= 200u ? 0xFFFFD36Bu : 0xFFFF8A80u,
+                0, 1);
+        append_text(append_ms(line, report->frame_us), " ms/frame");
+        debug_text_right(right, y, line, 0xFFE8EEF2u);
+        y += row;
+        static const char* const rate_names[3] = {
+            "Pointer redraws", "Mouse events", "Scene repaints"};
+        const uint32_t rates[3] = {report->pointer_per_second,
+                                   report->mouse_per_second,
+                                   report->repaints_per_second};
+        for (uint32_t i = 0; i < 3u; i++) {
+            wm_text(x + 12, y, rate_names[i], 0xFFB7C4CEu, 0, 1);
+            append_text(append_number(line, rates[i]), " /s");
+            debug_text_right(right, y, line, 0xFFE8EEF2u);
+            y += row;
         }
     }
-    draw_taskbar(windows, count);
-    cursor_animation_elapsed_ms = mos_syscall1(SYS_UPTIME, 0);
-    draw_cursor();
-    if (mos_graphics_blit_surface(canvas, display.width, display.height,
-            display.width * sizeof(uint32_t), 0, 0,
-            (int32_t)display.width, (int32_t)display.height, 0, 0,
-            SYS_GRAPHICS_BLIT_OPAQUE) != SYS_SUCCESS) {
-        strcpy(status_message, "Framebuffer update failed");
-        return;
+    if (debug_profiler) {
+        if (debug_fps) {
+            fill_rect(x + 12, y + 1, width - 24, 1, 0x40FFFFFFu);
+            y += 9;
+        }
+        wm_text(x + 12, y, "Stage (ms per frame)", 0xFF8EC5FFu, 0, 1);
+        debug_text_right(average_right, y, "avg", 0xFF8EC5FFu);
+        debug_text_right(peak_right, y, "peak", 0xFF8EC5FFu);
+        y += row;
+        for (uint32_t i = 0; i < PROFILE_STAGES; i++) {
+            /* Sleep is the idle part of a frame; everything else is work,
+             * flagged once it alone would break a 60 Hz frame. */
+            bool slow = i != PROFILE_SLEEP && report->average_us[i] >= 8000u;
+            wm_text(x + 12, y, stage_names[i],
+                    slow ? 0xFFFF8A80u : 0xFFB7C4CEu, 0, 1);
+            append_ms(line, report->average_us[i]);
+            debug_text_right(average_right, y, line,
+                             slow ? 0xFFFF8A80u : 0xFFE8EEF2u);
+            append_ms(line, report->peak_us[i]);
+            debug_text_right(peak_right, y, line, 0xFF94A5B1u);
+            y += row;
+        }
     }
-    if (mos_graphics_present(0, 0, (int32_t)display.width,
-                             (int32_t)display.height) != SYS_SUCCESS)
-        strcpy(status_message, "Display present failed");
+}
+
+/* Everything the scene shows, folded into one number: when it is unchanged
+ * from the last frame there is nothing to repaint but the pointer. */
+static uint64_t compute_scene_signature(const syscall_window_info_t* windows,
+                                        uint64_t count) {
+    uint64_t hash = 0xCBF29CE484222325ull;
+    hash = hash_u64(hash, auth_state);
+    hash = hash_u64(hash, accent_color);
+    hash = hash_text(hash, status_message);
+    hash = hash_u64(hash, ((uint64_t)debug_fps << 33) |
+                          ((uint64_t)debug_profiler << 32) |
+                          debug_generation);
+    if (auth_state != AUTH_NONE) {
+        hash = hash_u64(hash, wallpaper_generation);
+        hash = hash_u64(hash, auth_password_length);
+        return hash_text(hash, auth_message);
+    }
+    hash = hash_u64(hash, desktop_signature());
+    hash = hash_bytes(hash, windows, (size_t)count * sizeof(*windows));
+    for (uint64_t i = 0; i < count; i++) {
+        cached_window_t* entry = cache_for(windows[i].id);
+        if (entry && entry->has_icon) hash = hash_u64(hash, entry->icon_sum);
+    }
+    hash = hash_u64(hash, ((uint64_t)focused_id << 32) | hover_taskbar);
+    hash = hash_u64(hash, ((uint64_t)start_menu_open << 32) | hover_start_row);
+    hash = hash_u64(hash, clock_valid);
+    hash = hash_bytes(hash, &clock_time, sizeof(clock_time));
+    hash = hash_u64(hash, ((uint64_t)menu_open << 32) | menu_hover);
+    if (menu_open) {
+        hash = hash_u64(hash, ((uint64_t)(uint32_t)menu_x << 32) |
+                              (uint32_t)menu_y);
+        for (uint32_t i = 0; i < menu_item_count; i++)
+            hash = hash_u64(hash, ((uint64_t)menu_items[i].action << 1) |
+                                  menu_items[i].enabled);
+    }
+    hash = hash_u64(hash, dialog_kind);
+    if (dialog_kind != DIALOG_NONE) {
+        hash = hash_text(hash, dialog_path);
+        hash = hash_text(hash, dialog_text);
+        hash = hash_text(hash, dialog_error);
+    }
+    return hash;
+}
+
+static void render(const syscall_window_info_t* windows, uint64_t count) {
+    ensure_wallpaper();
+    uint64_t signature = compute_scene_signature(windows, count);
+    bool repaint = !scene_valid || signature != scene_signature;
+    if (repaint && auth_state != AUTH_NONE) {
+        draw_auth_screen();
+    } else if (repaint) {
+        compose_desktop();
+        for (uint32_t focus_pass = 0; focus_pass < 2; focus_pass++) {
+            for (uint64_t i = 0; i < count; i++) {
+                const syscall_window_info_t* info = &windows[i];
+                bool focused = info->id == focused_id;
+                if ((focus_pass == 0 && focused) ||
+                    (focus_pass == 1 && !focused))
+                    continue;
+                if (!(info->flags & SYSCALL_WINDOW_VISIBLE) ||
+                    (info->flags & SYSCALL_WINDOW_MINIMIZED))
+                    continue;
+                cached_window_t* entry = cache_for(info->id);
+                if (entry) composite_window(info, entry);
+            }
+        }
+        draw_taskbar(windows, count);
+        draw_context_menu();
+        draw_dialog();
+    }
+    if (repaint) {
+        draw_debug_overlay();
+        scene_signature = signature;
+        scene_valid = true;
+    }
+    debug_lap(PROFILE_DRAW);
+    present_frame(repaint);
+    debug_lap(PROFILE_PRESENT);
 }
 
 static syscall_window_info_t* window_at(syscall_window_info_t* windows,
@@ -2757,18 +4116,26 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
     desktop_icon_drag_index = UINT32_MAX;
     desktop_icon_drag_moved = false;
     uint32_t taskbar_y = display.height - TASKBAR_HEIGHT;
-    if (start_menu_open && cursor_x >= 12 && cursor_x < 298 &&
-        cursor_y >= (int32_t)taskbar_y - 268 &&
-        cursor_y < (int32_t)taskbar_y - 10) {
+    int32_t menu_left, menu_top, menu_width, menu_tall;
+    start_menu_bounds(&menu_left, &menu_top, &menu_width, &menu_tall);
+    if (start_menu_open && cursor_x >= menu_left &&
+        cursor_x < menu_left + menu_width && cursor_y >= menu_top &&
+        cursor_y < menu_top + menu_tall) {
         last_click_valid = false;
-        if (cursor_y >= (int32_t)taskbar_y - 192 &&
-            cursor_y < (int32_t)taskbar_y - 156) {
-            const char* settings_path = "0:/programs/mosdesk/mosdesk.run";
-            int64_t process_id = (int64_t)mos_syscall3(SYS_EXEC,
-                (uint64_t)(uintptr_t)settings_path, 0, 0);
-            if (process_id < 0)
-                strcpy(status_message, "Unable to open MOSdesk Settings");
-            start_menu_open = false;
+        uint32_t row = start_menu_row_at(cursor_x, cursor_y);
+        if (row == UINT32_MAX) return;
+        start_menu_open = false;
+        uint32_t apps[START_MENU_MAX_ROWS];
+        uint32_t app_count = start_menu_rows(apps);
+        if (row == 0u) {
+            browser_open(MOSDESK_USERS_PATH);
+        } else if (row == 1u) {
+            open_settings(NULL);
+        } else if (row == 2u) {
+            open_settings("wallpaper");
+        } else if (row - 3u < app_count) {
+            open_path(CLICK_ACTION_APPLICATION,
+                      desktop_apps[apps[row - 3u]].path);
         }
         return;
     }
@@ -2830,6 +4197,7 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
     int32_t x = cursor_x - (int32_t)info->x;
     int32_t y = cursor_y - (int32_t)info->y;
     int32_t right = (int32_t)info->width + 1;
+    start_menu_open = false;
     if (info->id == browser_window_id) {
         if (y >= (int32_t)TITLE_HEIGHT) {
             browser_mouse_down(x - 1,
@@ -2857,6 +4225,94 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
                y >= (int32_t)info->height + (int32_t)TITLE_HEIGHT - 14) {
         start_move(info, true);
     }
+}
+
+static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
+    start_menu_open = false;
+    pending_click_action = CLICK_ACTION_NONE;
+    last_click_valid = false;
+    if ((uint32_t)cursor_y >= display.height - TASKBAR_HEIGHT) return;
+    syscall_window_info_t* info =
+        window_at(windows, count, cursor_x, cursor_y);
+    if (info) {
+        /* Other applications get the click as an ordinary window event. */
+        if (info->id != browser_window_id) return;
+        int32_t x = cursor_x - (int32_t)info->x - 1;
+        int32_t y = cursor_y - (int32_t)info->y - (int32_t)TITLE_HEIGHT - 1;
+        if (y < (int32_t)BROWSER_HEADER_HEIGHT ||
+            y >= (int32_t)browser_height - (int32_t)BROWSER_FOOTER_HEIGHT)
+            return;
+        uint32_t index = browser_row_at(x, y);
+        char entry_path[BROWSER_PATH_SIZE];
+        if (index == UINT32_MAX) {
+            menu_show_for_folder(browser_path);
+        } else if (path_join(entry_path, sizeof(entry_path), browser_path,
+                             browser_entries[index].name)) {
+            browser_selected = index;
+            browser_generation++;
+            menu_show_for_item(CLICK_ACTION_BROWSER_ENTRY, entry_path);
+        }
+        return;
+    }
+    uint32_t app_index = UINT32_MAX;
+    click_action_t action =
+        desktop_shortcut_at(cursor_x, cursor_y, &app_index);
+    if (action == CLICK_ACTION_HOME)
+        menu_show_for_item(action, MOSDESK_USERS_PATH);
+    else if (action == CLICK_ACTION_SYSTEM)
+        menu_show_for_item(action, "0:/");
+    else if (action == CLICK_ACTION_APPLICATION)
+        menu_show_for_item(action, desktop_apps[app_index].path);
+    else
+        menu_show_for_desktop();
+}
+
+/* Works out what the pointer is resting on, for hover highlights. */
+static void update_hover(syscall_window_info_t* windows, uint64_t count) {
+    hover_desktop_icon = UINT32_MAX;
+    hover_taskbar = UINT32_MAX;
+    hover_start_row = UINT32_MAX;
+    menu_hover = UINT32_MAX;
+    browser_hover = UINT32_MAX;
+    browser_tool_hover = UINT32_MAX;
+    if (auth_state != AUTH_NONE || dialog_kind != DIALOG_NONE) return;
+    if (menu_open) {
+        uint32_t item = menu_item_at(cursor_x, cursor_y);
+        if (item != UINT32_MAX && menu_items[item].enabled) menu_hover = item;
+        return;
+    }
+    if (dragging_id || desktop_icon_drag_index != UINT32_MAX) return;
+    if (start_menu_open) {
+        int32_t x, y, width, height;
+        start_menu_bounds(&x, &y, &width, &height);
+        if (cursor_x >= x && cursor_x < x + width && cursor_y >= y &&
+            cursor_y < y + height) {
+            hover_start_row = start_menu_row_at(cursor_x, cursor_y);
+            return;
+        }
+    }
+    if ((uint32_t)cursor_y >= display.height - TASKBAR_HEIGHT) {
+        if (cursor_x < 44) {
+            hover_taskbar = 0u;
+        } else if (cursor_x >= 60 && (uint32_t)(cursor_x - 60) % 180u < 176u) {
+            uint32_t index = (uint32_t)(cursor_x - 60) / 180u;
+            if (index < count) hover_taskbar = index + 1u;
+        }
+        return;
+    }
+    syscall_window_info_t* info =
+        window_at(windows, count, cursor_x, cursor_y);
+    if (!info) {
+        hover_desktop_icon = desktop_icon_at(cursor_x, cursor_y);
+        return;
+    }
+    if (info->id != browser_window_id) return;
+    int32_t x = cursor_x - (int32_t)info->x - 1;
+    int32_t y = cursor_y - (int32_t)info->y - (int32_t)TITLE_HEIGHT - 1;
+    if (y < 0) return;
+    browser_tool_hover = browser_tool_at(x, y);
+    if (y < (int32_t)browser_height - (int32_t)BROWSER_FOOTER_HEIGHT)
+        browser_hover = browser_row_at(x, y);
 }
 
 static void on_mouse_up(syscall_window_info_t* windows, uint64_t count,
@@ -2939,6 +4395,7 @@ static void on_mouse_up(syscall_window_info_t* windows, uint64_t count,
 
 static void route_input(const syscall_input_event_t* input,
                         syscall_window_info_t* windows, uint64_t count) {
+    if (input->type == SYSCALL_INPUT_MOUSE_MOVE) debug_mouse_events++;
     if (auth_state != AUTH_NONE) {
         if (input->type == SYSCALL_INPUT_MOUSE_MOVE) {
             int32_t scaled_x =
@@ -2980,6 +4437,7 @@ static void route_input(const syscall_input_event_t* input,
             cursor_x = (int32_t)display.width - 1;
         if ((uint32_t)cursor_y >= display.height)
             cursor_y = (int32_t)display.height - 1;
+        if (menu_open || dialog_kind != DIALOG_NONE) return;
         move_dragged_window(windows, count);
         syscall_window_info_t* under =
             window_at(windows, count, cursor_x, cursor_y);
@@ -3001,7 +4459,28 @@ static void route_input(const syscall_input_event_t* input,
         bool was_down =
             (previous_buttons & SYSCALL_INPUT_BTN_LEFT) != 0;
         bool is_down = (input->buttons & SYSCALL_INPUT_BTN_LEFT) != 0;
+        bool right_was_down =
+            (previous_buttons & SYSCALL_MOUSE_BTN_RIGHT) != 0;
+        bool right_is_down = (input->buttons & SYSCALL_MOUSE_BTN_RIGHT) != 0;
+        bool right_pressed = !right_was_down && right_is_down;
         previous_buttons = input->buttons;
+        if (dialog_kind != DIALOG_NONE) {
+            if (!was_down && is_down) dialog_click();
+            return;
+        }
+        if (menu_open) {
+            /* A click picks an item or dismisses the menu; it never falls
+             * through to whatever is underneath. */
+            if (!was_down && is_down) {
+                uint32_t item = menu_item_at(cursor_x, cursor_y);
+                menu_open = false;
+                if (item != UINT32_MAX && menu_items[item].enabled)
+                    run_menu_action(menu_items[item].action);
+                return;
+            }
+            if (!right_pressed) return;
+            menu_open = false;
+        }
         syscall_window_info_t* under =
             window_at(windows, count, cursor_x, cursor_y);
         if (under) {
@@ -3020,18 +4499,22 @@ static void route_input(const syscall_input_event_t* input,
         if (!was_down && is_down) on_mouse_down(windows, count);
         else if (was_down && !is_down)
             on_mouse_up(windows, count, input->time_ms);
+        if (right_pressed) on_right_down(windows, count);
     } else if (input->type == SYSCALL_INPUT_MOUSE_WHEEL) {
+        if (menu_open || dialog_kind != DIALOG_NONE) return;
         syscall_window_info_t* under =
             window_at(windows, count, cursor_x, cursor_y);
         if (under && under->id == browser_window_id) {
-            uint32_t visible_rows = browser_height > 106u
-                ? (browser_height - 106u) / BROWSER_ROW_HEIGHT : 0u;
+            uint32_t visible_rows = browser_visible_rows(browser_height);
             uint32_t max_scroll = browser_entry_count > visible_rows
                 ? browser_entry_count - visible_rows : 0u;
-            if (input->wheel < 0 && browser_scroll < max_scroll)
-                browser_scroll++;
-            else if (input->wheel > 0 && browser_scroll)
-                browser_scroll--;
+            uint32_t step = max_scroll < 3u ? max_scroll : 3u;
+            if (input->wheel < 0)
+                browser_scroll = browser_scroll + step > max_scroll
+                    ? max_scroll : browser_scroll + step;
+            else if (input->wheel > 0)
+                browser_scroll = browser_scroll > step
+                    ? browser_scroll - step : 0u;
             last_click_valid = false;
             return;
         }
@@ -3050,6 +4533,15 @@ static void route_input(const syscall_input_event_t* input,
         }
     } else if (input->type == SYSCALL_INPUT_KEY_DOWN ||
                input->type == SYSCALL_INPUT_KEY_UP) {
+        if (dialog_kind != DIALOG_NONE) {
+            if (input->type == SYSCALL_INPUT_KEY_DOWN) dialog_key(input);
+            return;
+        }
+        if (menu_open) {
+            if (input->type == SYSCALL_INPUT_KEY_DOWN && input->key == 41u)
+                menu_open = false;
+            return;
+        }
         if (!focused_id) return;
         syscall_window_event_t event = {
             .type = SYSCALL_WINDOW_EVENT_KEY,
@@ -3072,6 +4564,8 @@ static void cleanup(void) {
     canvas = NULL;
     wm_free(wallpaper);
     wallpaper = NULL;
+    wm_free(desktop_layer);
+    desktop_layer = NULL;
     wm_free(wallpaper_source);
     wallpaper_source = NULL;
     wm_free(font_regular_data);
@@ -3121,6 +4615,9 @@ int main(void) {
     }
     wallpaper = wm_malloc((size_t)display.width * display.height *
                           sizeof(uint32_t));
+    if (wallpaper)
+        desktop_layer = wm_malloc((size_t)display.width * display.height *
+                                  sizeof(uint32_t));
     cursor_x = (int32_t)(display.width / 2u);
     cursor_y = (int32_t)(display.height / 2u);
     load_desktop_settings();
@@ -3150,7 +4647,9 @@ int main(void) {
             settings_poll_frames = 0;
             load_desktop_settings();
         }
+        debug_lap(PROFILE_SETTINGS);
         browser_render();
+        debug_lap(PROFILE_FILES);
         uint64_t count = mos_window_list(windows, MAX_WINDOWS);
         if (count > MAX_WINDOWS) {
             strcpy(status_message, "Unable to enumerate windows");
@@ -3163,10 +4662,17 @@ int main(void) {
             cached_window_t* entry = cache_for(windows[i].id);
             if (windows[i].flags & SYSCALL_WINDOW_FOCUSED)
                 focused_id = windows[i].id;
+            /* A window that has just appeared takes the keyboard focus. */
+            if (entry && !entry->announced) {
+                entry->announced = true;
+                if (windows[i].flags & SYSCALL_WINDOW_VISIBLE)
+                    focus_window(&windows[i]);
+            }
             refresh_window_icon(entry, refresh_icons);
             if (entry && !refresh_frame(entry, &windows[i]))
                 strcpy(status_message, "Unable to read a window surface");
         }
+        debug_lap(PROFILE_WINDOWS);
 
         uint64_t event_count = mos_input_read(input, 32, 0, NULL);
         if (event_count <= 32) {
@@ -3175,8 +4681,14 @@ int main(void) {
         } else if (event_count != SYS_ERR_AGAIN) {
             strcpy(status_message, "Input read failed");
         }
+        debug_lap(PROFILE_INPUT);
         update_cursor_appearance(windows, count);
+        update_hover(windows, count);
+        update_clock();
+        debug_lap(PROFILE_POINTER);
         render(windows, count);
         mos_sleep(16);
+        debug_lap(PROFILE_SLEEP);
+        debug_frame_end();
     }
 }

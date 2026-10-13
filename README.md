@@ -12,7 +12,7 @@ https://github.com/user-attachments/assets/bddd45a1-8dfb-4670-86b6-80896696b8b8
 
 - Composites desktop layers and window surfaces with dirty-rectangle updates
 - Keeps desktop shortcut positions across restarts, with optional grid snapping
-- Includes six coordinated color themes and eight photo wallpapers selectable in the File Browser, with fill, crop, stretch, and rotation controls
+- Includes six coordinated color themes and eight photo wallpapers selectable in Settings > Appearance, with fill, crop, stretch, and rotation controls
 - Renders smooth, anti-aliased OpenType/TrueType text (Inter, bundled) through the reusable `ttrend` / `ttrend_outline` libraries, with the bitmap font as a fallback
 - Produces SDK `.slib` bundles that can be consumed by other freestanding programs
 - Packages the desktop as a Minimal-OS deliver package (`.mpkg`) for installation
@@ -77,9 +77,11 @@ python3 -m pip install Pillow
 python3 mosWM/tools/generate_wallpapers.py
 ```
 
-In MOSdesk, open System, choose Wallpapers in the File Browser, then
-double-click a photo to apply it. The File Browser toolbar selects fill, crop,
-stretch, and repeated 90-degree rotation.
+In MOSdesk, open Settings > Appearance (or right-click the desktop and choose
+Change wallpaper) and click a theme or photo to apply it. The same page has
+the accent colours and the fill, crop, stretch, and rotate controls; it
+scrolls with the mouse wheel or its scrollbar. The converter also writes the
+small previews that page shows.
 
 ## Cursor showcase
 
@@ -136,8 +138,9 @@ On the first MOSdesk launch, mosWM creates `0:/users/` and shows a one-time
 setup asking whether to enable password sign-in. Choosing no enables automatic
 sign-in; choosing yes sets the desktop password. Password sign-in is a
 MOSdesk desktop gate, not an OS-level account or filesystem security boundary.
-Settings includes Appearance (accent and wallpaper), Mouse, Cursor, and Login
-pages.
+Settings includes Appearance (accent and wallpaper), Mouse, Cursor, Login,
+Desktop, and Debug pages. Debug switches on an FPS meter and a per-stage
+frame profiler that mosWM draws in the top-right corner of the screen.
 
 The standalone manager can also be started manually from the Minimal-OS
 terminal:

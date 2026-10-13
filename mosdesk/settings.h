@@ -57,7 +57,32 @@ typedef struct {
     char wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE];
     uint32_t desktop_icon_x[MOSDESK_DESKTOP_ICON_COUNT];
     uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t debug_fps;
+    uint32_t debug_profiler;
 } mosdesk_settings_t;
+
+/* The layout before the debug switches were appended: a file of this size
+ * is the leading part of mosdesk_settings_t. */
+typedef struct {
+    uint32_t magic;
+    uint32_t mouse_speed;
+    uint32_t accent_color;
+    uint32_t cursor_fill;
+    uint32_t cursor_scale;
+    uint32_t cursor_pack;
+    uint32_t wallpaper;
+    uint32_t onboarding_complete;
+    uint32_t login_enabled;
+    uint8_t password_salt[MOSDESK_PASSWORD_SALT_SIZE];
+    uint8_t password_hash[MOSDESK_PASSWORD_HASH_SIZE];
+    uint32_t click_once_open;
+    uint32_t grid_enabled;
+    uint32_t wallpaper_mode;
+    uint32_t wallpaper_rotation;
+    char wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE];
+    uint32_t desktop_icon_x[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT];
+} mosdesk_settings_v4_t;
 
 typedef struct {
     uint32_t magic;
@@ -132,6 +157,11 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
                 (uintptr_t)&settings, sizeof(settings)) !=
             (long)sizeof(settings))
+            settings = mosdesk_settings_default();
+    } else if (size == (long)sizeof(mosdesk_settings_v4_t)) {
+        if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
+                (uintptr_t)&settings, sizeof(mosdesk_settings_v4_t)) !=
+            (long)sizeof(mosdesk_settings_v4_t))
             settings = mosdesk_settings_default();
     } else if (size == (long)sizeof(mosdesk_settings_v3_t)) {
         mosdesk_settings_v3_t legacy;
@@ -213,6 +243,7 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         settings.cursor_pack > MOSDESK_CURSOR_PACK_CLASSIC ||
         settings.wallpaper > 5u ||
         settings.grid_enabled > 1u ||
+        settings.debug_fps > 1u || settings.debug_profiler > 1u ||
         settings.wallpaper_mode > MOSDESK_WALLPAPER_STRETCH ||
         settings.wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE - 1u] != '\0' ||
         settings.onboarding_complete > 1u ||

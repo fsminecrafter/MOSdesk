@@ -68,9 +68,18 @@ uint64_t mos_graphics_acquire(void) { return 0; }
 uint64_t mos_graphics_release(void) { return 0; }
 uint64_t mos_graphics_info(syscall_graphics_info_t* i) { i->width = harness_w; i->height = harness_h; i->pixel_format = 1; i->pitch = harness_w * 4; return 0; }
 uint64_t mos_graphics_blit_surface(const uint32_t* px, uint32_t w, uint32_t h, uint32_t pitch, int32_t sx, int32_t sy, int32_t sw, int32_t sh, int32_t dx, int32_t dy, uint32_t flags) {
-    (void)pitch; (void)sx; (void)sy; (void)sw; (void)sh; (void)dx; (void)dy; (void)flags;
-    if (!harness_fb) harness_fb = malloc((size_t)w * h * 4);
-    memcpy(harness_fb, px, (size_t)w * h * 4); return 0;
+    (void)w; (void)h; (void)flags;
+    /* The compositor blits the whole scene, then small pointer patches. */
+    if (!harness_fb) harness_fb = calloc((size_t)harness_w * harness_h, 4);
+    for (int32_t row = 0; row < sh; row++) {
+        if (dy + row < 0 || (uint32_t)(dy + row) >= harness_h) continue;
+        for (int32_t col = 0; col < sw; col++) {
+            if (dx + col < 0 || (uint32_t)(dx + col) >= harness_w) continue;
+            harness_fb[(size_t)(dy + row) * harness_w + (uint32_t)(dx + col)] =
+                *(const uint32_t*)((const uint8_t*)px + (size_t)(sy + row) * pitch + (size_t)(sx + col) * 4u);
+        }
+    }
+    return 0;
 }
 uint64_t mos_graphics_present(int32_t x, int32_t y, int32_t w, int32_t h) { (void)x; (void)y; (void)w; (void)h; return 0; }
 uint64_t mos_window_register_manager(void) { return 0; }

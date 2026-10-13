@@ -31,3 +31,18 @@ uint64_t mos_syscall3(uint64_t n, uint64_t a, uint64_t b, uint64_t c);
 #define SYSCALL_DIRENT_TYPE_EXECUTABLE 3u
 #define SYSCALL_DIRENT_NAME_SIZE 64u
 typedef struct { char name[64]; uint32_t type; uint32_t hidden; } syscall_dirent_t;
+/* --- additions: file operations and right-click used by the shell --- */
+#define SYS_EXISTS 9u
+#define SYS_RMDIR 21u
+#define SYS_GET_METADATA 22u
+#define SYSCALL_MOUSE_BTN_RIGHT (1u << 1)
+typedef struct {
+    char filetype[64];
+    char fileformat[16];
+    uint32_t data_length;
+    uint8_t runnable;
+    uint8_t hidden;
+    uint64_t entrypoint;
+    char created_date[32];
+    char last_changed[32];
+} syscall_file_metadata_t;

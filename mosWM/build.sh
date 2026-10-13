@@ -29,6 +29,9 @@ rm -f "$PACKAGE/programs/mosWM/assets/posy.cur"
 cp "$SCRIPT_DIR/assets/NOTICE.txt" "$PACKAGE/programs/mosWM/assets/NOTICE.txt"
 cp "$SCRIPT_DIR/assets/wallpapers/"*.qoi \
     "$PACKAGE/programs/mosWM/assets/wallpapers/"
+mkdir -p "$PACKAGE/programs/mosWM/assets/wallpapers/thumbs"
+cp "$SCRIPT_DIR/assets/wallpapers/thumbs/"*.thm \
+    "$PACKAGE/programs/mosWM/assets/wallpapers/thumbs/"
 cp "$SCRIPT_DIR/assets/fonts/"Inter-* "$PACKAGE/programs/mosWM/assets/fonts/"
 cp "$SCRIPT_DIR/mosWM.pkg" "$PACKAGE/mosWM.pkg"
 cp "$SCRIPT_DIR/mosWM.service" "$PACKAGE/services/mosWM.service"

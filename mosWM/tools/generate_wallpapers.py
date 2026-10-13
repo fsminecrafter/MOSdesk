@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Convert the supplied JPEG wallpapers to bounded-size QOI files."""
+"""Convert the supplied JPEG wallpapers to bounded-size QOI files.
+
+Also writes a small preview next to each one (thumbs/<name>.thm) so the
+wallpaper picker in MOSdesk Settings never has to decode a full image.
+Pass --thumbs-only to refresh just the previews.
+"""
 
 from pathlib import Path
 import struct
@@ -9,6 +14,23 @@ from PIL import Image
 
 
 MAX_DIMENSION = 1600
+THUMB_SIZE = (96, 60)
+
+
+def encode_thumb(image):
+    """"MTHB", u16 width, u16 height, then 0xAARRGGBB little-endian pixels."""
+    width, height = THUMB_SIZE
+    scale = max(width / image.width, height / image.height)
+    resized = image.convert("RGB").resize(
+        (max(width, round(image.width * scale)),
+         max(height, round(image.height * scale))), Image.Resampling.LANCZOS)
+    left = (resized.width - width) // 2
+    top = (resized.height - height) // 2
+    cropped = resized.crop((left, top, left + width, top + height))
+    output = bytearray(b"MTHB" + struct.pack("<HH", width, height))
+    for red, green, blue in cropped.getdata():
+        output.extend((blue, green, red, 255))
+    return output
 
 
 def encode_qoi(image):
@@ -54,14 +76,21 @@ def encode_qoi(image):
 
 def main():
     root = Path(__file__).resolve().parents[2]
-    source_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "use"
-    output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else root / "mosWM/assets/wallpapers"
+    paths = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
+    source_dir = Path(paths[0]) if paths else root / "use"
+    output_dir = Path(paths[1]) if len(paths) > 1 else root / "mosWM/assets/wallpapers"
     output_dir.mkdir(parents=True, exist_ok=True)
+    thumbs_only = "--thumbs-only" in sys.argv
+    thumb_dir = output_dir / "thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
     images = sorted(source_dir.glob("*.jpg"))
     if not images:
         raise SystemExit(f"No JPEG wallpapers found in {source_dir}")
     for source in images:
         with Image.open(source) as image:
+            (thumb_dir / f"{source.stem}.thm").write_bytes(encode_thumb(image))
+            if thumbs_only:
+                continue
             image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.Resampling.LANCZOS)
             target = output_dir / f"{source.stem}.qoi"
             target.write_bytes(encode_qoi(image))
