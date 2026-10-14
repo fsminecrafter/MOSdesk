@@ -210,25 +210,14 @@ static void moswm_blend_pixel(uint32_t* d, uint32_t c) {
     *d = 0xFF000000u | (r << 16) | (gg << 8) | b;
 }
 
-/* Draws `text` with its top-left corner at (x, y). `color` is 0xAARRGGBB and
- * is alpha-blended onto the canvas. Pass shadow != 0 for a drop shadow
- * (0xAARRGGBB) to keep text readable over the wallpaper. */
-static void moswm_draw_text(uint32_t* canvas, uint32_t cw, uint32_t ch,
-                            int32_t x, int32_t y, const char* text,
-                            uint32_t color, uint32_t shadow, uint32_t scale) {
+/* The 8x8 bitmap font, whatever fonts are loaded: fixed-width and with no
+ * glyph cache to disturb, which is what the debug overlay wants for figures
+ * that change every second. Each character advances 9*scale px. */
+static void moswm_draw_text_bitmap(uint32_t* canvas, uint32_t cw, uint32_t ch,
+                                   uint32_t stride, int32_t x, int32_t y,
+                                   const char* text, uint32_t color,
+                                   uint32_t shadow, uint32_t scale) {
     if (!canvas || !text || !scale) return;
-    if (moswm_text_is_smooth()) {
-        ttrend_outline_font_t* f = moswm_text_font(scale);
-        ttrend_outline_surface_t target = {canvas, cw, ch, cw};
-        /* Centre the font's ascent+descent in the 8*scale px tall box. */
-        int32_t asc = ttrend_outline_ascent(f), desc = ttrend_outline_descent(f);
-        int32_t baseline = y + ((int32_t)(8u * scale) - (asc + desc)) / 2 + asc;
-        if (shadow)
-            ttrend_outline_draw_text_baseline(&target, x + 1, baseline + 1,
-                                              text, shadow, f);
-        ttrend_outline_draw_text_baseline(&target, x, baseline, text, color, f);
-        return;
-    }
     for (int pass = shadow ? 0 : 1; pass < 2; pass++) {
         uint32_t c = pass ? color : shadow;
         int32_t ox = pass ? 0 : (int32_t)scale;
@@ -247,7 +236,7 @@ static void moswm_draw_text(uint32_t* canvas, uint32_t cw, uint32_t ch,
                         for (uint32_t sx = 0; sx < scale; sx++) {
                             int32_t px = pen + ox + (int32_t)(col * scale + sx);
                             if (px < 0 || (uint32_t)px >= cw) continue;
-                            moswm_blend_pixel(canvas + (size_t)py * cw + (uint32_t)px, c);
+                            moswm_blend_pixel(canvas + (size_t)py * stride + (uint32_t)px, c);
                         }
                     }
                 }
@@ -255,6 +244,32 @@ static void moswm_draw_text(uint32_t* canvas, uint32_t cw, uint32_t ch,
             pen += (int32_t)(8u * scale + scale);
         }
     }
+}
+
+/* Draws `text` with its top-left corner at (x, y). `color` is 0xAARRGGBB and
+ * is alpha-blended onto the canvas. Pass shadow != 0 for a drop shadow
+ * (0xAARRGGBB) to keep text readable over the wallpaper. The canvas is cw x
+ * ch pixels with `stride` pixels per row, so it may be a view onto part of a
+ * larger one; text is clipped to it. */
+static void moswm_draw_text(uint32_t* canvas, uint32_t cw, uint32_t ch,
+                            uint32_t stride, int32_t x, int32_t y,
+                            const char* text, uint32_t color, uint32_t shadow,
+                            uint32_t scale) {
+    if (!canvas || !text || !scale) return;
+    if (moswm_text_is_smooth()) {
+        ttrend_outline_font_t* f = moswm_text_font(scale);
+        ttrend_outline_surface_t target = {canvas, cw, ch, stride};
+        /* Centre the font's ascent+descent in the 8*scale px tall box. */
+        int32_t asc = ttrend_outline_ascent(f), desc = ttrend_outline_descent(f);
+        int32_t baseline = y + ((int32_t)(8u * scale) - (asc + desc)) / 2 + asc;
+        if (shadow)
+            ttrend_outline_draw_text_baseline(&target, x + 1, baseline + 1,
+                                              text, shadow, f);
+        ttrend_outline_draw_text_baseline(&target, x, baseline, text, color, f);
+        return;
+    }
+    moswm_draw_text_bitmap(canvas, cw, ch, stride, x, y, text, color, shadow,
+                           scale);
 }
 
 #endif

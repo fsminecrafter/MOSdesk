@@ -943,6 +943,25 @@ static void handle_mouse(const syscall_window_event_t* event) {
     save_preferences(&previous);
 }
 
+/* The pointer crosses the window far more often than it changes anything in
+ * it. Reports whether this event did, so the window is redrawn (and the
+ * compositor made to repaint the scene) only then. */
+static bool mouse_changed_window(const syscall_window_event_t* event) {
+    mosdesk_settings_t settings_before = preferences;
+    char message_before[sizeof(settings_message)];
+    memcpy(message_before, settings_message, sizeof(message_before));
+    uint32_t hover_before = nav_hover, page_before = category;
+    int32_t scroll_before = appearance_scroll;
+    bool dragging_before = scroll_dragging, editing_before = password_editing;
+    handle_mouse(event);
+    return hover_before != nav_hover || page_before != category ||
+           scroll_before != appearance_scroll ||
+           dragging_before != scroll_dragging ||
+           editing_before != password_editing ||
+           memcmp(message_before, settings_message, sizeof(message_before)) ||
+           memcmp(&settings_before, &preferences, sizeof(settings_before));
+}
+
 static void handle_key(const syscall_window_event_t* event) {
     if (category != 3u || !password_editing || !event->buttons) return;
     if (event->key == 40u) {
@@ -1050,7 +1069,10 @@ int main(int argc, char** argv) {
                 event.width && event.height)
                 resize_surface((uint32_t)event.width,
                                (uint32_t)event.height);
-            if (event.type == SYSCALL_WINDOW_EVENT_MOUSE) handle_mouse(&event);
+            if (event.type == SYSCALL_WINDOW_EVENT_MOUSE) {
+                if (mouse_changed_window(&event)) needs_redraw = true;
+                continue;
+            }
             if (event.type == SYSCALL_WINDOW_EVENT_MOUSE_WHEEL)
                 handle_wheel(&event);
             if (event.type == SYSCALL_WINDOW_EVENT_KEY) handle_key(&event);

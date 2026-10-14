@@ -48,13 +48,18 @@ typedef enum {
 
 static uint32_t moswm_icon_scratch[MOSWM_ICON_SOURCE_SIZE * MOSWM_ICON_SOURCE_SIZE];
 
+/* Pixels per row of the target when it is wider than the surface drawn
+ * into (a view onto part of a larger canvas); 0 means surface_width. */
+static uint32_t moswm_icon_stride;
+
 static void moswm_icon_pixel(uint32_t* pixels, uint32_t surface_width,
                              uint32_t surface_height, int32_t x, int32_t y,
                              uint32_t color) {
     if (x < 0 || y < 0 || (uint32_t)x >= surface_width ||
         (uint32_t)y >= surface_height)
         return;
-    uint32_t* destination = pixels + (size_t)y * surface_width + (uint32_t)x;
+    uint32_t* destination = pixels + (uint32_t)x + (size_t)y *
+        (moswm_icon_stride ? moswm_icon_stride : surface_width);
     uint32_t alpha = color >> 24u;
     if (alpha == 255u) {
         *destination = color;

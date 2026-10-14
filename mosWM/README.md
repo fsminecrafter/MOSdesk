@@ -81,21 +81,29 @@ just those).
 
 ## Rendering
 
-mosWM repaints the desktop layer (wallpaper and icons) and the composed scene
-only when something they show changes. The pointer is drawn as a small patch
-over the finished scene, so moving the mouse updates two small rectangles
-instead of the whole screen, and an idle desktop draws nothing at all.
-Applications help by presenting only when their content changes: every
-present makes the compositor rebuild the scene.
+mosWM repaints only what changed. The pointer is drawn as a small patch over
+the finished scene, so moving the mouse updates two small rectangles, and an
+idle desktop draws nothing at all. A window that moves, resizes or presents
+new content, a hover highlight (desktop icon, panel, menu row), the clock
+and the debug overlay each damage just the rectangle they cover: the scene
+is redrawn clipped to those rectangles and only they are sent to the screen.
+Everything else (a window opening, closing or changing focus, a new
+wallpaper, a dialog) repaints the whole scene. Applications help by
+presenting only when their content changes.
+
+`mosdesk/tools/host_preview/damage_test.sh` checks this on the host: it runs
+the real compositor through random changes and compares every partially
+repainted frame with a full repaint of the same state. Run it after touching
+anything that draws into the scene.
 
 Settings > Debug turns on two overlays in the top-right corner, refreshed
 once a second. The FPS meter shows main-loop frames per second and frame
 time, how often the pointer was redrawn, how many mouse-move events arrived,
-and how many full scene repaints happened. The profiler adds the average and
-peak time per frame spent in each stage of the loop (settings poll, Files
-window, window surfaces, input, cursor/hover/clock, scene draw, present,
-sleep). While either is on, the overlay itself causes one scene repaint a
-second.
+and how many partial and full scene repaints happened. The profiler adds the
+average and peak time per frame spent in each stage of the loop (settings
+poll, Files window, window surfaces, input, cursor and hover, desktop layer,
+window draw, panel and menus, present, sleep). The loop is paced at 16 ms a
+frame, so a healthy desktop reads 62.5 fps with most of each frame in Sleep.
 
 ## Window features
 

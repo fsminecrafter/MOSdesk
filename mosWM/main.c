@@ -71,6 +71,9 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define START_MENU_MAX_ROWS 9u
 #define FILE_TREE_MAX_DEPTH 6u
 #define FILE_COPY_CHUNK (64u * 1024u)
+#define FRAME_INTERVAL_MS 16u
+#define DAMAGE_MAX_RECTS 8u
+#define WINDOW_SHADOW_MARGIN 10
 
 #ifndef SYSCALL_CURSOR_COUNT
 /* This SDK does not expose per-window cursor state; keep the shell cursor local. */
@@ -102,6 +105,14 @@ typedef struct {
     bool icon_checked;
     bool has_icon;
     bool announced;
+    /* Where, and with which frame, the window was last drawn in the scene. */
+    int32_t drawn_x;
+    int32_t drawn_y;
+    uint32_t drawn_width;
+    uint32_t drawn_height;
+    uint32_t drawn_version;
+    /* No translucent pixels in the current frame: it can be copied in. */
+    bool opaque;
     uint32_t icon_sum;
     uint32_t icon_pixels[SYSCALL_WINDOW_ICON_PIXELS];
 } cached_window_t;
@@ -161,8 +172,16 @@ typedef struct {
     uint32_t pixels[CURSOR_MAX_SIZE * CURSOR_MAX_SIZE];
 } cached_cursor_t;
 
+typedef struct {
+    int32_t left, top, right, bottom;
+} rect_t;
+
 static syscall_graphics_info_t display;
 static uint32_t* canvas;
+/* While render() repaints just the damaged part of the scene, everything
+ * that draws into the canvas is confined to this rectangle. All zero (the
+ * usual state) means no clipping. */
+static rect_t clip;
 static cached_window_t cache[MAX_WINDOWS];
 static desktop_app_t desktop_apps[MAX_DESKTOP_APPS];
 static uint32_t desktop_app_count;
@@ -272,7 +291,9 @@ typedef enum {
     PROFILE_WINDOWS,
     PROFILE_INPUT,
     PROFILE_POINTER,
-    PROFILE_DRAW,
+    PROFILE_DESKTOP,
+    PROFILE_WINDOW_DRAW,
+    PROFILE_PANEL,
     PROFILE_PRESENT,
     PROFILE_SLEEP,
     PROFILE_STAGES
@@ -285,6 +306,7 @@ typedef struct {
     uint32_t pointer_per_second;
     uint32_t mouse_per_second;
     uint32_t repaints_per_second;
+    uint32_t partial_per_second;
     uint32_t average_us[PROFILE_STAGES];
     uint32_t peak_us[PROFILE_STAGES];
 } debug_report_t;
@@ -301,6 +323,7 @@ static uint32_t debug_frames;
 static uint32_t debug_pointer_draws;
 static uint32_t debug_mouse_events;
 static uint32_t debug_repaints;
+static uint32_t debug_partial_repaints;
 static debug_report_t debug_report;
 static uint32_t debug_generation;
 
@@ -1203,23 +1226,35 @@ static uint32_t clamp_u32(uint32_t value, uint32_t low, uint32_t high) {
     return value;
 }
 
-static uint32_t alpha_blend(uint32_t source, uint32_t destination) {
+/* value / 255 for value <= 255 * 255, without the division. */
+static inline uint32_t div255(uint32_t value) {
+    return (value + 1u + (value >> 8)) >> 8;
+}
+
+static inline uint32_t alpha_blend(uint32_t source, uint32_t destination) {
     uint32_t alpha = source >> 24;
     if (alpha == 255u) return source;
     if (!alpha) return destination;
     uint32_t inverse = 255u - alpha;
-    uint32_t red = (((source >> 16) & 255u) * alpha +
-                    ((destination >> 16) & 255u) * inverse) / 255u;
-    uint32_t green = (((source >> 8) & 255u) * alpha +
-                      ((destination >> 8) & 255u) * inverse) / 255u;
-    uint32_t blue = ((source & 255u) * alpha +
-                     (destination & 255u) * inverse) / 255u;
+    uint32_t red = div255(((source >> 16) & 255u) * alpha +
+                          ((destination >> 16) & 255u) * inverse);
+    uint32_t green = div255(((source >> 8) & 255u) * alpha +
+                            ((destination >> 8) & 255u) * inverse);
+    uint32_t blue = div255((source & 255u) * alpha +
+                           (destination & 255u) * inverse);
     return 0xFF000000u | (red << 16) | (green << 8) | blue;
 }
 
+/* The part of the canvas that may be drawn into right now. */
+static rect_t draw_bounds(void) {
+    if (clip.right) return clip;
+    return (rect_t){0, 0, (int32_t)display.width, (int32_t)display.height};
+}
+
 static void put_pixel(int32_t x, int32_t y, uint32_t color) {
-    if (x < 0 || y < 0 || (uint32_t)x >= display.width ||
-        (uint32_t)y >= display.height)
+    rect_t bounds = draw_bounds();
+    if (x < bounds.left || y < bounds.top || x >= bounds.right ||
+        y >= bounds.bottom)
         return;
     uint32_t* pixel = canvas + (size_t)y * display.width + (uint32_t)x;
     *pixel = alpha_blend(color, *pixel);
@@ -1227,21 +1262,33 @@ static void put_pixel(int32_t x, int32_t y, uint32_t color) {
 
 static void fill_rect(int32_t x, int32_t y, int32_t width, int32_t height,
                       uint32_t color) {
+    rect_t bounds = draw_bounds();
     int64_t right = (int64_t)x + width;
     int64_t bottom = (int64_t)y + height;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (right > display.width) right = display.width;
-    if (bottom > display.height) bottom = display.height;
+    if (x < bounds.left) x = bounds.left;
+    if (y < bounds.top) y = bounds.top;
+    if (right > bounds.right) right = bounds.right;
+    if (bottom > bounds.bottom) bottom = bounds.bottom;
     uint32_t alpha = color >> 24;
     if (!alpha || right <= x) return;
+    /* One colour over many pixels: its share of the blend is the same for
+     * all of them, so work it out once. */
+    uint32_t inverse = 255u - alpha;
+    uint32_t red = ((color >> 16) & 255u) * alpha;
+    uint32_t green = ((color >> 8) & 255u) * alpha;
+    uint32_t blue = (color & 255u) * alpha;
     for (int32_t py = y; py < bottom; py++) {
         uint32_t* row = canvas + (size_t)py * display.width;
         if (alpha == 255u) {
             for (int32_t px = x; px < right; px++) row[px] = color;
         } else {
-            for (int32_t px = x; px < right; px++)
-                row[px] = alpha_blend(color, row[px]);
+            for (int32_t px = x; px < right; px++) {
+                uint32_t under = row[px];
+                row[px] = 0xFF000000u |
+                    div255(red + ((under >> 16) & 255u) * inverse) << 16 |
+                    div255(green + ((under >> 8) & 255u) * inverse) << 8 |
+                    div255(blue + (under & 255u) * inverse);
+            }
         }
     }
 }
@@ -1270,8 +1317,31 @@ static void draw_wallpaper_line(int32_t x0, int32_t y0, int32_t x1,
 
 static void wm_text(int32_t x, int32_t y, const char* text, uint32_t color,
                     uint32_t shadow, uint32_t scale) {
-    moswm_draw_text(canvas, display.width, display.height, x, y, text, color,
-                    shadow, scale);
+    /* Text clips itself to the surface it is given, so hand it a view of
+     * just the drawable part of the canvas. */
+    rect_t bounds = draw_bounds();
+    if (y - 8 >= bounds.bottom || y + (int32_t)(16u * scale) + 8 <= bounds.top)
+        return;
+    moswm_draw_text(canvas + (size_t)bounds.top * display.width + bounds.left,
+                    (uint32_t)(bounds.right - bounds.left),
+                    (uint32_t)(bounds.bottom - bounds.top), display.width,
+                    x - bounds.left, y - bounds.top, text, color, shadow,
+                    scale);
+}
+
+static void wm_icon(int32_t x, int32_t y, moswm_file_icon_t icon,
+                    uint32_t size) {
+    rect_t bounds = draw_bounds();
+    if (x >= bounds.right || y >= bounds.bottom ||
+        x + (int32_t)size <= bounds.left || y + (int32_t)size <= bounds.top)
+        return;
+    moswm_icon_stride = display.width;
+    moswm_draw_file_icon_sized(
+        canvas + (size_t)bounds.top * display.width + bounds.left,
+        (uint32_t)(bounds.right - bounds.left),
+        (uint32_t)(bounds.bottom - bounds.top), x - bounds.left,
+        y - bounds.top, icon, size);
+    moswm_icon_stride = 0;
 }
 
 static void stroke_rect(int32_t x, int32_t y, int32_t w, int32_t h,
@@ -2089,13 +2159,16 @@ static uint32_t isqrt_u64(uint64_t value) {
 }
 
 /* Each pixel is painted exactly once, so translucent colours stay even. */
-static void fill_rounded_rect(int32_t x, int32_t y, int32_t width,
-                              int32_t height, uint32_t radius,
-                              uint32_t color) {
+/* A rounded rectangle, minus the pixels inside `hole` (left, top, right,
+ * bottom; NULL for none). Window shadows use it to skip the area the window
+ * itself is about to cover, which is nearly all of them. */
+static void fill_rounded_rect_around(int32_t x, int32_t y, int32_t width,
+                                     int32_t height, uint32_t radius,
+                                     uint32_t color, const int32_t* hole) {
     if (width <= 0 || height <= 0) return;
     if (radius * 2u > (uint32_t)width) radius = (uint32_t)width / 2u;
     if (radius * 2u > (uint32_t)height) radius = (uint32_t)height / 2u;
-    if (!radius) {
+    if (!radius && !hole) {
         fill_rect(x, y, width, height, color);
         return;
     }
@@ -2109,8 +2182,22 @@ static void fill_rounded_rect(int32_t x, int32_t y, int32_t width,
             inset = r - (int32_t)((isqrt_u64((uint64_t)span2) + 1u) / 2u);
             if (inset < 0) inset = 0;
         }
-        fill_rect(x + inset, y + row, width - inset * 2, 1, color);
+        int32_t left = x + inset;
+        int32_t right = x + width - inset;
+        if (hole && y + row >= hole[1] && y + row < hole[3] &&
+            hole[0] < right && hole[2] > left) {
+            fill_rect(left, y + row, hole[0] - left, 1, color);
+            fill_rect(hole[2], y + row, right - hole[2], 1, color);
+        } else {
+            fill_rect(left, y + row, right - left, 1, color);
+        }
     }
+}
+
+static void fill_rounded_rect(int32_t x, int32_t y, int32_t width,
+                              int32_t height, uint32_t radius,
+                              uint32_t color) {
+    fill_rounded_rect_around(x, y, width, height, radius, color, NULL);
 }
 
 static uint32_t* wallpaper;
@@ -2238,11 +2325,14 @@ static void draw_logo_mask(uint8_t* mask, int32_t mw, int32_t mh,
 
 static void paint_wallpaper(uint32_t* target) {
     uint32_t* saved = canvas;
+    rect_t saved_clip = clip;
+    clip = (rect_t){0};
     canvas = target;
     uint32_t w = display.width, h = display.height;
     if (wallpaper_source) {
         paint_image_wallpaper(target);
         canvas = saved;
+        clip = saved_clip;
         return;
     }
     static const uint8_t colors[6][6] = {
@@ -2312,9 +2402,11 @@ static void paint_wallpaper(uint32_t* target) {
         wm_free(mask);
     }
     canvas = saved;
+    clip = saved_clip;
 }
 
 static void draw_desktop_icons(void);
+static rect_t desktop_icon_highlight(uint32_t index);
 
 static void ensure_wallpaper(void) {
     if (!wallpaper || painted_wallpaper_style == wallpaper_style) return;
@@ -2336,7 +2428,9 @@ static uint64_t desktop_signature(void) {
     hash = hash_u64(hash, wallpaper_generation);
     hash = hash_u64(hash, desktop_apps_generation);
     hash = hash_u64(hash, ((uint64_t)display.width << 32) | display.height);
-    hash = hash_u64(hash, hover_desktop_icon);
+    /* Without a desktop layer the icons are drawn straight into the scene,
+     * hover highlight included. */
+    if (!desktop_layer) hash = hash_u64(hash, hover_desktop_icon);
     hash = hash_bytes(hash, desktop_settings.desktop_icon_x,
                       sizeof(desktop_settings.desktop_icon_x));
     hash = hash_bytes(hash, desktop_settings.desktop_icon_y,
@@ -2346,25 +2440,75 @@ static uint64_t desktop_signature(void) {
 
 static void draw_desktop(uint32_t* target) {
     uint32_t* saved = canvas;
+    rect_t saved_clip = clip;
+    clip = (rect_t){0};
     copy_wallpaper(target);
     canvas = target;
     draw_desktop_icons();
     canvas = saved;
+    clip = saved_clip;
 }
 
-/* Wallpaper and icons into the canvas, repainting them only on change. */
+/* Keeps the desktop layer (wallpaper and icons) current. A change of layout
+ * redraws all of it; the hover highlight moving redraws only the one or two
+ * icons involved and reports them in `changed` (two rectangles). */
+static uint32_t desktop_layer_hover = UINT32_MAX;
+
+static uint32_t update_desktop_layer(rect_t* changed) {
+    if (!desktop_layer) return 0;
+    uint64_t signature = desktop_signature();
+    if (signature != desktop_layer_signature) {
+        draw_desktop(desktop_layer);
+        desktop_layer_signature = signature;
+        desktop_layer_hover = hover_desktop_icon;
+        return 0;
+    }
+    if (desktop_layer_hover == hover_desktop_icon) return 0;
+    const uint32_t icons[2] = {desktop_layer_hover, hover_desktop_icon};
+    desktop_layer_hover = hover_desktop_icon;
+    uint32_t count = 0;
+    uint32_t* saved = canvas;
+    canvas = desktop_layer;
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (icons[i] >= desktop_app_count + 2u) continue;
+        rect_t area = desktop_icon_highlight(icons[i]);
+        if (area.left < 0) area.left = 0;
+        if (area.top < 0) area.top = 0;
+        if (area.right > (int32_t)display.width)
+            area.right = (int32_t)display.width;
+        if (area.bottom > (int32_t)display.height)
+            area.bottom = (int32_t)display.height;
+        if (area.left >= area.right || area.top >= area.bottom) continue;
+        for (int32_t y = area.top; y < area.bottom; y++) {
+            size_t offset = (size_t)y * display.width + (uint32_t)area.left;
+            copy_pixels(desktop_layer + offset, wallpaper + offset,
+                        (size_t)(area.right - area.left));
+        }
+        clip = area;
+        draw_desktop_icons();
+        changed[count++] = area;
+    }
+    clip = (rect_t){0};
+    canvas = saved;
+    return count;
+}
+
+/* The desktop into the canvas (the part of it inside the clip). */
 static void compose_desktop(void) {
     if (!desktop_layer) {
         draw_desktop(canvas);
         return;
     }
-    uint64_t signature = desktop_signature();
-    if (signature != desktop_layer_signature) {
-        draw_desktop(desktop_layer);
-        desktop_layer_signature = signature;
+    if (!clip.right) {
+        copy_pixels(canvas, desktop_layer,
+                    (size_t)display.width * display.height);
+        return;
     }
-    copy_pixels(canvas, desktop_layer,
-                (size_t)display.width * display.height);
+    for (int32_t y = clip.top; y < clip.bottom; y++) {
+        size_t offset = (size_t)y * display.width + (uint32_t)clip.left;
+        copy_pixels(canvas + offset, desktop_layer + offset,
+                    (size_t)(clip.right - clip.left));
+    }
 }
 
 static void draw_custom_icon(const uint32_t* icon, int32_t x, int32_t y,
@@ -2434,10 +2578,22 @@ static click_action_t desktop_shortcut_at(int32_t px, int32_t py,
     return CLICK_ACTION_APPLICATION;
 }
 
+/* The hover highlight behind desktop icon `index`. */
+static rect_t desktop_icon_highlight(uint32_t index) {
+    int32_t x = 0, y = 0;
+    desktop_icon_position(index, &x, &y);
+    return (rect_t){x - 10, y - 4, x + 74, y + 90};
+}
+
 static void draw_desktop_icons(void) {
+    rect_t bounds = draw_bounds();
     for (uint32_t i = 0; i < desktop_app_count + 2u; i++) {
         int32_t x, y;
         desktop_icon_position(i, &x, &y);
+        /* Icon, label and highlight all sit well inside this box. */
+        if (x - 48 >= bounds.right || x + 112 <= bounds.left ||
+            y - 16 >= bounds.bottom || y + 104 <= bounds.top)
+            continue;
         if (hover_desktop_icon == i) {
             fill_rounded_rect(x - 10, y - 4, 84, 94, 8, 0x30FFFFFFu);
             fill_rounded_rect(x - 9, y - 3, 82, 92, 7, 0x18000000u);
@@ -2445,14 +2601,12 @@ static void draw_desktop_icons(void) {
         const char* name = i == 0u ? "Home" : i == 1u ? "System"
             : desktop_apps[i - 2u].name;
         if (i < 2u) {
-            moswm_draw_file_icon_sized(canvas, display.width, display.height,
-                x, y, i == 0u ? MOSWM_ICON_HOME : MOSWM_ICON_COMPUTER, 64u);
+            wm_icon(x, y, i == 0u ? MOSWM_ICON_HOME : MOSWM_ICON_COMPUTER, 64u);
         } else if (desktop_apps[i - 2u].has_icon) {
             draw_custom_icon(desktop_apps[i - 2u].icon_pixels, x + 8, y + 6,
                              48u);
         } else {
-            moswm_draw_file_icon_sized(canvas, display.width, display.height,
-                x + 4, y + 2, MOSWM_ICON_APP, 56u);
+            wm_icon(x + 4, y + 2, MOSWM_ICON_APP, 56u);
         }
         char label[DESKTOP_APP_NAME_SIZE];
         fit_text_px(label, sizeof(label), name, 86, 2u);
@@ -2518,6 +2672,11 @@ static bool refresh_frame(cached_window_t* entry,
     };
     if (mos_window_get_frame(info->id, &frame) != SYS_SUCCESS) return false;
     entry->frame_version = info->frame_version;
+    size_t pixel_count = (size_t)info->width * info->height;
+    size_t checked = 0;
+    while (checked < pixel_count && entry->pixels[checked] >> 24 == 255u)
+        checked++;
+    entry->opaque = checked == pixel_count;
     return true;
 }
 
@@ -2632,15 +2791,31 @@ static void composite_window(const syscall_window_info_t* info,
         return;
 
     bool window_focused = info->id == focused_id;
-    fill_rounded_rect(x - 4, y - 1, outer_width + 8, outer_height + 10,
-                      CORNER_RADIUS + 4u, 0x16000000u);
-    fill_rounded_rect(x - 1, y + 2, outer_width + 2, outer_height + 4,
-                      CORNER_RADIUS + 1u, window_focused ? 0x40000000u
-                                                         : 0x24000000u);
-    fill_rounded_rect(x, y, outer_width, outer_height,
-                      CORNER_RADIUS, info->style.border);
-    fill_rounded_rect(x + 1, y + 1, outer_width - 2, outer_height - 2,
-                      CORNER_RADIUS - 1u, info->style.content_background);
+    /* Only the fringe of the two shadows is ever seen: an opaque border
+     * covers everything between the window's rounded corners. */
+    const int32_t body[4] = {x, y + (int32_t)CORNER_RADIUS, x + outer_width,
+                             y + outer_height - (int32_t)CORNER_RADIUS};
+    const int32_t* covered = info->style.border >> 24 == 255u ? body : NULL;
+    /* Likewise the frame and background behind an opaque window surface:
+     * only the edge and the rounded bottom corners show. */
+    const int32_t content[4] = {
+        x + 1, y + (int32_t)TITLE_HEIGHT + 1, x + 1 + (int32_t)info->width,
+        y + (int32_t)TITLE_HEIGHT + 1 + (int32_t)info->height -
+            (int32_t)CORNER_RADIUS};
+    const int32_t* filled = entry && entry->pixels && entry->opaque
+        ? content : NULL;
+    fill_rounded_rect_around(x - 4, y - 1, outer_width + 8,
+                             outer_height + 10, CORNER_RADIUS + 4u,
+                             0x16000000u, covered);
+    fill_rounded_rect_around(x - 1, y + 2, outer_width + 2, outer_height + 4,
+                             CORNER_RADIUS + 1u,
+                             window_focused ? 0x40000000u : 0x24000000u,
+                             covered);
+    fill_rounded_rect_around(x, y, outer_width, outer_height, CORNER_RADIUS,
+                             info->style.border, filled);
+    fill_rounded_rect_around(x + 1, y + 1, outer_width - 2, outer_height - 2,
+                             CORNER_RADIUS - 1u,
+                             info->style.content_background, filled);
     fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT, outer_width - 2, 2,
               info->style.title_bar);
     fill_rounded_rect(x + 1, y + 1, outer_width - 2,
@@ -2659,19 +2834,25 @@ static void composite_window(const syscall_window_info_t* info,
     if (entry && entry->pixels) {
         int32_t content_x = x + 1;
         int32_t content_y = y + (int32_t)TITLE_HEIGHT + 1;
-        int32_t first = content_x < 0 ? -content_x : 0;
+        rect_t bounds = draw_bounds();
+        int32_t first = content_x < bounds.left ? bounds.left - content_x : 0;
         int32_t last = (int32_t)info->width;
-        if (content_x + last > (int32_t)display.width)
-            last = (int32_t)display.width - content_x;
+        if (content_x + last > bounds.right) last = bounds.right - content_x;
         for (uint32_t py = 0; py < info->height; py++) {
             int32_t dy = content_y + (int32_t)py;
-            if (dy < 0 || (uint32_t)dy >= display.height) continue;
+            if (dy < bounds.top || dy >= bounds.bottom) continue;
             const uint32_t* source =
                 entry->pixels + (size_t)py * info->width;
             uint32_t* target = canvas + (size_t)dy * display.width +
                                content_x;
             if (py + CORNER_RADIUS < info->height) {
                 /* Straight rows: no per-pixel bounds or corner tests. */
+                if (entry->opaque) {
+                    if (last > first)
+                        copy_pixels(target + first, source + first,
+                                    (size_t)(last - first));
+                    continue;
+                }
                 for (int32_t px = first; px < last; px++) {
                     uint32_t color = source[px];
                     target[px] = color >> 24 == 255u
@@ -2780,9 +2961,11 @@ static bool blit_canvas_rect(int32_t x, int32_t y, int32_t width,
 }
 
 /* Sends the finished scene to the screen with the pointer on top. `full`
- * pushes the whole canvas; otherwise only the pixels the pointer left and
- * the ones it now covers are updated, and nothing at all if it is still. */
-static void present_frame(bool full) {
+ * pushes the whole canvas and `areas` the repainted parts of it; otherwise
+ * only the pixels the pointer left and the ones it now covers are updated,
+ * and nothing at all if it is still. */
+static void present_frame(bool full, const rect_t* areas,
+                          uint32_t area_count) {
     prepare_cursor_pixels();
     uint32_t scale = cursor_scale ? cursor_scale : 1u;
     uint32_t frame = 0;
@@ -2809,16 +2992,23 @@ static void present_frame(bool full) {
     signature = hash_u64(signature, ((uint64_t)cursor_fill_color << 32) |
                                     scale);
     signature = hash_text(signature, cached_cursor_pack);
-    if (!full && cursor_drawn && signature == cursor_drawn_signature) return;
+    if (!full && !area_count && cursor_drawn &&
+        signature == cursor_drawn_signature)
+        return;
 
     bool ok = true;
     if (full) {
         ok = blit_canvas_rect(0, 0, (int32_t)display.width,
                               (int32_t)display.height);
-    } else if (cursor_drawn && cursor_drawn_width > 0 &&
-               cursor_drawn_height > 0) {
-        ok = blit_canvas_rect(cursor_drawn_x, cursor_drawn_y,
-                              cursor_drawn_width, cursor_drawn_height);
+    } else {
+        for (uint32_t i = 0; i < area_count; i++)
+            ok = blit_canvas_rect(areas[i].left, areas[i].top,
+                                  areas[i].right - areas[i].left,
+                                  areas[i].bottom - areas[i].top) && ok;
+        if (cursor_drawn && cursor_drawn_width > 0 && cursor_drawn_height > 0)
+            ok = blit_canvas_rect(cursor_drawn_x, cursor_drawn_y,
+                                  cursor_drawn_width, cursor_drawn_height) &&
+                 ok;
     }
 
     int32_t left = origin_x < 0 ? 0 : origin_x;
@@ -2874,9 +3064,13 @@ static void present_frame(bool full) {
         ok = mos_graphics_present(0, 0, (int32_t)display.width,
                                   (int32_t)display.height) == SYS_SUCCESS;
     } else {
+        for (uint32_t i = 0; i < area_count; i++)
+            ok = mos_graphics_present(areas[i].left, areas[i].top,
+                areas[i].right - areas[i].left,
+                areas[i].bottom - areas[i].top) == SYS_SUCCESS && ok;
         if (cursor_drawn && cursor_drawn_width > 0 && cursor_drawn_height > 0)
             ok = mos_graphics_present(cursor_drawn_x, cursor_drawn_y,
-                cursor_drawn_width, cursor_drawn_height) == SYS_SUCCESS;
+                cursor_drawn_width, cursor_drawn_height) == SYS_SUCCESS && ok;
         if (width > 0 && height > 0)
             ok = mos_graphics_present(left, top, width, height) ==
                  SYS_SUCCESS && ok;
@@ -2887,6 +3081,7 @@ static void present_frame(bool full) {
         return;
     }
     if (full) debug_repaints++;
+    else if (area_count) debug_partial_repaints++;
     else debug_pointer_draws++;
     cursor_drawn = true;
     cursor_drawn_x = left;
@@ -3013,8 +3208,7 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         if (has_icon)
             draw_custom_icon(entry->icon_pixels, x + 8, top + 12, 24u);
         else
-            moswm_draw_file_icon_sized(canvas, display.width, display.height,
-                x + 8, top + 12, info->id == browser_window_id
+            wm_icon(x + 8, top + 12, info->id == browser_window_id
                     ? MOSWM_ICON_FOLDER : MOSWM_ICON_APP, 24u);
         wm_text(x + 40, top + 16, label,
                 minimized ? 0xFF8C9BA6u : 0xFFEAF2F8u, 0, 2);
@@ -3080,8 +3274,7 @@ static void draw_taskbar(const syscall_window_info_t* windows,
             const char* label;
             if (row < 3u) {
                 label = fixed[row].label;
-                moswm_draw_file_icon_sized(canvas, display.width,
-                    display.height, mx + 16, row_y + 4, fixed[row].icon,
+                wm_icon(mx + 16, row_y + 4, fixed[row].icon,
                     28u);
             } else {
                 const desktop_app_t* app = &desktop_apps[apps[row - 3u]];
@@ -3090,8 +3283,7 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                     draw_custom_icon(app->icon_pixels, mx + 16, row_y + 4,
                                      28u);
                 else
-                    moswm_draw_file_icon_sized(canvas, display.width,
-                        display.height, mx + 16, row_y + 4, MOSWM_ICON_APP,
+                    wm_icon(mx + 16, row_y + 4, MOSWM_ICON_APP,
                         28u);
             }
             char shown[DESKTOP_APP_NAME_SIZE];
@@ -3099,8 +3291,11 @@ static void draw_taskbar(const syscall_window_info_t* windows,
             wm_text(mx + 56, row_y + 10, shown, 0xFFF2F6F9u, 0, 2);
         }
         fill_rect(mx + 18, my + mh - 34, mw - 36, 1, 0xFF353C42u);
-        wm_text(mx + 18, my + mh - 22, "Right-click icons for more actions",
-                0xFF8A9AA6u, 0, 1);
+        /* Fitted, because the fallback bitmap font is wider than the menu. */
+        char hint[40];
+        fit_text_px(hint, sizeof(hint), "Right-click icons for more actions",
+                    mw - 36, 1);
+        wm_text(mx + 18, my + mh - 22, hint, 0xFF8A9AA6u, 0, 1);
     }
     if (status_message[0])
         wm_text(8, 8, status_message, 0xFFFFE696u, 0xAA000000u, 2);
@@ -3217,8 +3412,7 @@ static void draw_context_menu(void) {
             fill_rounded_rect(menu_x + 5, y, MENU_WIDTH - 10,
                               MENU_ITEM_HEIGHT, 5,
                               0x66000000u | (accent & 0x00FFFFFFu));
-        moswm_draw_file_icon_sized(canvas, display.width, display.height,
-                                   menu_x + 13, y + 6, item->icon, 18u);
+        wm_icon(menu_x + 13, y + 6, item->icon, 18u);
         wm_text(menu_x + 42, y + 10, item->label,
                 item->enabled ? 0xFFF2F6F9u : 0xFF6F7C86u, 0, 1u);
         y += MENU_ITEM_HEIGHT;
@@ -3244,8 +3438,7 @@ static void draw_dialog(void) {
     fill_rounded_rect(x - 4, y - 2, width + 8, height + 10, 14, 0x30000000u);
     fill_rounded_rect(x, y, width, height, 12, 0xFF3A4249u);
     fill_rounded_rect(x + 2, y + 2, width - 4, height - 4, 10, 0xFFF3F5F6u);
-    moswm_draw_file_icon_sized(canvas, display.width, display.height,
-        x + 22, y + 18, deleting ? MOSWM_ICON_TRASH
+    wm_icon(x + 22, y + 18, deleting ? MOSWM_ICON_TRASH
             : dialog_kind == DIALOG_RENAME ? MOSWM_ICON_EDIT
             : MOSWM_ICON_NEWFOLDER, 28u);
     wm_text(x + 62, y + 24,
@@ -3690,6 +3883,7 @@ static void debug_restart_window(uint64_t now_ms) {
     debug_pointer_draws = 0;
     debug_mouse_events = 0;
     debug_repaints = 0;
+    debug_partial_repaints = 0;
 }
 
 /* Called once per trip round the main loop; publishes a report every second.
@@ -3730,6 +3924,9 @@ static void debug_frame_end(void) {
     debug_report.repaints_per_second =
         (uint32_t)(((uint64_t)debug_repaints * 1000u + elapsed_ms / 2u) /
                    elapsed_ms);
+    debug_report.partial_per_second =
+        (uint32_t)(((uint64_t)debug_partial_repaints * 1000u +
+                    elapsed_ms / 2u) / elapsed_ms);
     for (uint32_t i = 0; i < PROFILE_STAGES; i++) {
         debug_report.average_us[i] =
             (uint32_t)(debug_stage_ticks[i] / debug_frames / ticks_per_us);
@@ -3769,35 +3966,61 @@ static char* append_ms(char* output, uint32_t microseconds) {
     return output;
 }
 
+/* Overlay text is drawn in the fixed-width bitmap font: digits line up in
+ * columns, and figures that change every second do not churn the outline
+ * font's glyph cache (which made the overlay itself the slowest thing it
+ * measured). */
+static void debug_text(int32_t x, int32_t y, const char* text,
+                       uint32_t color) {
+    rect_t bounds = draw_bounds();
+    moswm_draw_text_bitmap(
+        canvas + (size_t)bounds.top * display.width + bounds.left,
+        (uint32_t)(bounds.right - bounds.left),
+        (uint32_t)(bounds.bottom - bounds.top), display.width,
+        x - bounds.left, y - bounds.top, text, color, 0, 1);
+}
+
 static void debug_text_right(int32_t right, int32_t y, const char* text,
                              uint32_t color) {
-    wm_text(right - (int32_t)moswm_text_width(text, 1u), y, text, color, 0,
-            1);
+    debug_text(right - (int32_t)strlen(text) * 9 + 1, y, text, color);
+}
+
+#define DEBUG_ROW_HEIGHT 15
+
+/* Where the overlay is drawn; an empty rectangle while it is switched off. */
+static rect_t debug_overlay_rect(void) {
+    if (!debug_fps && !debug_profiler) return (rect_t){0};
+    uint32_t rows = 1u;
+    if (debug_report.valid)
+        rows = (debug_fps ? 5u : 0u) +
+               (debug_profiler ? PROFILE_STAGES + 1u : 0u);
+    int32_t height = (int32_t)rows * DEBUG_ROW_HEIGHT + 15 +
+        (debug_report.valid && debug_fps && debug_profiler ? 9 : 0);
+    int32_t right = (int32_t)display.width - 8;
+    return (rect_t){right - 304, 8, right, 8 + height};
 }
 
 static void draw_debug_overlay(void) {
     if (!debug_fps && !debug_profiler) return;
     static const char* const stage_names[PROFILE_STAGES] = {
         "Settings poll", "Files window", "Window surfaces", "Input",
-        "Cursor, hover, clock", "Scene draw", "Present", "Sleep"
+        "Cursor + hover", "Desktop layer", "Window draw", "Panel + menus",
+        "Present", "Sleep"
     };
     const debug_report_t* report = &debug_report;
-    const int32_t width = 268, row = 17;
-    uint32_t rows = 0;
-    if (!report->valid) rows = 1u;
-    else rows = (debug_fps ? 4u : 0u) +
-                (debug_profiler ? PROFILE_STAGES + 1u : 0u);
-    int32_t height = (int32_t)rows * row + 15 +
-                     (report->valid && debug_fps && debug_profiler ? 9 : 0);
-    int32_t x = (int32_t)display.width - width - 8;
-    int32_t y = 8;
+    const int32_t row = DEBUG_ROW_HEIGHT;
+    rect_t panel = debug_overlay_rect();
+    int32_t x = panel.left;
+    int32_t y = panel.top;
+    int32_t width = panel.right - panel.left;
+    int32_t height = panel.bottom - panel.top;
     int32_t right = x + width - 12;
     int32_t peak_right = right;
-    int32_t average_right = right - 64;
+    int32_t average_right = right - 68;
     fill_rounded_rect(x, y, width, height, 6, 0xD910161Bu);
     y += 10;
     if (!report->valid) {
-        wm_text(x + 12, y, "Measuring...", 0xFFB7C4CEu, 0, 1);
+        debug_text(x + 12, y, "Measuring...", 0xFFB7C4CEu);
         return;
     }
     char line[48];
@@ -3807,20 +4030,22 @@ static void draw_debug_overlay(void) {
         *end++ = (char)('0' + report->fps_tenths % 10u);
         append_text(end, " fps");
         /* Green at a full 60 Hz loop, amber when it sags, red when it crawls. */
-        wm_text(x + 12, y, line,
-                report->fps_tenths >= 450u ? 0xFF7FE0A0u
-                    : report->fps_tenths >= 200u ? 0xFFFFD36Bu : 0xFFFF8A80u,
-                0, 1);
+        debug_text(x + 12, y, line,
+                   report->fps_tenths >= 450u ? 0xFF7FE0A0u
+                       : report->fps_tenths >= 200u ? 0xFFFFD36Bu
+                                                    : 0xFFFF8A80u);
         append_text(append_ms(line, report->frame_us), " ms/frame");
         debug_text_right(right, y, line, 0xFFE8EEF2u);
         y += row;
-        static const char* const rate_names[3] = {
-            "Pointer redraws", "Mouse events", "Scene repaints"};
-        const uint32_t rates[3] = {report->pointer_per_second,
+        static const char* const rate_names[4] = {
+            "Pointer redraws", "Mouse events", "Partial repaints",
+            "Full repaints"};
+        const uint32_t rates[4] = {report->pointer_per_second,
                                    report->mouse_per_second,
+                                   report->partial_per_second,
                                    report->repaints_per_second};
-        for (uint32_t i = 0; i < 3u; i++) {
-            wm_text(x + 12, y, rate_names[i], 0xFFB7C4CEu, 0, 1);
+        for (uint32_t i = 0; i < 4u; i++) {
+            debug_text(x + 12, y, rate_names[i], 0xFFB7C4CEu);
             append_text(append_number(line, rates[i]), " /s");
             debug_text_right(right, y, line, 0xFFE8EEF2u);
             y += row;
@@ -3831,7 +4056,7 @@ static void draw_debug_overlay(void) {
             fill_rect(x + 12, y + 1, width - 24, 1, 0x40FFFFFFu);
             y += 9;
         }
-        wm_text(x + 12, y, "Stage (ms per frame)", 0xFF8EC5FFu, 0, 1);
+        debug_text(x + 12, y, "Stage, ms/frame", 0xFF8EC5FFu);
         debug_text_right(average_right, y, "avg", 0xFF8EC5FFu);
         debug_text_right(peak_right, y, "peak", 0xFF8EC5FFu);
         y += row;
@@ -3839,8 +4064,8 @@ static void draw_debug_overlay(void) {
             /* Sleep is the idle part of a frame; everything else is work,
              * flagged once it alone would break a 60 Hz frame. */
             bool slow = i != PROFILE_SLEEP && report->average_us[i] >= 8000u;
-            wm_text(x + 12, y, stage_names[i],
-                    slow ? 0xFFFF8A80u : 0xFFB7C4CEu, 0, 1);
+            debug_text(x + 12, y, stage_names[i],
+                       slow ? 0xFFFF8A80u : 0xFFB7C4CEu);
             append_ms(line, report->average_us[i]);
             debug_text_right(average_right, y, line,
                              slow ? 0xFFFF8A80u : 0xFFE8EEF2u);
@@ -3852,39 +4077,34 @@ static void draw_debug_overlay(void) {
 }
 
 /* Everything the scene shows, folded into one number: when it is unchanged
- * from the last frame there is nothing to repaint but the pointer. */
+ * from the last frame there is nothing to repaint but the pointer. Left out
+ * is whatever render() tracks separately so that it can repaint just the
+ * area concerned: where each window is and what it shows, and the regions
+ * in scene_regions() (panel, menus, debug overlay). */
 static uint64_t compute_scene_signature(const syscall_window_info_t* windows,
                                         uint64_t count) {
     uint64_t hash = 0xCBF29CE484222325ull;
     hash = hash_u64(hash, auth_state);
     hash = hash_u64(hash, accent_color);
     hash = hash_text(hash, status_message);
-    hash = hash_u64(hash, ((uint64_t)debug_fps << 33) |
-                          ((uint64_t)debug_profiler << 32) |
-                          debug_generation);
     if (auth_state != AUTH_NONE) {
         hash = hash_u64(hash, wallpaper_generation);
         hash = hash_u64(hash, auth_password_length);
         return hash_text(hash, auth_message);
     }
     hash = hash_u64(hash, desktop_signature());
-    hash = hash_bytes(hash, windows, (size_t)count * sizeof(*windows));
     for (uint64_t i = 0; i < count; i++) {
+        syscall_window_info_t layout = windows[i];
+        layout.x = 0;
+        layout.y = 0;
+        layout.width = 0;
+        layout.height = 0;
+        layout.frame_version = 0;
+        hash = hash_bytes(hash, &layout, sizeof(layout));
         cached_window_t* entry = cache_for(windows[i].id);
         if (entry && entry->has_icon) hash = hash_u64(hash, entry->icon_sum);
     }
-    hash = hash_u64(hash, ((uint64_t)focused_id << 32) | hover_taskbar);
-    hash = hash_u64(hash, ((uint64_t)start_menu_open << 32) | hover_start_row);
-    hash = hash_u64(hash, clock_valid);
-    hash = hash_bytes(hash, &clock_time, sizeof(clock_time));
-    hash = hash_u64(hash, ((uint64_t)menu_open << 32) | menu_hover);
-    if (menu_open) {
-        hash = hash_u64(hash, ((uint64_t)(uint32_t)menu_x << 32) |
-                              (uint32_t)menu_y);
-        for (uint32_t i = 0; i < menu_item_count; i++)
-            hash = hash_u64(hash, ((uint64_t)menu_items[i].action << 1) |
-                                  menu_items[i].enabled);
-    }
+    hash = hash_u64(hash, focused_id);
     hash = hash_u64(hash, dialog_kind);
     if (dialog_kind != DIALOG_NONE) {
         hash = hash_text(hash, dialog_path);
@@ -3894,14 +4114,18 @@ static uint64_t compute_scene_signature(const syscall_window_info_t* windows,
     return hash;
 }
 
-static void render(const syscall_window_info_t* windows, uint64_t count) {
-    ensure_wallpaper();
-    uint64_t signature = compute_scene_signature(windows, count);
-    bool repaint = !scene_valid || signature != scene_signature;
-    if (repaint && auth_state != AUTH_NONE) {
+static bool window_shown(const syscall_window_info_t* info) {
+    return (info->flags & SYSCALL_WINDOW_VISIBLE) &&
+           !(info->flags & SYSCALL_WINDOW_MINIMIZED);
+}
+
+/* Paints the scene into the canvas, within the current clip. */
+static void draw_scene(const syscall_window_info_t* windows, uint64_t count) {
+    if (auth_state != AUTH_NONE) {
         draw_auth_screen();
-    } else if (repaint) {
+    } else {
         compose_desktop();
+        debug_lap(PROFILE_DESKTOP);
         for (uint32_t focus_pass = 0; focus_pass < 2; focus_pass++) {
             for (uint64_t i = 0; i < count; i++) {
                 const syscall_window_info_t* info = &windows[i];
@@ -3909,24 +4133,201 @@ static void render(const syscall_window_info_t* windows, uint64_t count) {
                 if ((focus_pass == 0 && focused) ||
                     (focus_pass == 1 && !focused))
                     continue;
-                if (!(info->flags & SYSCALL_WINDOW_VISIBLE) ||
-                    (info->flags & SYSCALL_WINDOW_MINIMIZED))
-                    continue;
+                if (!window_shown(info)) continue;
                 cached_window_t* entry = cache_for(info->id);
                 if (entry) composite_window(info, entry);
             }
         }
+        debug_lap(PROFILE_WINDOW_DRAW);
         draw_taskbar(windows, count);
         draw_context_menu();
         draw_dialog();
     }
+    draw_debug_overlay();
+    debug_lap(PROFILE_PANEL);
+}
+
+/* Damage: the parts of the screen whose contents changed since the last
+ * frame. A handful of rectangles; anything more is a full repaint. */
+static rect_t damage[DAMAGE_MAX_RECTS];
+static uint32_t damage_count;
+static bool damage_everything;
+
+/* Parts of the scene that change on their own (hovering, the clock, a menu
+ * opening): each has a signature for what it shows and the area it covers,
+ * and a change repaints that area as it was and as it is now. */
+typedef enum {
+    REGION_PANEL,
+    REGION_START_MENU,
+    REGION_CONTEXT_MENU,
+    REGION_OVERLAY,
+    REGION_COUNT
+} scene_region_t;
+
+typedef struct {
+    uint64_t signature;
+    rect_t area;
+} region_state_t;
+
+static region_state_t regions_drawn[REGION_COUNT];
+
+static void damage_add(rect_t area) {
+    if (area.left < 0) area.left = 0;
+    if (area.top < 0) area.top = 0;
+    if (area.right > (int32_t)display.width)
+        area.right = (int32_t)display.width;
+    if (area.bottom > (int32_t)display.height)
+        area.bottom = (int32_t)display.height;
+    if (area.left >= area.right || area.top >= area.bottom) return;
+    for (uint32_t i = 0; i < damage_count; i++) {
+        rect_t* other = &damage[i];
+        if (area.left >= other->right || area.right <= other->left ||
+            area.top >= other->bottom || area.bottom <= other->top)
+            continue;
+        if (area.left < other->left) other->left = area.left;
+        if (area.top < other->top) other->top = area.top;
+        if (area.right > other->right) other->right = area.right;
+        if (area.bottom > other->bottom) other->bottom = area.bottom;
+        return;
+    }
+    if (damage_count == DAMAGE_MAX_RECTS) {
+        damage_everything = true;
+        return;
+    }
+    damage[damage_count++] = area;
+}
+
+/* A window with its title bar, border and shadow. */
+static rect_t window_outer_rect(int32_t x, int32_t y, uint32_t width,
+                                uint32_t height) {
+    return (rect_t){
+        x - WINDOW_SHADOW_MARGIN, y - WINDOW_SHADOW_MARGIN,
+        x + (int32_t)width + 2 + WINDOW_SHADOW_MARGIN,
+        y + (int32_t)height + (int32_t)TITLE_HEIGHT + 2 + WINDOW_SHADOW_MARGIN
+    };
+}
+
+static void scene_regions(region_state_t* regions) {
+    uint64_t hash = 0xCBF29CE484222325ull;
+    hash = hash_u64(hash, ((uint64_t)start_menu_open << 32) | hover_taskbar);
+    hash = hash_u64(hash, clock_valid);
+    regions[REGION_PANEL].signature =
+        hash_bytes(hash, &clock_time, sizeof(clock_time));
+    regions[REGION_PANEL].area = (rect_t){
+        0, (int32_t)display.height - (int32_t)TASKBAR_HEIGHT,
+        (int32_t)display.width, (int32_t)display.height};
+
+    regions[REGION_START_MENU].signature =
+        ((uint64_t)start_menu_open << 32) | hover_start_row;
+    regions[REGION_START_MENU].area = (rect_t){0};
+    if (start_menu_open) {
+        int32_t x, y, width, height;
+        start_menu_bounds(&x, &y, &width, &height);
+        regions[REGION_START_MENU].area =
+            (rect_t){x - 5, y - 3, x + width + 5, y + height + 7};
+    }
+
+    hash = 0xCBF29CE484222325ull;
+    hash = hash_u64(hash, ((uint64_t)menu_open << 32) | menu_hover);
+    regions[REGION_CONTEXT_MENU].area = (rect_t){0};
+    if (menu_open) {
+        hash = hash_u64(hash, ((uint64_t)(uint32_t)menu_x << 32) |
+                              (uint32_t)menu_y);
+        for (uint32_t i = 0; i < menu_item_count; i++)
+            hash = hash_u64(hash, ((uint64_t)menu_items[i].action << 1) |
+                                  menu_items[i].enabled);
+        regions[REGION_CONTEXT_MENU].area = (rect_t){
+            menu_x - 4, menu_y - 2, menu_x + MENU_WIDTH + 4,
+            menu_y + menu_height() + 6};
+    }
+    regions[REGION_CONTEXT_MENU].signature = hash;
+
+    regions[REGION_OVERLAY].signature =
+        ((uint64_t)debug_fps << 33) | ((uint64_t)debug_profiler << 32) |
+        debug_generation;
+    regions[REGION_OVERLAY].area = debug_overlay_rect();
+}
+
+/* Works out what has to be repainted. With the layout unchanged that is
+ * only the windows that moved or drew something new, the regions that
+ * changed, and the desktop icons whose highlight did. */
+static void collect_damage(const syscall_window_info_t* windows,
+                           uint64_t count, bool layout_changed,
+                           const region_state_t* regions,
+                           const rect_t* desktop_changed,
+                           uint32_t desktop_changed_count) {
+    damage_count = 0;
+    damage_everything = layout_changed || !scene_valid;
+    if (damage_everything) return;
+    for (uint32_t i = 0; i < desktop_changed_count; i++)
+        damage_add(desktop_changed[i]);
+    for (uint32_t i = 0; i < REGION_COUNT; i++) {
+        if (regions[i].signature == regions_drawn[i].signature) continue;
+        damage_add(regions_drawn[i].area);
+        damage_add(regions[i].area);
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        const syscall_window_info_t* info = &windows[i];
+        cached_window_t* entry = cache_for(info->id);
+        if (!entry || !window_shown(info)) continue;
+        if (entry->drawn_x != (int32_t)info->x ||
+            entry->drawn_y != (int32_t)info->y ||
+            entry->drawn_width != info->width ||
+            entry->drawn_height != info->height) {
+            damage_add(window_outer_rect(entry->drawn_x, entry->drawn_y,
+                                         entry->drawn_width,
+                                         entry->drawn_height));
+            damage_add(window_outer_rect((int32_t)info->x, (int32_t)info->y,
+                                         info->width, info->height));
+        } else if (entry->drawn_version != entry->frame_version) {
+            int32_t left = (int32_t)info->x + 1;
+            int32_t top = (int32_t)info->y + (int32_t)TITLE_HEIGHT + 1;
+            damage_add((rect_t){left, top, left + (int32_t)info->width,
+                                top + (int32_t)info->height});
+        }
+    }
+    /* The sign-in screen, and a desktop drawn without its layer, are only
+     * ever painted whole. */
+    if (damage_count && (!desktop_layer || auth_state != AUTH_NONE))
+        damage_everything = true;
+}
+
+static void render(const syscall_window_info_t* windows, uint64_t count) {
+    ensure_wallpaper();
+    rect_t desktop_changed[2];
+    uint32_t desktop_changed_count = update_desktop_layer(desktop_changed);
+    region_state_t regions[REGION_COUNT];
+    scene_regions(regions);
+    uint64_t signature = compute_scene_signature(windows, count);
+    collect_damage(windows, count, signature != scene_signature, regions,
+                   desktop_changed, desktop_changed_count);
+    bool repaint = damage_everything || damage_count;
+    if (damage_everything) {
+        draw_scene(windows, count);
+    } else {
+        for (uint32_t i = 0; i < damage_count; i++) {
+            clip = damage[i];
+            draw_scene(windows, count);
+        }
+        clip = (rect_t){0};
+    }
     if (repaint) {
-        draw_debug_overlay();
+        for (uint64_t i = 0; i < count; i++) {
+            cached_window_t* entry = cache_for(windows[i].id);
+            if (!entry) continue;
+            entry->drawn_x = (int32_t)windows[i].x;
+            entry->drawn_y = (int32_t)windows[i].y;
+            entry->drawn_width = windows[i].width;
+            entry->drawn_height = windows[i].height;
+            entry->drawn_version = entry->frame_version;
+        }
+        memcpy(regions_drawn, regions, sizeof(regions_drawn));
         scene_signature = signature;
         scene_valid = true;
     }
-    debug_lap(PROFILE_DRAW);
-    present_frame(repaint);
+    debug_lap(PROFILE_PANEL);
+    present_frame(damage_everything, damage, damage_everything ? 0u
+                                                               : damage_count);
     debug_lap(PROFILE_PRESENT);
 }
 
@@ -4638,6 +5039,7 @@ int main(void) {
     load_fonts();
     syscall_window_info_t windows[MAX_WINDOWS];
     syscall_input_event_t input[32];
+    uint64_t frame_due_ms = mos_syscall1(SYS_UPTIME, 0);
 
     for (;;) {
         bool refresh_icons = ++icon_poll_frames >= 30u;
@@ -4687,7 +5089,16 @@ int main(void) {
         update_clock();
         debug_lap(PROFILE_POINTER);
         render(windows, count);
-        mos_sleep(16);
+        /* Sleep to the next frame boundary rather than a fixed 16 ms, so
+         * the time a frame took to draw comes out of its own wait. */
+        uint64_t now_ms = mos_syscall1(SYS_UPTIME, 0);
+        frame_due_ms += FRAME_INTERVAL_MS;
+        if (frame_due_ms <= now_ms) {
+            frame_due_ms = now_ms;
+            mos_sleep(1);
+        } else {
+            mos_sleep(frame_due_ms - now_ms);
+        }
         debug_lap(PROFILE_SLEEP);
         debug_frame_end();
     }
