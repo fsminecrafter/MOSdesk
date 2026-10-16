@@ -35,6 +35,9 @@ typedef struct { char name[64]; uint32_t type; uint32_t hidden; } syscall_dirent
 #define SYS_EXISTS 9u
 #define SYS_RMDIR 21u
 #define SYS_GET_METADATA 22u
+/* --- additions: the user folders (0:/users/<username>/...) --- */
+#define SYS_IS_DIR 93u
+#define SYS_MKDIR 94u
 #define SYSCALL_MOUSE_BTN_RIGHT (1u << 1)
 typedef struct {
     char filetype[64];

@@ -37,23 +37,27 @@ fill color, scale, pointer speed, one of six coordinated color themes, optional
 password sign-in, single-click opening, and desktop grid snapping. Desktop
 shortcut positions persist across restarts; the grid is on by default and can
 be disabled for free placement. Single-click opening and password sign-in are
-off by default. On first launch mosWM creates `0:/users/` and asks whether to
-use password sign-in or automatic sign-in. The password prompt gates MOSdesk
+off by default. On first launch mosWM asks for a username, creates
+`0:/users/<username>/` with `Documents`, `Pictures` and `Desktop`, and asks
+whether to use password sign-in or automatic sign-in. The password prompt gates MOSdesk
 only; it does not protect OS files or replace an OS account login. Posy's
 animated busy and working cursors and its text, hand, help, forbidden, move,
 pen, precise, and resize cursors are loaded as needed.
 
 MOSdesk keeps the Home and System desktop shortcuts and adds shortcuts for
 `.run` applications found directly in `0:/programs/` or one directory below
-it. Double-clicking an application shortcut launches its `.run` bundle by
-default. Bundles may include a root-level `icon.bmp` or `icon.ico`; these are
+it (built-in `mos_<name>.run` apps are labelled "Name"), followed by the
+files and folders in `0:/users/<username>/Desktop`; that folder is re-read
+twice a second, so files other programs save there appear on their own.
+Double-clicking an application shortcut launches its `.run` bundle by
+default; text files open in the bundled editor, `0:/programs/mos_edit.run`. Bundles may include a root-level `icon.bmp` or `icon.ico`; these are
 shown on the desktop.
 The decoder supports uncompressed 24-bit or 32-bit BMP and DIB-based ICO
 entries. Apps can set a 32×32 ARGB8888 icon for their own window with
 `mos_window_set_icon`; mosWM displays it in the title bar and taskbar. See the
 SDK README for the application API.
 
-Home opens the `0:/users/` folder and System opens the `0:/` filesystem root
+Home opens the user's `0:/users/<username>/` folder and System opens the `0:/` filesystem root
 in the built-in Files window. Navigate folders with a double-click (or one
 click when enabled); the toolbar jumps Home/System, goes up, refreshes, and
 creates a folder. Entries are listed folders first, with an icon chosen from

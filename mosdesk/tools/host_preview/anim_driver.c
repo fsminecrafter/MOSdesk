@@ -104,6 +104,7 @@ static void type_str(const char* s) {
 static void write_settings(const char* password) {
     mosdesk_settings_t s = mosdesk_settings_default();
     s.onboarding_complete = 1; s.login_enabled = 1;
+    strcpy(s.username, "demo");
     for (int i = 0; i < 16; i++) s.password_salt[i] = (uint8_t)(0xA5 ^ (i * 29));
     mosdesk_password_hash(s.password_salt, password, s.password_hash);
     FILE* f = fopen("0:/programs/mosdesk/settings.dat", "wb"); fwrite(&s, sizeof s, 1, f); fclose(f);
@@ -114,8 +115,10 @@ int main(int argc, char** argv) {
     harness_w = W; harness_h = H; sfb = calloc((size_t)W * H, 4);
     hook_exec = on_exec; hook_event = on_event; hook_bounds = on_bounds;
     write_settings("mosdesk1");
-    a_init(1 /* AUTH_FIRST_CHOICE */);
+    a_init(4 /* AUTH_USERNAME */);
     a_set_cursor(W / 2, H / 2);
+    snap("login_username");                        /* first run: choose a username */
+    a_set_auth(1 /* AUTH_FIRST_CHOICE */);
     snap("login_first_run");                       /* welcome / choose sign-in mode */
     a_set_auth(3 /* AUTH_LOGIN */);
     if (mp4) {

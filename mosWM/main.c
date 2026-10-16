@@ -27,6 +27,9 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define SYS_EXEC 33u
 #endif
 
+/* The text editor shipped with MOSdesk (mosdesk/apps/edit.c). */
+#define MOSDESK_EDITOR_PATH "0:/programs/mos_edit.run"
+
 #define SYS_HEAP_ALLOC 1u
 #define SYS_HEAP_FREE 2u
 #define MAX_WINDOWS SYSCALL_WINDOW_MAX_WINDOWS
@@ -41,6 +44,7 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define CURSOR_MAX_FRAMES 80u
 #define CURSOR_MAX_FILE_SIZE (8u * 1024u * 1024u)
 #define MAX_DESKTOP_APPS 32u
+#define MAX_DESKTOP_FILES 32u
 #define DESKTOP_APP_PATH_SIZE 192u
 #define DESKTOP_APP_NAME_SIZE 48u
 #define DESKTOP_DIR_ENTRIES 128u
@@ -60,6 +64,7 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define AUTH_FIRST_CHOICE 1u
 #define AUTH_FIRST_PASSWORD 2u
 #define AUTH_LOGIN 3u
+#define AUTH_USERNAME 4u
 #define AUTH_PASSWORD_MAX 63u
 #define BROWSER_HEADER_HEIGHT 50u
 #define BROWSER_FOOTER_HEIGHT 26u
@@ -124,12 +129,20 @@ typedef struct {
     uint32_t icon_pixels[DESKTOP_ICON_PIXELS];
 } desktop_app_t;
 
+/* A file or folder inside the user's Desktop folder. */
+typedef struct {
+    char path[DESKTOP_APP_PATH_SIZE];
+    char name[DESKTOP_APP_NAME_SIZE];
+    uint32_t type;
+} desktop_file_t;
+
 typedef enum {
     CLICK_ACTION_NONE,
     CLICK_ACTION_HOME,
     CLICK_ACTION_SYSTEM,
     CLICK_ACTION_APPLICATION,
-    CLICK_ACTION_BROWSER_ENTRY
+    CLICK_ACTION_BROWSER_ENTRY,
+    CLICK_ACTION_DESKTOP_FILE
 } click_action_t;
 
 typedef enum {
@@ -185,6 +198,13 @@ static rect_t clip;
 static cached_window_t cache[MAX_WINDOWS];
 static desktop_app_t desktop_apps[MAX_DESKTOP_APPS];
 static uint32_t desktop_app_count;
+static desktop_file_t desktop_files[MAX_DESKTOP_FILES];
+static uint32_t desktop_file_count;
+static uint64_t desktop_files_signature;
+/* 0:/users/<username> and its Desktop folder; the home is 0:/users and the
+ * Desktop folder empty until a username has been chosen. */
+static char user_home[BROWSER_PATH_SIZE] = MOSDESK_USERS_PATH;
+static char user_desktop[BROWSER_PATH_SIZE];
 static syscall_dirent_t browser_entries[BROWSER_MAX_ENTRIES];
 static uint32_t browser_entry_count;
 static uint32_t browser_selected = UINT32_MAX;
@@ -233,6 +253,8 @@ static mosdesk_settings_t desktop_settings;
 static char auth_password[AUTH_PASSWORD_MAX + 1u];
 static uint32_t auth_password_length;
 static char auth_message[64];
+static char auth_username[MOSDESK_USERNAME_SIZE];
+static uint32_t auth_username_length;
 static uint32_t dragging_id;
 static uint32_t drag_mode;
 static uint32_t drag_start_x;
@@ -369,6 +391,8 @@ static void fill_rounded_rect(int32_t x, int32_t y, int32_t width,
 static void fill_rect(int32_t x, int32_t y, int32_t width, int32_t height,
                       uint32_t color);
 static void reload_desktop_apps(void);
+static bool reload_desktop_files(void);
+static void update_user_paths(void);
 static void open_settings(const char* page);
 
 static void copy_pixels(uint32_t* destination, const uint32_t* source,
@@ -416,7 +440,10 @@ static void load_desktop_settings(void) {
         settings.wallpaper_mode != desktop_settings.wallpaper_mode ||
         settings.wallpaper_rotation != desktop_settings.wallpaper_rotation)
         painted_wallpaper_style = UINT32_MAX;
+    bool user_changed = strcmp(settings.username,
+                               desktop_settings.username) != 0;
     desktop_settings = settings;
+    if (user_changed) update_user_paths();
     mouse_speed = settings.mouse_speed;
     accent_color = settings.accent_color;
     cursor_fill_color = settings.cursor_fill;
@@ -1143,8 +1170,16 @@ static void add_desktop_app(const char* path, const char* run_name) {
         !name_length || name_length >= sizeof(app->name))
         return;
     memcpy(app->path, path, path_length + 1u);
-    memcpy(app->name, run_name, name_length);
+    /* Built-in apps are installed as mos_<name>.run; show them as "Name". */
+    const char* label = run_name;
+    if (!strncmp(run_name, "mos_", 4u) && name_length > 4u) {
+        label += 4;
+        name_length -= 4u;
+    }
+    memcpy(app->name, label, name_length);
     app->name[name_length] = '\0';
+    if (label != run_name && app->name[0] >= 'a' && app->name[0] <= 'z')
+        app->name[0] = (char)(app->name[0] - 'a' + 'A');
     app->has_icon = read_bundle_icon(app->path, app->icon_pixels);
     desktop_app_count++;
 }
@@ -1194,6 +1229,63 @@ static void load_desktop_apps(void) {
                 add_desktop_app(run_path, children[child].name);
         }
     }
+}
+
+/* Re-reads the user's Desktop folder. Returns true (and redraws the
+ * desktop) only when what is in it has changed. */
+static bool reload_desktop_files(void) {
+    syscall_dirent_t entries[DESKTOP_DIR_ENTRIES];
+    uint64_t count = 0;
+    if (user_desktop[0]) {
+        count = mos_syscall3(SYS_LISTDIR,
+            (uint64_t)(uintptr_t)user_desktop,
+            (uint64_t)(uintptr_t)entries, DESKTOP_DIR_ENTRIES);
+        if ((int64_t)count < 0) count = 0;
+        if (count > DESKTOP_DIR_ENTRIES) count = DESKTOP_DIR_ENTRIES;
+    }
+    uint64_t signature = hash_bytes(0xCBF29CE484222325ull, user_desktop,
+                                    strlen(user_desktop));
+    for (uint64_t i = 0; i < count; i++) {
+        if (entries[i].hidden) continue;
+        signature = hash_bytes(signature, entries[i].name,
+                               strlen(entries[i].name));
+        signature = hash_u64(signature, entries[i].type);
+    }
+    if (signature == desktop_files_signature) return false;
+    desktop_files_signature = signature;
+    desktop_file_count = 0;
+    for (uint64_t i = 0; i < count &&
+         desktop_file_count < MAX_DESKTOP_FILES; i++) {
+        if (entries[i].hidden) continue;
+        desktop_file_t* item = &desktop_files[desktop_file_count];
+        if (!path_join(item->path, sizeof(item->path), user_desktop,
+                       entries[i].name))
+            continue;
+        size_t length = strlen(entries[i].name);
+        if (length >= sizeof(item->name)) length = sizeof(item->name) - 1u;
+        memcpy(item->name, entries[i].name, length);
+        item->name[length] = '\0';
+        item->type = entries[i].type;
+        desktop_file_count++;
+    }
+    desktop_apps_generation++;
+    return true;
+}
+
+/* Points Home and the desktop at 0:/users/<username>, creating the user's
+ * Documents, Pictures and Desktop folders if they are missing. */
+static void update_user_paths(void) {
+    const char* username = desktop_settings.username;
+    if (mosdesk_user_path(user_home, sizeof(user_home), username, NULL) &&
+        mosdesk_user_path(user_desktop, sizeof(user_desktop), username,
+                          MOSDESK_USER_DESKTOP)) {
+        if (!mosdesk_user_prepare(username))
+            log_message("mosWM: unable to create the user folders\n");
+    } else {
+        strcpy(user_home, MOSDESK_USERS_PATH);
+        user_desktop[0] = '\0';
+    }
+    reload_desktop_files();
 }
 
 static uint8_t* font_regular_data;
@@ -1442,6 +1534,17 @@ static bool path_is_protected(const char* path) {
     };
     for (uint32_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++)
         if (!strcmp(path, exact[i])) return true;
+    /* The user's home and its standard folders. */
+    if (!strcmp(path, user_home)) return true;
+    size_t home_length = strlen(user_home);
+    if (user_desktop[0] && !strncmp(path, user_home, home_length) &&
+        path[home_length] == '/') {
+        const char* folder = path + home_length + 1u;
+        if (!strcmp(folder, MOSDESK_USER_DOCUMENTS) ||
+            !strcmp(folder, MOSDESK_USER_PICTURES) ||
+            !strcmp(folder, MOSDESK_USER_DESKTOP))
+            return true;
+    }
     return path_has_prefix(path, "0:/programs/mosWM") ||
            path_has_prefix(path, "0:/programs/mosdesk") ||
            path_has_prefix(path, "0:/services/mosWM.service");
@@ -2060,7 +2163,7 @@ static void browser_mouse_down(int32_t x, int32_t y,
     if (y < (int32_t)BROWSER_HEADER_HEIGHT) {
         last_click_valid = false;
         uint32_t tool = browser_tool_at(x, y);
-        if (tool == 0u) browser_open(MOSDESK_USERS_PATH);
+        if (tool == 0u) browser_open(user_home);
         else if (tool == 1u) browser_open("0:/");
         else if (tool == 2u) browser_go_up();
         else if (tool == 3u) browser_refresh_directory();
@@ -2086,39 +2189,88 @@ static void browser_mouse_down(int32_t x, int32_t y,
     queue_open_click(CLICK_ACTION_BROWSER_ENTRY, entry_path);
 }
 
+/* Files the bundled text editor opens. */
+static bool is_text_name(const char* name) {
+    static const char* const extensions[] = {
+        ".txt", ".md", ".log", ".c", ".h", ".cpp", ".hpp", ".py", ".sh",
+        ".cfg", ".conf", ".ini", ".json", ".csv", ".html", ".css", ".js",
+        ".service", ".desc", ".pkg"
+    };
+    for (uint32_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++)
+        if (name_has_extension(name, extensions[i])) return true;
+    return false;
+}
+
+/* Reports a problem opening something, in Files or on the panel. */
+static void open_note(bool in_files, const char* message, bool is_error) {
+    if (in_files) {
+        browser_note(message, is_error);
+    } else {
+        size_t length = strlen(message);
+        if (length >= sizeof(status_message))
+            length = sizeof(status_message) - 1u;
+        memcpy(status_message, message, length);
+        status_message[length] = '\0';
+    }
+}
+
+/* Opens a file or folder from Files or the desktop: folders in Files, .qoi
+ * images as the wallpaper, programs by running them and text files in the
+ * bundled editor. */
+static void open_file(const char* path, bool executable, bool in_files) {
+    if (fs_is_directory(path)) {
+        browser_open(path);
+        return;
+    }
+    const char* name = path_name(path);
+    if (name_has_extension(name, ".qoi")) {
+        set_wallpaper_image(path);
+        return;
+    }
+    if (executable || is_run_name(name)) {
+        if ((int64_t)mos_syscall3(SYS_EXEC,
+                (uint64_t)(uintptr_t)path, 0, 0) < 0)
+            open_note(in_files, "Unable to run this item", true);
+        return;
+    }
+    if (is_text_name(name) && fs_exists(MOSDESK_EDITOR_PATH)) {
+        const char* arguments[1] = {path};
+        if ((int64_t)mos_syscall3(SYS_EXEC,
+                (uint64_t)(uintptr_t)MOSDESK_EDITOR_PATH,
+                (uint64_t)(uintptr_t)arguments, 1u) < 0)
+            open_note(in_files, "Unable to open the text editor", true);
+        return;
+    }
+    open_note(in_files, "Nothing is set up to open this file", false);
+}
+
 static void open_path(click_action_t action, const char* path) {
     if (action == CLICK_ACTION_HOME) {
-        browser_open(MOSDESK_USERS_PATH);
+        browser_open(user_home);
     } else if (action == CLICK_ACTION_SYSTEM) {
         browser_open("0:/");
     } else if (action == CLICK_ACTION_APPLICATION) {
         if ((int64_t)mos_syscall3(SYS_EXEC,
                 (uint64_t)(uintptr_t)path, 0, 0) < 0)
             strcpy(status_message, "Unable to open desktop application");
+    } else if (action == CLICK_ACTION_DESKTOP_FILE) {
+        bool executable = false;
+        for (uint32_t i = 0; i < desktop_file_count; i++)
+            if (!strcmp(desktop_files[i].path, path))
+                executable = desktop_files[i].type ==
+                    SYSCALL_DIRENT_TYPE_EXECUTABLE;
+        open_file(path, executable, false);
     } else if (action == CLICK_ACTION_BROWSER_ENTRY) {
-        if (fs_is_directory(path)) {
-            browser_open(path);
-            return;
-        }
-        const char* name = path_name(path);
-        if (name_has_extension(name, ".qoi")) {
-            set_wallpaper_image(path);
-            return;
-        }
-        bool runnable = is_run_name(name);
-        for (uint32_t i = 0; i < browser_entry_count && !runnable; i++) {
+        bool executable = false;
+        for (uint32_t i = 0; i < browser_entry_count && !executable; i++) {
             char entry_path[BROWSER_PATH_SIZE];
-            runnable = browser_entries[i].type ==
-                           SYSCALL_DIRENT_TYPE_EXECUTABLE &&
+            executable = browser_entries[i].type ==
+                             SYSCALL_DIRENT_TYPE_EXECUTABLE &&
                 path_join(entry_path, sizeof(entry_path), browser_path,
                           browser_entries[i].name) &&
                 !strcmp(entry_path, path);
         }
-        if (!runnable)
-            browser_note("Nothing is set up to open this file", false);
-        else if ((int64_t)mos_syscall3(SYS_EXEC,
-                     (uint64_t)(uintptr_t)path, 0, 0) < 0)
-            browser_note("Unable to run this item", true);
+        open_file(path, executable, true);
     }
 }
 
@@ -2408,6 +2560,12 @@ static void paint_wallpaper(uint32_t* target) {
 static void draw_desktop_icons(void);
 static rect_t desktop_icon_highlight(uint32_t index);
 
+/* Desktop icons: 0 Home, 1 System, then the applications, then the items
+ * of the user's Desktop folder. */
+static uint32_t desktop_icon_count(void) {
+    return 2u + desktop_app_count + desktop_file_count;
+}
+
 static void ensure_wallpaper(void) {
     if (!wallpaper || painted_wallpaper_style == wallpaper_style) return;
     paint_wallpaper(wallpaper);
@@ -2470,7 +2628,7 @@ static uint32_t update_desktop_layer(rect_t* changed) {
     uint32_t* saved = canvas;
     canvas = desktop_layer;
     for (uint32_t i = 0; i < 2u; i++) {
-        if (icons[i] >= desktop_app_count + 2u) continue;
+        if (icons[i] >= desktop_icon_count()) continue;
         rect_t area = desktop_icon_highlight(icons[i]);
         if (area.left < 0) area.left = 0;
         if (area.top < 0) area.top = 0;
@@ -2526,8 +2684,8 @@ static void draw_custom_icon(const uint32_t* icon, int32_t x, int32_t y,
 }
 
 static void desktop_icon_position(uint32_t index, int32_t* x, int32_t* y) {
-    if (index >= MOSDESK_DESKTOP_ICON_COUNT) return;
-    if (desktop_settings.desktop_icon_x[index] != UINT32_MAX &&
+    if (index < MOSDESK_DESKTOP_ICON_COUNT &&
+        desktop_settings.desktop_icon_x[index] != UINT32_MAX &&
         desktop_settings.desktop_icon_y[index] != UINT32_MAX) {
         uint32_t max_x = display.width > 84u ? display.width - 84u : 0u;
         uint32_t work_height = display.height > TASKBAR_HEIGHT
@@ -2557,9 +2715,9 @@ static void desktop_icon_position(uint32_t index, int32_t* x, int32_t* y) {
     *y = 14 + (int32_t)row * 98;
 }
 
-/* Index of the desktop icon under a point (0 Home, 1 System, then apps). */
+/* Index of the desktop icon under a point (see desktop_icon_count). */
 static uint32_t desktop_icon_at(int32_t px, int32_t py) {
-    for (uint32_t i = 0; i < desktop_app_count + 2u; i++) {
+    for (uint32_t i = 0; i < desktop_icon_count(); i++) {
         int32_t x, y;
         desktop_icon_position(i, &x, &y);
         if (px >= x - 10 && px < x + 74 && py >= y - 4 && py < y + 90)
@@ -2574,8 +2732,24 @@ static click_action_t desktop_shortcut_at(int32_t px, int32_t py,
     if (index == UINT32_MAX) return CLICK_ACTION_NONE;
     if (index == 0u) return CLICK_ACTION_HOME;
     if (index == 1u) return CLICK_ACTION_SYSTEM;
-    if (app_index) *app_index = index - 2u;
-    return CLICK_ACTION_APPLICATION;
+    if (index - 2u < desktop_app_count) {
+        if (app_index) *app_index = index - 2u;
+        return CLICK_ACTION_APPLICATION;
+    }
+    if (app_index) *app_index = index - 2u - desktop_app_count;
+    return CLICK_ACTION_DESKTOP_FILE;
+}
+
+/* The path a desktop shortcut stands for, or NULL. */
+static const char* desktop_shortcut_path(click_action_t action,
+                                         uint32_t index) {
+    if (action == CLICK_ACTION_HOME) return user_home;
+    if (action == CLICK_ACTION_SYSTEM) return "0:/";
+    if (action == CLICK_ACTION_APPLICATION && index < desktop_app_count)
+        return desktop_apps[index].path;
+    if (action == CLICK_ACTION_DESKTOP_FILE && index < desktop_file_count)
+        return desktop_files[index].path;
+    return NULL;
 }
 
 /* The hover highlight behind desktop icon `index`. */
@@ -2587,7 +2761,7 @@ static rect_t desktop_icon_highlight(uint32_t index) {
 
 static void draw_desktop_icons(void) {
     rect_t bounds = draw_bounds();
-    for (uint32_t i = 0; i < desktop_app_count + 2u; i++) {
+    for (uint32_t i = 0; i < desktop_icon_count(); i++) {
         int32_t x, y;
         desktop_icon_position(i, &x, &y);
         /* Icon, label and highlight all sit well inside this box. */
@@ -2598,10 +2772,16 @@ static void draw_desktop_icons(void) {
             fill_rounded_rect(x - 10, y - 4, 84, 94, 8, 0x30FFFFFFu);
             fill_rounded_rect(x - 9, y - 3, 82, 92, 7, 0x18000000u);
         }
+        bool is_file = i >= 2u + desktop_app_count;
+        const desktop_file_t* file = is_file
+            ? &desktop_files[i - 2u - desktop_app_count] : NULL;
         const char* name = i == 0u ? "Home" : i == 1u ? "System"
-            : desktop_apps[i - 2u].name;
+            : file ? file->name : desktop_apps[i - 2u].name;
         if (i < 2u) {
             wm_icon(x, y, i == 0u ? MOSWM_ICON_HOME : MOSWM_ICON_COMPUTER, 64u);
+        } else if (file) {
+            wm_icon(x + 4, y + 2, icon_for_entry(file->type, file->name),
+                    56u);
         } else if (desktop_apps[i - 2u].has_icon) {
             draw_custom_icon(desktop_apps[i - 2u].icon_pixels, x + 8, y + 6,
                              48u);
@@ -3340,14 +3520,16 @@ static void menu_show_for_item(click_action_t target, const char* path) {
     menu_item_count = 0;
     bool editable = !path_is_protected(path);
     menu_add(MENU_ACTION_OPEN, "Open", MOSWM_ICON_FOLDER, false, true);
-    if (target == CLICK_ACTION_APPLICATION)
+    if (target == CLICK_ACTION_APPLICATION ||
+        target == CLICK_ACTION_DESKTOP_FILE)
         menu_add(MENU_ACTION_SHOW_IN_FILES, "Show in Files",
                  MOSWM_ICON_COMPUTER, false, true);
     if (name_has_extension(path, ".qoi"))
         menu_add(MENU_ACTION_SET_WALLPAPER, "Set as wallpaper",
                  MOSWM_ICON_IMAGE, false, true);
     if (target == CLICK_ACTION_APPLICATION ||
-        target == CLICK_ACTION_BROWSER_ENTRY) {
+        target == CLICK_ACTION_BROWSER_ENTRY ||
+        target == CLICK_ACTION_DESKTOP_FILE) {
         menu_add(MENU_ACTION_COPY, "Copy", MOSWM_ICON_COPY, true, true);
         menu_add(MENU_ACTION_RENAME, "Rename", MOSWM_ICON_EDIT, false,
                  editable);
@@ -3486,6 +3668,8 @@ static void draw_dialog(void) {
 static void reload_desktop_apps(void) {
     desktop_app_count = 0;
     load_desktop_apps();
+    desktop_files_signature = 0;
+    reload_desktop_files();
     desktop_apps_generation++;
 }
 
@@ -3496,6 +3680,8 @@ static void after_file_change(const char* directory, const char* select) {
         if (select) browser_select_name(select);
     }
     if (path_has_prefix(directory, "0:/programs")) reload_desktop_apps();
+    if (user_desktop[0] && path_has_prefix(directory, user_desktop))
+        reload_desktop_files();
 }
 
 static void dialog_confirm(void) {
@@ -3658,7 +3844,7 @@ static void run_menu_action(menu_action_t action) {
             else reload_desktop_apps();
             break;
         case MENU_ACTION_FILES:
-            browser_open(MOSDESK_USERS_PATH);
+            browser_open(user_home);
             break;
         case MENU_ACTION_WALLPAPERS:
             open_settings("wallpaper");
@@ -3693,7 +3879,32 @@ static void draw_auth_screen(void) {
     wm_text(x + 32, y + 25, "M", 0xFFFFFFFFu, 0, 2);
     wm_text(x + 68, y + 22, "MOSdesk", 0xFF273640u, 0, 2);
 
-    if (auth_state == AUTH_FIRST_CHOICE) {
+    if (auth_state == AUTH_USERNAME) {
+        wm_text(x + 28, y + 86,
+                desktop_settings.onboarding_complete ? "Choose a username"
+                                                     : "Welcome to MOSdesk",
+                0xFF34434Cu, 0, 2);
+        wm_text(x + 28, y + 116,
+                "Pick a username: letters, numbers, - and _.",
+                0xFF667680u, 0, 1);
+        fill_rounded_rect(x + 28, y + 140, width - 56, 38, 6,
+                          0xFFFFFFFFu);
+        fill_rect(x + 28, y + 140, width - 56, 1, 0xFFBCC6CDu);
+        fill_rect(x + 28, y + 177, width - 56, 1, 0xFFBCC6CDu);
+        wm_text(x + 42, y + 153, auth_username, 0xFF34434Cu, 0, 1);
+        int32_t caret_x = x + 42 +
+            (int32_t)moswm_text_width(auth_username, 1u) + 1;
+        fill_rect(caret_x, y + 150, 2, 18, accent_color);
+        char where[96] = "Your files go in " MOSDESK_USERS_PATH "/";
+        size_t used = strlen(where);
+        size_t name_length = strlen(auth_username);
+        if (used + name_length < sizeof(where)) {
+            memcpy(where + used, auth_username, name_length + 1u);
+            wm_text(x + 28, y + 192, where, 0xFF667680u, 0, 1);
+        }
+        wm_text(x + 28, y + height - 51, "Enter to continue",
+                0xFF667680u, 0, 1);
+    } else if (auth_state == AUTH_FIRST_CHOICE) {
         wm_text(x + 28, y + 86, "Welcome to MOSdesk", 0xFF34434Cu, 0, 2);
         wm_text(x + 28, y + 116, "Would you like password sign-in?",
                 0xFF667680u, 0, 1);
@@ -3718,8 +3929,19 @@ static void draw_auth_screen(void) {
         wm_text(x + 28, y + 86,
                 logging_in ? "Sign in to MOSdesk" : "Set a password",
                 0xFF34434Cu, 0, 2);
+        char prompt[96] = "Enter your password to continue.";
+        if (logging_in && desktop_settings.username[0]) {
+            strcpy(prompt, "Enter the password for ");
+            size_t used = strlen(prompt);
+            size_t name_length = strlen(desktop_settings.username);
+            if (used + name_length + 2u <= sizeof(prompt)) {
+                memcpy(prompt + used, desktop_settings.username, name_length);
+                prompt[used + name_length] = '.';
+                prompt[used + name_length + 1u] = '\0';
+            }
+        }
         wm_text(x + 28, y + 116,
-                logging_in ? "Enter your password to continue."
+                logging_in ? prompt
                            : "Use 4 to 63 characters, then press Enter.",
                 0xFF667680u, 0, 1);
         fill_rounded_rect(x + 28, y + 140, width - 56, 38, 6,
@@ -3742,6 +3964,8 @@ static void draw_auth_screen(void) {
 }
 
 static bool save_auth_preferences(bool password_enabled) {
+    if (mosdesk_username_valid(auth_username))
+        strcpy(desktop_settings.username, auth_username);
     desktop_settings.onboarding_complete = 1u;
     desktop_settings.login_enabled = password_enabled ? 1u : 0u;
     if (!password_enabled) {
@@ -3758,7 +3982,47 @@ static bool save_auth_preferences(bool password_enabled) {
     auth_message[0] = '\0';
     auth_password_length = 0;
     memset(auth_password, 0, sizeof(auth_password));
+    update_user_paths();
     return true;
+}
+
+/* Where to go once the password is out of the way: a desktop installed
+ * before usernames existed asks for one first. */
+static void finish_sign_in(void) {
+    auth_message[0] = '\0';
+    auth_password_length = 0;
+    memset(auth_password, 0, sizeof(auth_password));
+    auth_state = desktop_settings.username[0] ? AUTH_NONE : AUTH_USERNAME;
+}
+
+static void submit_auth_username(void) {
+    if (!auth_username_length) {
+        strcpy(auth_message, "Type a username first.");
+        return;
+    }
+    if (!mosdesk_username_valid(auth_username)) {
+        strcpy(auth_message, "Use only letters, numbers, - and _.");
+        return;
+    }
+    if (!mosdesk_user_prepare(auth_username)) {
+        strcpy(auth_message, "Could not create the user folders.");
+        return;
+    }
+    auth_message[0] = '\0';
+    if (!desktop_settings.onboarding_complete) {
+        /* First run: the password question comes next, and saves both. */
+        auth_state = AUTH_FIRST_CHOICE;
+        return;
+    }
+    mosdesk_settings_t updated = desktop_settings;
+    strcpy(updated.username, auth_username);
+    if (!mosdesk_settings_save(&updated)) {
+        strcpy(auth_message, "Could not save the username.");
+        return;
+    }
+    desktop_settings = updated;
+    auth_state = AUTH_NONE;
+    update_user_paths();
 }
 
 static void submit_auth_password(void) {
@@ -3789,10 +4053,7 @@ static void submit_auth_password(void) {
                 difference |= actual[i] ^ desktop_settings.password_hash[i];
             memset(actual, 0, sizeof(actual));
             if (difference == 0) {
-                auth_state = AUTH_NONE;
-                auth_message[0] = '\0';
-                auth_password_length = 0;
-                memset(auth_password, 0, sizeof(auth_password));
+                finish_sign_in();
                 return;
             }
         }
@@ -3802,14 +4063,51 @@ static void submit_auth_password(void) {
     }
 }
 
+static void handle_auth_username_key(const syscall_input_event_t* input) {
+    if (input->key == 40u) {
+        submit_auth_username();
+        return;
+    }
+    if (input->key == 42u) {
+        if (auth_username_length) {
+            auth_username[--auth_username_length] = '\0';
+            auth_message[0] = '\0';
+        }
+        return;
+    }
+    char character = (char)mos_syscall3(SYS_USB,
+        SYS_USB_KEY_TO_ASCII, input->key,
+        mosdesk_usb_modifiers(input->mods));
+    bool allowed = (character >= 'a' && character <= 'z') ||
+                   (character >= 'A' && character <= 'Z') ||
+                   (character >= '0' && character <= '9') ||
+                   character == '-' || character == '_';
+    if (!allowed) {
+        if (character >= 32 && character <= 126)
+            strcpy(auth_message, "Use only letters, numbers, - and _.");
+        return;
+    }
+    if (auth_username_length >= MOSDESK_USERNAME_SIZE - 1u) return;
+    auth_username[auth_username_length++] = character;
+    auth_username[auth_username_length] = '\0';
+    auth_message[0] = '\0';
+}
+
 static void handle_auth_key(const syscall_input_event_t* input) {
     if (input->type != SYSCALL_INPUT_KEY_DOWN) return;
+    if (auth_state == AUTH_USERNAME) {
+        handle_auth_username_key(input);
+        return;
+    }
     if (input->key == 40u) {
         if (auth_state != AUTH_FIRST_CHOICE) submit_auth_password();
         return;
     }
     if (input->key == 41u) {
-        if (auth_state == AUTH_FIRST_PASSWORD) {
+        if (auth_state == AUTH_FIRST_CHOICE) {
+            auth_state = AUTH_USERNAME;     /* back to the username */
+            auth_message[0] = '\0';
+        } else if (auth_state == AUTH_FIRST_PASSWORD) {
             auth_state = AUTH_FIRST_CHOICE;
             auth_message[0] = '\0';
             auth_password_length = 0;
@@ -4090,6 +4388,7 @@ static uint64_t compute_scene_signature(const syscall_window_info_t* windows,
     if (auth_state != AUTH_NONE) {
         hash = hash_u64(hash, wallpaper_generation);
         hash = hash_u64(hash, auth_password_length);
+        hash = hash_text(hash, auth_username);
         return hash_text(hash, auth_message);
     }
     hash = hash_u64(hash, desktop_signature());
@@ -4529,7 +4828,7 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         uint32_t apps[START_MENU_MAX_ROWS];
         uint32_t app_count = start_menu_rows(apps);
         if (row == 0u) {
-            browser_open(MOSDESK_USERS_PATH);
+            browser_open(user_home);
         } else if (row == 1u) {
             open_settings(NULL);
         } else if (row == 2u) {
@@ -4571,18 +4870,17 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         uint32_t app_index = UINT32_MAX;
         click_action_t action =
             desktop_shortcut_at(cursor_x, cursor_y, &app_index);
-        if (action == CLICK_ACTION_HOME) {
-            queue_open_click(action, MOSDESK_USERS_PATH);
-        } else if (action == CLICK_ACTION_SYSTEM) {
-            queue_open_click(action, "0:/");
-        } else if (action == CLICK_ACTION_APPLICATION) {
-            queue_open_click(action, desktop_apps[app_index].path);
-        } else {
+        const char* shortcut = desktop_shortcut_path(action, app_index);
+        if (!shortcut) {
             last_click_valid = false;
             return;
         }
-        desktop_icon_drag_index = action == CLICK_ACTION_HOME ? 0u
-            : action == CLICK_ACTION_SYSTEM ? 1u : app_index + 2u;
+        queue_open_click(action, shortcut);
+        desktop_icon_drag_index = desktop_icon_at(cursor_x, cursor_y);
+        if (desktop_icon_drag_index >= MOSDESK_DESKTOP_ICON_COUNT) {
+            desktop_icon_drag_index = UINT32_MAX;
+            return;
+        }
         desktop_icon_drag_start_x = cursor_x;
         desktop_icon_drag_start_y = cursor_y;
         desktop_icon_position(desktop_icon_drag_index,
@@ -4658,12 +4956,9 @@ static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
     uint32_t app_index = UINT32_MAX;
     click_action_t action =
         desktop_shortcut_at(cursor_x, cursor_y, &app_index);
-    if (action == CLICK_ACTION_HOME)
-        menu_show_for_item(action, MOSDESK_USERS_PATH);
-    else if (action == CLICK_ACTION_SYSTEM)
-        menu_show_for_item(action, "0:/");
-    else if (action == CLICK_ACTION_APPLICATION)
-        menu_show_for_item(action, desktop_apps[app_index].path);
+    const char* shortcut = desktop_shortcut_path(action, app_index);
+    if (shortcut)
+        menu_show_for_item(action, shortcut);
     else
         menu_show_for_desktop();
 }
@@ -5032,9 +5327,11 @@ int main(void) {
     }
     load_desktop_apps();
     if (!desktop_settings.onboarding_complete)
-        auth_state = AUTH_FIRST_CHOICE;
+        auth_state = AUTH_USERNAME;
     else if (desktop_settings.login_enabled)
         auth_state = AUTH_LOGIN;
+    else if (!desktop_settings.username[0])
+        auth_state = AUTH_USERNAME;
     painted_wallpaper_style = UINT32_MAX;
     load_fonts();
     syscall_window_info_t windows[MAX_WINDOWS];
@@ -5043,7 +5340,11 @@ int main(void) {
 
     for (;;) {
         bool refresh_icons = ++icon_poll_frames >= 30u;
-        if (refresh_icons) icon_poll_frames = 0;
+        if (refresh_icons) {
+            icon_poll_frames = 0;
+            /* Pick up files other programs put on the Desktop. */
+            if (desktop_icon_drag_index == UINT32_MAX) reload_desktop_files();
+        }
         if (++settings_poll_frames >= 30u &&
             desktop_icon_drag_index == UINT32_MAX) {
             settings_poll_frames = 0;

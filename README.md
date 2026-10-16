@@ -20,6 +20,7 @@ https://github.com/user-attachments/assets/bddd45a1-8dfb-4670-86b6-80896696b8b8
 ## Repository layout
 
 - `mosdesk/` — MOSdesk Settings client, reusable file-type icon library, preview, and packaging metadata
+- `mosdesk/apps/` — built-in apps shipped with MOSdesk (see [Built-in apps](#built-in-apps))
 - `mosWM/` — the MOSdesk desktop, compositor, cursor, and protected application window API
 - `Minimal-OS-SDK/` — toolchain and build utilities for freestanding C/C++ programs and `.slib` bundles
 - `Minimal-OS/` — Minimal-OS source tree used by the SDK and runtime
@@ -49,8 +50,53 @@ From the repository root:
 ```
 
 The build creates the MOSdesk Settings window client, exported text-rendering
-libraries, and the required mosWM desktop shell. It produces
-`mosdesk/dist/mosdesk.mpkg` and `mosWM/dist/mosWM.mpkg`.
+libraries, the built-in apps, and the required mosWM desktop shell. It
+produces `mosdesk/dist/mosdesk.mpkg` and `mosWM/dist/mosWM.mpkg`.
+
+## Built-in apps
+
+Apps in `mosdesk/apps/` are built and delivered with MOSdesk. Each one is
+installed into `0:/programs` with a `mos_` prefix:
+
+| Source | Built as | Installed at |
+| --- | --- | --- |
+| `mosdesk/apps/edit.c` | `mos_edit.run` | `0:/programs/mos_edit.run` |
+
+To add an app, drop `<name>.c` (or a `<name>/` folder with a `main.c`) into
+`mosdesk/apps/` and run `./mosdesk/build.sh`. For each app the build runs the
+same thing you would by hand:
+
+```sh
+./Minimal-OS-SDK/build.sh --output mos_edit.run mosdesk/apps/edit.c
+# or, with the SDK on PATH:
+msdk --output mos_edit.run mosdesk/apps/edit.c
+```
+
+The desktop and Start menu list them without the prefix (`mos_edit.run` shows
+as "Edit"). Apps can include `../settings.h` to find the user's folders.
+
+`mos_edit` (MOS Edit) is a text editor built on the SDK's `easyui`. Double
+clicking a text file (`.txt`, `.md`, `.c`, `.h`, `.log`, `.cfg`, ...) on the
+desktop or in Files opens it there, and new documents are saved to the
+user's `Documents` folder by default.
+
+## Users and folders
+
+On first launch MOSdesk asks for a username (letters, digits, `-` and `_`,
+up to 31 characters). Everything that belongs to the user goes in their home
+folder, which is created together with its standard folders:
+
+```text
+0:/users/<username>/
+    Documents/
+    Pictures/
+    Desktop/      anything in here is shown on the desktop
+```
+
+Home on the desktop, in Files and in the Start menu opens
+`0:/users/<username>`. The home and its three folders cannot be renamed or
+deleted from the shell, and missing folders are recreated at startup.
+Desktops set up before usernames existed ask for one once, after sign-in.
 
 ## Icons
 
@@ -135,7 +181,9 @@ pointer is the Posy cursor pack; the previous single-pointer cursor is
 available as Classic. Attribution is included in the package.
 
 On the first MOSdesk launch, mosWM creates `0:/users/` and shows a one-time
-setup asking whether to enable password sign-in. Choosing no enables automatic
+setup: it asks for a username (creating `0:/users/<username>` with
+`Documents`, `Pictures` and `Desktop`), then whether to enable password
+sign-in. Choosing no enables automatic
 sign-in; choosing yes sets the desktop password. Password sign-in is a
 MOSdesk desktop gate, not an OS-level account or filesystem security boundary.
 Settings includes Appearance (accent and wallpaper), Mouse, Cursor, Login,
@@ -164,7 +212,9 @@ After a successful build, the following files are produced in `mosdesk/dist/`:
 - `mosdesk.run` — the desktop executable
 - `ttrend_raster.slib` — raster text renderer library bundle
 - `ttrend_outline.slib` — OpenType/TrueType (CFF and glyf) anti-aliased text renderer bundle
-- `mosdesk.mpkg` — deliver package for Minimal-OS installation
+- `mosdesk.mpkg` — deliver package for Minimal-OS installation; it installs
+  at `0:/`, with MOSdesk in `programs/mosdesk/` and the built-in apps in
+  `programs/`
 - `mosdesk/` — unpacked package directory used to assemble the final package
 
 The `.slib` bundles are distribution artifacts for Minimal-OS. The runtime does not currently load shared libraries dynamically at runtime; instead, they are used as packaged SDK deliverables and metadata for other programs.

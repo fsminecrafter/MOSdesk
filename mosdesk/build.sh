@@ -7,6 +7,10 @@ SDK_BUILD="$PROJECT_ROOT/Minimal-OS-SDK/build.sh"
 PACKAGE_TOOL="$PROJECT_ROOT/Minimal-OS/tools/mkpkg/mkpkg.py"
 DIST="$SCRIPT_DIR/dist"
 PACKAGE="$DIST/mosdesk"
+# The package installs at 0:/: MOSdesk itself under programs/mosdesk, the
+# built-in apps (mosdesk/apps) straight into programs as mos_<name>.run.
+INSTALL="$PACKAGE/programs/mosdesk"
+APPS="$SCRIPT_DIR/apps"
 
 if [ ! -x "$SDK_BUILD" ]; then
     echo "MOSdesk: SDK build script missing at $SDK_BUILD" >&2
@@ -18,7 +22,9 @@ if [ ! -f "$PACKAGE_TOOL" ]; then
     exit 1
 fi
 
-mkdir -p "$DIST" "$PACKAGE"
+# Start from an empty package directory: everything in it gets installed.
+rm -rf "$PACKAGE"
+mkdir -p "$DIST" "$INSTALL"
 BUILD_SOURCE=$(mktemp -d "$DIST/.mosdesk-build-source.XXXXXX")
 trap 'rm -rf "$BUILD_SOURCE"' EXIT HUP INT TERM
 mkdir -p "$BUILD_SOURCE/mosdesk" "$BUILD_SOURCE/mosWM" \
@@ -37,7 +43,21 @@ ln -s "$PROJECT_ROOT/Minimal-OS-SDK/libraries" \
 "$SDK_BUILD" --slib --output "$DIST/ttrend_outline.slib" \
     "$SCRIPT_DIR/libraries/ttrend_outline"
 
-mkdir -p "$SCRIPT_DIR/fonts" "$PACKAGE/fonts"
+# Built-in apps: apps/<name>.c, or apps/<name>/ with a main.c, becomes
+# 0:/programs/mos_<name>.run (the same as `./build.sh mos_<name>.c`).
+if [ -d "$APPS" ]; then
+    for app in "$APPS"/*; do
+        [ -e "$app" ] || continue
+        name=$(basename -- "$app")
+        case "$name" in
+            *.c|*.cpp) name=${name%.*} ;;
+            *) [ -d "$app" ] || continue ;;
+        esac
+        "$SDK_BUILD" --output "$PACKAGE/programs/mos_$name.run" "$app"
+    done
+fi
+
+mkdir -p "$SCRIPT_DIR/fonts" "$INSTALL/fonts"
 if [ -f "$PROJECT_ROOT/Open_Sans.zip" ]; then
     python3 "$SCRIPT_DIR/tools/generate_font.py" "$SCRIPT_DIR/fonts/arial.font" "$PROJECT_ROOT/Open_Sans.zip"
     python3 "$SCRIPT_DIR/tools/generate_font.py" "$SCRIPT_DIR/fonts/roboto.font" "$PROJECT_ROOT/Open_Sans.zip"
@@ -51,19 +71,25 @@ else
     done
     printf 'Using bundled TTREND fonts (Open_Sans.zip not present).\n'
 fi
-cp "$SCRIPT_DIR/fonts/arial.font" "$PACKAGE/fonts/arial.font"
-cp "$SCRIPT_DIR/fonts/roboto.font" "$PACKAGE/fonts/roboto.font"
-cp "$SCRIPT_DIR/fonts/default.font" "$PACKAGE/fonts/default.font"
+cp "$SCRIPT_DIR/fonts/arial.font" "$INSTALL/fonts/arial.font"
+cp "$SCRIPT_DIR/fonts/roboto.font" "$INSTALL/fonts/roboto.font"
+cp "$SCRIPT_DIR/fonts/default.font" "$INSTALL/fonts/default.font"
 for font in Inter-Regular.otf Inter-Medium.otf Inter-LICENSE.txt; do
-    cp "$SCRIPT_DIR/fonts/$font" "$PACKAGE/fonts/$font"
+    cp "$SCRIPT_DIR/fonts/$font" "$INSTALL/fonts/$font"
 done
-cp "$DIST/mosdesk.run" "$PACKAGE/mosdesk.run"
-cp "$DIST/ttrend_raster.slib" "$PACKAGE/ttrend_raster.slib"
-cp "$DIST/ttrend_outline.slib" "$PACKAGE/ttrend_outline.slib"
+cp "$DIST/mosdesk.run" "$INSTALL/mosdesk.run"
+cp "$DIST/ttrend_raster.slib" "$INSTALL/ttrend_raster.slib"
+cp "$DIST/ttrend_outline.slib" "$INSTALL/ttrend_outline.slib"
 cp "$SCRIPT_DIR/mosdesk.pkg" "$PACKAGE/mosdesk.pkg"
 python3 "$PACKAGE_TOOL" "$PACKAGE" "$DIST/mosdesk.mpkg"
 "$PROJECT_ROOT/mosWM/build.sh"
 
 printf 'MOSdesk deliver package: %s\n' "$DIST/mosdesk.mpkg"
 printf 'Package directory:       %s\n' "$PACKAGE"
+for app in "$PACKAGE"/programs/mos_*.run; do
+    if [ -e "$app" ]; then
+        printf 'Built-in app:            0:/programs/%s\n' \
+            "$(basename -- "$app")"
+    fi
+done
 printf 'Desktop package:         %s\n' "$PROJECT_ROOT/mosWM/dist/mosWM.mpkg"

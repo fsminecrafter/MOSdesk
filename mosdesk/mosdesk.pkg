@@ -1,10 +1,12 @@
 [Info]
 name=mosdesk
-version=0.1.0
+version=0.2.0
 description=Layered Minimal-OS desktop environment
 arch=x86_64
 operatingsystem=MINIMALOS
 
+# No copy= list: everything in the package installs below 0:/ -
+#   programs/mosdesk/...      the Settings app, libraries and fonts
+#   programs/mos_<app>.run    the built-in apps from mosdesk/apps
 [Install.minimalos]
-copy=mosdesk.run,ttrend_raster.slib,ttrend_outline.slib,fonts/arial.font,fonts/roboto.font,fonts/default.font,fonts/Inter-Regular.otf,fonts/Inter-Medium.otf,fonts/Inter-LICENSE.txt
-target=0:/programs/mosdesk
+target=0:/

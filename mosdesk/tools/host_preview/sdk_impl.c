@@ -54,6 +54,8 @@ uint64_t mos_syscall3(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
         if (!strcmp(p, "0:/programs/mosWM"))   { strcpy(e[0].name, "mosWM.run");   e[0].type = SYSCALL_DIRENT_TYPE_EXECUTABLE; return 1; }
         return (uint64_t)-1;
     }
+    case SYS_IS_DIR: { struct stat st; return stat((const char*)(uintptr_t)a, &st) == 0 && S_ISDIR(st.st_mode); }
+    case SYS_MKDIR: return mkdir((const char*)(uintptr_t)a, 0755) == 0 ? 0 : (uint64_t)-1;
     case SYS_EXEC: if (hook_exec) hook_exec((const char*)(uintptr_t)a); return 1;
     default: return (uint64_t)-1;
     }

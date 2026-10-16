@@ -2,6 +2,7 @@
 #define MOSDESK_SETTINGS_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "syscall.h"
@@ -33,7 +34,11 @@
 #define MOSDESK_PASSWORD_SALT_SIZE 16u
 #define MOSDESK_PASSWORD_HASH_SIZE 32u
 #define MOSDESK_WALLPAPER_PATH_SIZE 192u
-#define MOSDESK_DESKTOP_ICON_COUNT 34u
+/* Home, System, up to 32 applications and up to 32 items of the user's
+ * Desktop folder. Settings files from before the Desktop folder held 34. */
+#define MOSDESK_DESKTOP_ICON_COUNT 66u
+#define MOSDESK_DESKTOP_ICON_COUNT_V5 34u
+#define MOSDESK_USERNAME_SIZE 32u
 #define MOSDESK_WALLPAPER_FILL 0u
 #define MOSDESK_WALLPAPER_CROP 1u
 #define MOSDESK_WALLPAPER_STRETCH 2u
@@ -59,10 +64,10 @@ typedef struct {
     uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT];
     uint32_t debug_fps;
     uint32_t debug_profiler;
+    char username[MOSDESK_USERNAME_SIZE];
 } mosdesk_settings_t;
 
-/* The layout before the debug switches were appended: a file of this size
- * is the leading part of mosdesk_settings_t. */
+/* The layout before the username and the Desktop folder icons. */
 typedef struct {
     uint32_t magic;
     uint32_t mouse_speed;
@@ -80,8 +85,33 @@ typedef struct {
     uint32_t wallpaper_mode;
     uint32_t wallpaper_rotation;
     char wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE];
-    uint32_t desktop_icon_x[MOSDESK_DESKTOP_ICON_COUNT];
-    uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t desktop_icon_x[MOSDESK_DESKTOP_ICON_COUNT_V5];
+    uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT_V5];
+    uint32_t debug_fps;
+    uint32_t debug_profiler;
+} mosdesk_settings_v5_t;
+
+/* The layout before the debug switches were appended: a file of this size
+ * is the leading part of mosdesk_settings_v5_t. */
+typedef struct {
+    uint32_t magic;
+    uint32_t mouse_speed;
+    uint32_t accent_color;
+    uint32_t cursor_fill;
+    uint32_t cursor_scale;
+    uint32_t cursor_pack;
+    uint32_t wallpaper;
+    uint32_t onboarding_complete;
+    uint32_t login_enabled;
+    uint8_t password_salt[MOSDESK_PASSWORD_SALT_SIZE];
+    uint8_t password_hash[MOSDESK_PASSWORD_HASH_SIZE];
+    uint32_t click_once_open;
+    uint32_t grid_enabled;
+    uint32_t wallpaper_mode;
+    uint32_t wallpaper_rotation;
+    char wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE];
+    uint32_t desktop_icon_x[MOSDESK_DESKTOP_ICON_COUNT_V5];
+    uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT_V5];
 } mosdesk_settings_v4_t;
 
 typedef struct {
@@ -130,6 +160,77 @@ typedef struct {
     uint32_t cursor_scale;
 } mosdesk_settings_v0_t;
 
+/* ------------------------------------------------------------ user folders
+ *
+ * Everything that belongs to the user lives in 0:/users/<username>:
+ *
+ *     0:/users/<username>/Documents
+ *     0:/users/<username>/Pictures
+ *     0:/users/<username>/Desktop      (shown on the desktop)
+ */
+#define MOSDESK_USER_DOCUMENTS "Documents"
+#define MOSDESK_USER_PICTURES "Pictures"
+#define MOSDESK_USER_DESKTOP "Desktop"
+
+/* 1 to 31 letters, digits, '-' or '_': safe as a folder name. */
+static inline bool mosdesk_username_valid(const char* name) {
+    if (!name || !name[0]) return false;
+    uint32_t length = 0;
+    for (; name[length]; length++) {
+        char c = name[length];
+        if (length >= MOSDESK_USERNAME_SIZE - 1u) return false;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_'))
+            return false;
+    }
+    return true;
+}
+
+/* "0:/users/<username>" or, with a folder, "0:/users/<username>/<folder>".
+ * Returns false when the name is not valid or the path does not fit. */
+static inline bool mosdesk_user_path(char* output, size_t capacity,
+                                     const char* username,
+                                     const char* folder) {
+    if (!output || !capacity || !mosdesk_username_valid(username))
+        return false;
+    const char* parts[4] = {MOSDESK_USERS_PATH, "/", username, NULL};
+    size_t at = 0;
+    for (uint32_t part = 0; part < 5u; part++) {
+        const char* text = part < 3u ? parts[part]
+            : part == 3u ? (folder ? "/" : NULL) : folder;
+        if (!text) continue;
+        for (; *text; text++) {
+            if (at + 1u >= capacity) return false;
+            output[at++] = *text;
+        }
+    }
+    output[at] = '\0';
+    return true;
+}
+
+static inline bool mosdesk_make_directory(const char* path) {
+    if (MOSDESK_SYSCALL(SYS_IS_DIR, (uintptr_t)path, 0, 0) == 1u) return true;
+    MOSDESK_SYSCALL(SYS_MKDIR, (uintptr_t)path, 0, 0);
+    return MOSDESK_SYSCALL(SYS_IS_DIR, (uintptr_t)path, 0, 0) == 1u;
+}
+
+/* Creates 0:/users/<username> and its Documents, Pictures and Desktop
+ * folders where they are missing. */
+static inline bool mosdesk_user_prepare(const char* username) {
+    static const char* const folders[] = {
+        NULL, MOSDESK_USER_DOCUMENTS, MOSDESK_USER_PICTURES,
+        MOSDESK_USER_DESKTOP
+    };
+    char path[MOSDESK_WALLPAPER_PATH_SIZE];
+    if (!mosdesk_make_directory(MOSDESK_USERS_PATH)) return false;
+    for (uint32_t i = 0; i < sizeof(folders) / sizeof(folders[0]); i++) {
+        if (!mosdesk_user_path(path, sizeof(path), username, folders[i]) ||
+            !mosdesk_make_directory(path))
+            return false;
+    }
+    return true;
+}
+
 static inline mosdesk_settings_t mosdesk_settings_default(void) {
     mosdesk_settings_t settings = {0};
     settings.magic = MOSDESK_SETTINGS_MAGIC;
@@ -158,11 +259,27 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
                 (uintptr_t)&settings, sizeof(settings)) !=
             (long)sizeof(settings))
             settings = mosdesk_settings_default();
-    } else if (size == (long)sizeof(mosdesk_settings_v4_t)) {
+    } else if (size == (long)sizeof(mosdesk_settings_v5_t) ||
+               size == (long)sizeof(mosdesk_settings_v4_t)) {
+        /* v4 is the leading part of v5; the debug switches stay off. */
+        mosdesk_settings_v5_t legacy = {0};
         if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
-                (uintptr_t)&settings, sizeof(mosdesk_settings_v4_t)) !=
-            (long)sizeof(mosdesk_settings_v4_t))
+                (uintptr_t)&legacy, (uint64_t)size) == size) {
+            /* Everything up to the icon positions has the same layout. */
+            const uint8_t* from = (const uint8_t*)&legacy;
+            uint8_t* to = (uint8_t*)&settings;
+            for (size_t i = 0;
+                 i < offsetof(mosdesk_settings_v5_t, desktop_icon_x); i++)
+                to[i] = from[i];
+            for (uint32_t i = 0; i < MOSDESK_DESKTOP_ICON_COUNT_V5; i++) {
+                settings.desktop_icon_x[i] = legacy.desktop_icon_x[i];
+                settings.desktop_icon_y[i] = legacy.desktop_icon_y[i];
+            }
+            settings.debug_fps = legacy.debug_fps;
+            settings.debug_profiler = legacy.debug_profiler;
+        } else {
             settings = mosdesk_settings_default();
+        }
     } else if (size == (long)sizeof(mosdesk_settings_v3_t)) {
         mosdesk_settings_v3_t legacy;
         if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
@@ -248,8 +365,12 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         settings.wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE - 1u] != '\0' ||
         settings.onboarding_complete > 1u ||
         settings.login_enabled > 1u ||
-        settings.click_once_open > 1u)
+        settings.click_once_open > 1u ||
+        settings.username[MOSDESK_USERNAME_SIZE - 1u] != '\0')
         return mosdesk_settings_default();
+    /* An unusable name is asked for again rather than used as a path. */
+    if (!mosdesk_username_valid(settings.username))
+        settings.username[0] = '\0';
     settings.accent_color |= 0xFF000000u;
     settings.cursor_fill |= 0xFF000000u;
     return settings;
