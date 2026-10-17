@@ -4,11 +4,24 @@
 #include "easyui.h"
 #include <stdio.h>
 
-#include "util.h"
-
 int button0, button1, button2, button3, button4,
 button5, button6, button7, button8, button9, number, buttonplus,
 buttonminus, buttondiv, buttonmult, buttonequal, buttonclr, buttonback;
+
+// util.h now i put them in here because embedded / bundled app compiling sucks
+
+/* Writes v as decimal text into out (needs room for 12 chars) and returns out. */
+static inline char* int_to_str(int v, char* out) {
+    char tmp[12];
+    int n = 0;
+    unsigned int u = v < 0 ? 0u - (unsigned int)v : (unsigned int)v;  /* safe for INT_MIN too */
+    do { tmp[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+    char* p = out;
+    if (v < 0) *p++ = '-';
+    while (n) *p++ = tmp[--n];
+    *p = '\0';
+    return out;
+}
 
 // Action functions
 
