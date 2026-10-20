@@ -117,9 +117,8 @@ python3 mosdesk/tools/icons/generate_icons.py   # regenerates the header, the
 
 ## Wallpapers
 
-The eight supplied JPEG sources live in `use/`; the packaged QOI versions are
-bounded to 1600 pixels on their longest edge for desktop rendering. To
-regenerate them after changing the source photos, install Pillow and run:
+The packaged QOI versions arebounded to 1600 pixels on their longest edge
+for desktop rendering. To generate more, install Pillow and run:
 
 ```sh
 python3 -m pip install Pillow
