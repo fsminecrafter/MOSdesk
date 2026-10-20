@@ -3,8 +3,11 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-SDK_BUILD="$PROJECT_ROOT/Minimal-OS-SDK/build.sh"
-PACKAGE_TOOL="$PROJECT_ROOT/Minimal-OS/tools/mkpkg/mkpkg.py"
+# The Minimal-OS build passes its own SDK and package tool, so MOSdesk is
+# built against the same headers as the kernel it runs on.
+SDK_ROOT="${MOSDESK_SDK_DIR:-$PROJECT_ROOT/Minimal-OS-SDK}"
+SDK_BUILD="$SDK_ROOT/build.sh"
+PACKAGE_TOOL="${MKPKG_TOOL:-$PROJECT_ROOT/Minimal-OS/tools/mkpkg/mkpkg.py}"
 DIST="$SCRIPT_DIR/dist"
 PACKAGE="$DIST/mosWM"
 

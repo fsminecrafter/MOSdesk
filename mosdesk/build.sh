@@ -3,8 +3,11 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-SDK_BUILD="$PROJECT_ROOT/Minimal-OS-SDK/build.sh"
-PACKAGE_TOOL="$PROJECT_ROOT/Minimal-OS/tools/mkpkg/mkpkg.py"
+# The Minimal-OS build passes its own SDK and package tool, so MOSdesk is
+# built against the same headers as the kernel it runs on.
+SDK_ROOT="${MOSDESK_SDK_DIR:-$PROJECT_ROOT/Minimal-OS-SDK}"
+SDK_BUILD="$SDK_ROOT/build.sh"
+PACKAGE_TOOL="${MKPKG_TOOL:-$PROJECT_ROOT/Minimal-OS/tools/mkpkg/mkpkg.py}"
 DIST="$SCRIPT_DIR/dist"
 PACKAGE="$DIST/mosdesk"
 # The package installs at 0:/: MOSdesk itself under programs/mosdesk, the
@@ -35,7 +38,7 @@ cp "$SCRIPT_DIR/main.c" "$SCRIPT_DIR/settings.h" "$SCRIPT_DIR/input.h" \
 cp -R "$SCRIPT_DIR/libraries" "$BUILD_SOURCE/mosdesk/libraries"
 cp "$PROJECT_ROOT/mosWM/file_icons.h" \
     "$PROJECT_ROOT/mosWM/file_icon_data.h" "$BUILD_SOURCE/mosWM/"
-ln -s "$PROJECT_ROOT/Minimal-OS-SDK/libraries" \
+ln -s "$SDK_ROOT/libraries" \
     "$BUILD_SOURCE/Minimal-OS-SDK/libraries"
 "$SDK_BUILD" --output "$DIST/mosdesk.run" "$BUILD_SOURCE/mosdesk"
 "$SDK_BUILD" --slib --output "$DIST/ttrend_raster.slib" \
@@ -53,7 +56,11 @@ if [ -d "$APPS" ]; then
             *.c|*.cpp) name=${name%.*} ;;
             *) [ -d "$app" ] || continue ;;
         esac
-        "$SDK_BUILD" --output "$PACKAGE/programs/mos_$name.run" "$app"
+        # One broken app should not stop the desktop from building.
+        if ! "$SDK_BUILD" --output "$PACKAGE/programs/mos_$name.run" "$app"; then
+            echo "MOSdesk: WARNING: app '$name' failed to build and is left out" >&2
+            SKIPPED_APPS="${SKIPPED_APPS:-}${SKIPPED_APPS:+ }$name"
+        fi
     done
 fi
 
@@ -93,3 +100,6 @@ for app in "$PACKAGE"/programs/mos_*.run; do
     fi
 done
 printf 'Desktop package:         %s\n' "$PROJECT_ROOT/mosWM/dist/mosWM.mpkg"
+if [ -n "${SKIPPED_APPS:-}" ]; then
+    printf 'Apps that failed to build: %s\n' "$SKIPPED_APPS" >&2
+fi
