@@ -79,7 +79,12 @@ static void describe(void) {
     const syscall_storage_device_t* d = selected_disk();
     char text[256] = "";
     if (!d) {
-        easyui.settext(info, g_disk_rows ? "Pick a disk." : "No disks found.");
+        int usable = 0;
+        for (int r = 0; r < g_disk_rows; r++)
+            if (!(g_devices[g_disk_index[r]].flags & SYSCALL_STORAGE_FLAG_IN_USE)) usable++;
+        easyui.settext(info, !g_disk_rows ? "No disks found." :
+                       usable ? "Pick a disk." :
+                       "Every disk is in use by the running system. Attach another disk and press Rescan.");
         update_buttons();
         return;
     }
