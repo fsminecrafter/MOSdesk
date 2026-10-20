@@ -10,10 +10,28 @@
  *  Controls (like Kolf):
  *    - Move the mouse: the putter swings around the ball and aims at
  *      the cursor.  (LEFT / RIGHT arrows also rotate the aim.)
- *    - Click (or SPACE): start the power meter.  It swings up and down.
- *    - Click (or SPACE) again: hit the ball with the current power.
+ *    - HOLD the mouse button: the power meter charges (it swings up and
+ *      down).  You can keep moving the mouse to adjust the aim.
+ *    - RELEASE the mouse button: the putter hits the ball.
+ *    - (SPACE also works: press to start the meter, press again to hit.)
  *    - ESC: cancel the power meter.   R: replay hole.  T: scorecard.
  *
+ *  Level building:
+ *    Zones   {type, x, y, w, h, slope_x, slope_y}
+ *      ZONE_SAND / ZONE_ROUGH / ZONE_WATER : plain rectangles
+ *      ZONE_SLOPE : rectangle; (slope_x, slope_y) is the direction the ball
+ *                   is pushed AND how hard.  {24,0} = medium push right,
+ *                   {0,-8} = gentle push up, {0,40} = steep push down.
+ *      ZONE_HILL  : circle hill, w == h (diameter).  slope_x is the amount:
+ *                   positive = hill (ball rolls away from the middle),
+ *                   negative = dip (ball rolls toward the middle).
+ *                   The bigger the number, the steeper it is.
+ *    Obstacles  {type, x, y, w, h, radius, travel, phase}
+ *      OBSTACLE_BLOCK  : rectangular wall
+ *      OBSTACLE_BUMPER : round bumper (x, y, radius)
+ *      OBSTACLE_GATE   : sliding wall
+ *      WALL(x1,y1,x2,y2) : free-angle Kolf-style wall between two points
+  *
  *  Performance: the whole course is rendered ONCE per hole into a
  *  background buffer.  Each frame only small dirty rectangles (ball,
  *  putter, moving gate, power bar) are restored + redrawn + presented.
@@ -32,6 +50,11 @@
 #define FONT_LIMIT (4u * 1024u * 1024u)
 #define SUBSTEPS 2
 #define SLOPE_ACCEL 4.0f
+#define WALL_THICK 9.0f
+#define SLOPE_REST 12.0f   /* below this push the ball may come to rest */
+#define COURSE_BTN_X 290
+#define COURSE_BTN_STEP 46
+#define COURSE_BTN_W 38
 
 /* If your mos_window_present() does not accept a sub-rectangle, set
  * this to 0 and the whole window will be presented (still only when
@@ -52,8 +75,8 @@
 #define BTN_NEXT_W 136
 #define BTN_NEXT_H 28
 
-enum { ZONE_SAND, ZONE_ROUGH, ZONE_WATER, ZONE_SLOPE };
-enum { OBSTACLE_BLOCK, OBSTACLE_BUMPER, OBSTACLE_GATE };
+enum { ZONE_SAND, ZONE_ROUGH, ZONE_WATER, ZONE_SLOPE, ZONE_HILL };
+enum { OBSTACLE_BLOCK, OBSTACLE_BUMPER, OBSTACLE_GATE, OBSTACLE_WALL };
 enum { KEY_SPACE = 44, KEY_ENTER = 40, KEY_ESC = 41, KEY_T = 23, KEY_R = 21,
        KEY_N = 17, KEY_LEFT = 80, KEY_RIGHT = 79, KEY_UP = 82, KEY_DOWN = 81 };
 
@@ -65,9 +88,11 @@ typedef struct {
     int type, x, y, w, h, radius, travel, phase;
 } Obstacle;
 
+/* free-angle wall from (x1,y1) to (x2,y2); stored in x,y,w,h */
+#define WALL(x1, y1, x2, y2) {OBSTACLE_WALL, x1, y1, x2, y2, 0, 0, 0}
+
 typedef struct {
     const char* name;
-    const char* note;
     int tee_x, tee_y, hole_x, hole_y, par;
     const Zone* zones;
     int zone_count;
@@ -76,24 +101,31 @@ typedef struct {
     int portal_ax, portal_ay, portal_bx, portal_by, portal_radius;
 } Course;
 
+/* ---- 1: First Green -------------------------------------------------- */
 static const Zone zones_first[] = {
-    {ZONE_ROUGH, 280, 270, 150, 112, 0, 0}
+    {ZONE_ROUGH, 230, 300, 110, 100, 0, 0}
 };
 static const Obstacle obstacles_first[] = {
-    {OBSTACLE_BUMPER, 420, 220, 0, 0, 25, 0, 0},
-    {OBSTACLE_BUMPER, 590, 412, 0, 0, 25, 0, 0}
+    WALL(470, 238, 575, 349),
+    WALL(575, 349, 470, 460),
+    {OBSTACLE_BUMPER, 690, 240, 0, 0, 24, 0, 0},
+    {OBSTACLE_BUMPER, 690, 458, 0, 0, 24, 0, 0}
 };
 
+/* ---- 2: Sandbar ------------------------------------------------------- */
 static const Zone zones_sand[] = {
     {ZONE_SAND, 250, 274, 170, 120, 0, 0},
-    {ZONE_SAND, 540, 385, 138, 102, 0, 0}
+    {ZONE_SAND, 540, 385, 138, 102, 0, 0},
+    {ZONE_HILL, 735, 420, 110, 110, 14, 0}
 };
 static const Obstacle obstacles_sand[] = {
     {OBSTACLE_BLOCK, 465, 186, 22, 234, 0, 0, 0},
-    {OBSTACLE_BLOCK, 465, 468, 180, 22, 0, 0, 0},
-    {OBSTACLE_BUMPER, 690, 270, 0, 0, 29, 0, 0}
+    WALL(487, 480, 640, 480),
+    WALL(600, 150, 700, 215),
+    {OBSTACLE_BUMPER, 690, 290, 0, 0, 27, 0, 0}
 };
 
+/* ---- 3: Bank Shot ----------------------------------------------------- */
 static const Zone zones_bank[] = {
     {ZONE_ROUGH, 220, 145, 116, 390, 0, 0},
     {ZONE_SLOPE, 518, 145, 112, 390, 24, 0}
@@ -101,23 +133,26 @@ static const Zone zones_bank[] = {
 static const Obstacle obstacles_bank[] = {
     {OBSTACLE_BLOCK, 382, 154, 23, 252, 0, 0, 0},
     {OBSTACLE_BLOCK, 475, 360, 23, 219, 0, 0, 0},
+    WALL(150, 450, 250, 380),
     {OBSTACLE_BUMPER, 688, 236, 0, 0, 32, 0, 0},
     {OBSTACLE_BUMPER, 693, 446, 0, 0, 28, 0, 0}
 };
 
+/* ---- 4: Waterline ----------------------------------------------------- */
 static const Zone zones_water[] = {
-    {ZONE_WATER, 344, 256, 210, 194, 0, 0},
-    {ZONE_SAND, 602, 160, 98, 128, 0, 0},
-    {ZONE_SAND, 602, 417, 98, 128, 0, 0}
+    {ZONE_WATER, 330, 110, 250, 220, 0, 0},
+    {ZONE_WATER, 330, 372, 250, 216, 0, 0},
+    {ZONE_SAND, 640, 300, 110, 100, 0, 0},
+    {ZONE_SLOPE, 620, 125, 150, 120, 0, -12}
 };
 static const Obstacle obstacles_water[] = {
-    {OBSTACLE_BLOCK, 305, 148, 20, 153, 0, 0, 0},
-    {OBSTACLE_BLOCK, 305, 402, 20, 167, 0, 0, 0},
-    {OBSTACLE_BLOCK, 562, 148, 19, 146, 0, 0, 0},
-    {OBSTACLE_BLOCK, 562, 408, 19, 161, 0, 0, 0},
-    {OBSTACLE_BUMPER, 715, 350, 0, 0, 30, 0, 0}
+    WALL(235, 235, 330, 327),
+    WALL(235, 463, 330, 375),
+    {OBSTACLE_BUMPER, 700, 349, 0, 0, 26, 0, 0},
+    WALL(760, 270, 760, 330)
 };
 
+/* ---- 5: Clockwork ----------------------------------------------------- */
 static const Zone zones_clockwork[] = {
     {ZONE_SLOPE, 184, 168, 176, 334, 14, -9},
     {ZONE_ROUGH, 420, 140, 122, 388, 0, 0},
@@ -130,22 +165,55 @@ static const Obstacle obstacles_clockwork[] = {
     {OBSTACLE_BUMPER, 720, 226, 0, 0, 30, 0, 0}
 };
 
+/* ---- 6: Hilltop ------------------------------------------------------- */
+static const Zone zones_hilltop[] = {
+    {ZONE_SLOPE, 470, 118, 150, 100, 0, 36},
+    {ZONE_SLOPE, 470, 470, 150, 105, 10, 0},
+    {ZONE_HILL, 360, 259, 180, 180, 28, 0},
+    {ZONE_HILL, 741, 283, 132, 132, -14, 0}
+};
+static const Obstacle obstacles_hilltop[] = {
+    WALL(235, 150, 330, 235),
+    WALL(235, 548, 330, 463),
+    WALL(640, 165, 700, 245),
+    WALL(640, 533, 700, 453),
+    {OBSTACLE_BUMPER, 600, 349, 0, 0, 20, 0, 0}
+};
+
+/* ---- 7: Switchback ---------------------------------------------------- */
+static const Zone zones_switch[] = {
+    {ZONE_SLOPE, 130, 238, 740, 104, -10, 0},
+    {ZONE_SLOPE, 30, 358, 740, 104, 10, 0},
+    {ZONE_HILL, 140, 500, 80, 80, -10, 0}
+};
+static const Obstacle obstacles_switch[] = {
+    WALL(24, 230, 770, 230),
+    WALL(130, 350, 876, 350),
+    WALL(24, 470, 770, 470)
+};
+
 static const Course courses[] = {
-    {"First Green", "A clean line and a gentle first putt.",
-     105, 349, 806, 349, 3, zones_first, 1, obstacles_first, 2,
+    {"First Green",
+     105, 349, 806, 349, 3, zones_first, 1, obstacles_first, 4,
      0, 0, 0, 0, 0},
-    {"Sandbar", "Sand takes speed away. Bank around the divider.",
-     105, 349, 807, 349, 4, zones_sand, 2, obstacles_sand, 3,
+    {"Sandbar",
+     105, 349, 807, 349, 4, zones_sand, 3, obstacles_sand, 4,
      0, 0, 0, 0, 0},
-    {"Bank Shot", "Use the rails, then ride the right-hand slope.",
-     105, 522, 806, 151, 5, zones_bank, 2, obstacles_bank, 4,
+    {"Bank Shot",
+     105, 522, 806, 151, 4, zones_bank, 2, obstacles_bank, 5,
      0, 0, 0, 0, 0},
-    {"Waterline", "The pond is a penalty. Find the narrow crossing.",
-     105, 349, 807, 349, 4, zones_water, 3, obstacles_water, 5,
+    {"Waterline",
+     105, 349, 807, 200, 4, zones_water, 4, obstacles_water, 4,
      0, 0, 0, 0, 0},
-    {"Clockwork", "Catch the moving gate and take the portal shortcut.",
-     105, 349, 806, 349, 5, zones_clockwork, 3, obstacles_clockwork, 4,
-     280, 350, 670, 350, 23}
+    {"Clockwork",
+     105, 349, 806, 349, 3, zones_clockwork, 3, obstacles_clockwork, 4,
+     280, 350, 670, 350, 23},
+    {"Hilltop",
+     105, 349, 807, 349, 4, zones_hilltop, 4, obstacles_hilltop, 5,
+     0, 0, 0, 0, 0},
+    {"Switchback",
+     80, 170, 180, 540, 5, zones_switch, 3, obstacles_switch, 3,
+     0, 0, 0, 0, 0}
 };
 
 #define COURSE_COUNT ((int)(sizeof(courses) / sizeof(courses[0])))
@@ -189,6 +257,7 @@ static int scorecard_open;
 static int ball_moving;
 static int sinking, sink_t;
 static int power_active;
+static int charging;
 static int mouse_down, mouse_x, mouse_y, last_mx = -1, last_my = -1;
 static int portal_cooldown;
 static int need_full = 1, header_dirty = 1, ball_dirty = 1, meter_dirty = 1;
@@ -334,18 +403,33 @@ static void ring(float cx, float cy, float r, float w, uint32_t c, int a) {
     }
 }
 
-/* anti-aliased thick segment with round caps */
+/* anti-aliased thick segment with round caps (row-wise, cheap for long diagonals) */
 static void capsule(float x0, float y0, float x1, float y1, float w,
                     uint32_t c, int a) {
     float hw = w * 0.5f;
-    float minx = x0 < x1 ? x0 : x1, maxx = x0 < x1 ? x1 : x0;
-    float miny = y0 < y1 ? y0 : y1, maxy = y0 < y1 ? y1 : y0;
+    float pad = hw + 1.0f;
     float vx = x1 - x0, vy = y1 - y0;
     float len2 = vx * vx + vy * vy;
-    float lim = (hw + 1.0f) * (hw + 1.0f);
-    for (int y = (int)(miny - hw - 1.0f); y <= (int)(maxy + hw + 2.0f); y++) {
-        for (int x = (int)(minx - hw - 1.0f); x <= (int)(maxx + hw + 2.0f); x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+    float lim = pad * pad;
+    float miny = (y0 < y1 ? y0 : y1) - pad, maxy = (y0 < y1 ? y1 : y0) + pad;
+    for (int y = (int)(miny - 1.0f); y <= (int)(maxy + 1.0f); y++) {
+        float py = (float)y + 0.5f;
+        float xa, xb;
+        if (fabs_(vy) < 0.001f) {
+            if (fabs_(py - y0) > pad) continue;
+            xa = (x0 < x1 ? x0 : x1) - pad;
+            xb = (x0 < x1 ? x1 : x0) + pad;
+        } else {
+            float t0 = (py - pad - y0) / vy, t1 = (py + pad - y0) / vy;
+            if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
+            t0 = clampf(t0, 0.0f, 1.0f);
+            t1 = clampf(t1, 0.0f, 1.0f);
+            float xs = x0 + t0 * vx, xe = x0 + t1 * vx;
+            xa = (xs < xe ? xs : xe) - pad;
+            xb = (xs < xe ? xe : xs) + pad;
+        }
+        for (int x = (int)(xa - 1.0f); x <= (int)(xb + 1.0f); x++) {
+            float px = (float)x + 0.5f;
             float t = len2 > 0.0001f ? ((px - x0) * vx + (py - y0) * vy) / len2 : 0.0f;
             t = clampf(t, 0.0f, 1.0f);
             float qx = px - (x0 + t * vx), qy = py - (y0 + t * vy);
@@ -498,6 +582,18 @@ static void draw_portal(int x, int y, int r) {
     ring((float)x, (float)y, (float)r * 0.42f, 1.0f, rgb(80, 110, 210), 140);
 }
 
+static void draw_wall_segment(const Obstacle* o) {
+    float x0 = (float)o->x, y0 = (float)o->y, x1 = (float)o->w, y1 = (float)o->h;
+    capsule(x0, y0, x1, y1, WALL_THICK + 2.0f, rgb(50, 30, 15), 255);
+    capsule(x0, y0, x1, y1, WALL_THICK - 0.5f, rgb(128, 84, 44), 255);
+    capsule(x0 - 0.8f, y0 - 1.0f, x1 - 0.8f, y1 - 1.0f, WALL_THICK * 0.38f,
+            rgb(184, 134, 80), 200);
+    capsule(x0 + 1.2f, y0 + 1.8f, x1 + 1.2f, y1 + 1.8f, WALL_THICK * 0.22f,
+            rgb(92, 58, 28), 160);
+    disc(x0, y0, 2.0f, rgb(210, 170, 116), 200);
+    disc(x1, y1, 2.0f, rgb(210, 170, 116), 200);
+}
+
 static void draw_hole(int x, int y) {
     float r = (float)HOLE_RADIUS;
     disc((float)x, (float)y, r + 3.0f, rgb(20, 70, 24), 80);
@@ -506,7 +602,7 @@ static void draw_hole(int x, int y) {
     disc((float)x + 0.5f, (float)y + 1.8f, r - 1.6f, rgb(8, 8, 8), 255);
 }
 
-static float zu_x, zu_y, zu_half;
+static float zu_x, zu_y, zu_half, zu_k;
 
 static uint32_t zone_color(const Zone* z, int x, int y, float depth) {
     uint32_t h = hash2(x, y);
@@ -537,8 +633,8 @@ static uint32_t zone_color(const Zone* z, int x, int y, float depth) {
         float px = (float)x + 0.5f - ((float)z->x + (float)z->w * 0.5f);
         float py = (float)y + 0.5f - ((float)z->y + (float)z->h * 0.5f);
         float t = clampf((px * zu_x + py * zu_y) / zu_half, -1.0f, 1.0f);
-        int r = 88 + (int)(t * 20.0f) + n / 2;
-        int g = 176 + (int)(t * 24.0f) + n;
+        int r = 88 + (int)(t * zu_k * 0.85f) + n / 2;
+        int g = 176 + (int)(t * zu_k) + n;
         int b = 76 + n / 2;
         c = rgb(r, g, b);
         if (depth < 1.5f) c = mix(c, rgb(50, 120, 46), (int)((1.5f - depth) * 110.0f));
@@ -546,7 +642,67 @@ static uint32_t zone_color(const Zone* z, int x, int y, float depth) {
     return c;
 }
 
+static void chevron(float fx, float fy, float ux, float uy, float size, int alpha) {
+    float px = -uy, py = ux;
+    float tx = fx + ux * size * 0.9f, ty = fy + uy * size * 0.9f;
+    float bx = fx - ux * size * 0.6f, by = fy - uy * size * 0.6f;
+    uint32_t col = rgb(176, 232, 136);
+    capsule(bx + px * size, by + py * size, tx, ty, 2.2f, col, alpha);
+    capsule(bx - px * size, by - py * size, tx, ty, 2.2f, col, alpha);
+}
+
+static void hill_ring(float cx, float cy, float rad, int n, float sign,
+                      float size, int alpha) {
+    float c = 0.8660254f, s = 0.5f;                 /* 12 arrows */
+    if (n == 4) { c = 0.0f; s = 1.0f; }
+    else if (n == 6) { c = 0.5f; s = 0.8660254f; }
+    else if (n == 8) { c = 0.7071068f; s = 0.7071068f; }
+    float ux = 1.0f, uy = 0.0f;
+    for (int i = 0; i < n; i++) {
+        chevron(cx + ux * rad, cy + uy * rad, ux * sign, uy * sign, size, alpha);
+        float nx = ux * c - uy * s, ny = ux * s + uy * c;
+        ux = nx; uy = ny;
+    }
+}
+
+/* circle hill (amount > 0) or dip (amount < 0); steeper = stronger shading */
+static void paint_hill(const Zone* z) {
+    float amount = (float)z->slope_x;
+    float strength = clampf(fabs_(amount), 0.0f, 48.0f);
+    float sign = amount >= 0.0f ? 1.0f : -1.0f;
+    float r = (float)z->w * 0.5f;
+    float cx = (float)z->x + r, cy = (float)z->y + r;
+    float k = 12.0f + strength * 1.3f;
+    for (int y = z->y - 1; y <= z->y + z->w + 1; y++) {
+        for (int x = z->x - 1; x <= z->x + z->w + 1; x++) {
+            float dx = (float)x + 0.5f - cx, dy = (float)y + 0.5f - cy;
+            float d2 = dx * dx + dy * dy;
+            if (d2 >= (r + 0.5f) * (r + 0.5f)) continue;
+            float d = fsqrt(d2);
+            float cov = clampf(r + 0.5f - d, 0.0f, 1.0f);
+            float q = d / r;
+            float rx = d > 0.01f ? dx / d : 0.0f, ry = d > 0.01f ? dy / d : 0.0f;
+            float bright = -(rx + ry) * 0.7071f * sign * q * k;
+            int n = (int)(hash2(x, y) & 7u) - 4;
+            int cr = 90 + (int)(bright * 0.85f) + n / 2;
+            int cg = 178 + (int)bright + n;
+            int cb = 78 + (int)(bright * 0.6f) + n / 2;
+            uint32_t c = rgb(cr, cg, cb);
+            float f = q * 4.0f - (float)(int)(q * 4.0f);
+            if (f < 0.07f && q > 0.05f) c = mix(c, rgb(36, 104, 42), 60);
+            float depth = r - d;
+            if (depth < 1.6f) c = mix(c, rgb(46, 112, 44), (int)((1.6f - depth) * 110.0f));
+            put(x, y, c, (int)(cov * 255.0f));
+        }
+    }
+    float size = 5.0f + strength * 0.12f;
+    int alpha = 110 + (int)(strength * 2.0f);
+    if (r >= 55.0f) hill_ring(cx, cy, r * 0.42f, 6, sign, size, alpha);
+    hill_ring(cx, cy, r * 0.80f, r >= 70.0f ? 12 : 8, sign, size, alpha);
+}
+
 static void paint_zone(const Zone* z) {
+    if (z->type == ZONE_HILL) { paint_hill(z); return; }
     float radius = z->type == ZONE_WATER ? 18.0f : (z->type == ZONE_SAND ? 16.0f : 10.0f);
     if (z->type == ZONE_SLOPE) {
         float sl = fsqrt((float)(z->slope_x * z->slope_x + z->slope_y * z->slope_y));
@@ -555,6 +711,7 @@ static void paint_zone(const Zone* z) {
         zu_y = (float)z->slope_y / sl;
         zu_half = (float)z->w * 0.5f * fabs_(zu_x) + (float)z->h * 0.5f * fabs_(zu_y);
         if (zu_half < 1.0f) zu_half = 1.0f;
+        zu_k = 4.0f + clampf(sl, 0.0f, 48.0f) * 0.7f;
     }
     for (int y = z->y - 1; y <= z->y + z->h; y++) {
         for (int x = z->x - 1; x <= z->x + z->w; x++) {
@@ -565,17 +722,18 @@ static void paint_zone(const Zone* z) {
         }
     }
     if (z->type == ZONE_SLOPE) {
-        float ppx = -zu_y, ppy = zu_x;
-        for (int cy = z->y + 26; cy < z->y + z->h - 14; cy += 44) {
-            int stagger = (((cy - z->y) / 44) & 1) ? 21 : 0;
-            for (int cx = z->x + 24; cx < z->x + z->w - 16; cx += 42) {
-                float fx = (float)(cx + stagger), fy = (float)cy;
-                if (fx > (float)(z->x + z->w - 16)) continue;
-                float tx = fx + zu_x * 7.0f, ty = fy + zu_y * 7.0f;
-                float ax = fx - zu_x * 5.0f + ppx * 8.0f, ay = fy - zu_y * 5.0f + ppy * 8.0f;
-                float bx = fx - zu_x * 5.0f - ppx * 8.0f, by = fy - zu_y * 5.0f - ppy * 8.0f;
-                capsule(ax, ay, tx, ty, 2.2f, rgb(176, 232, 136), 175);
-                capsule(bx, by, tx, ty, 2.2f, rgb(176, 232, 136), 175);
+        float sl = fsqrt((float)(z->slope_x * z->slope_x + z->slope_y * z->slope_y));
+        float strength = clampf(sl, 0.0f, 48.0f);
+        float size = 5.0f + strength * 0.12f;
+        int alpha = 110 + (int)(strength * 2.0f);
+        int pitch = clampi(62 - (int)strength, 34, 56);     /* steeper = denser arrows */
+        int row = 0;
+        for (int cy = z->y + pitch / 2 + 4; cy < z->y + z->h - 10; cy += pitch, row++) {
+            int stagger = (row & 1) ? pitch / 2 : 0;
+            for (int cx = z->x + 20; cx < z->x + z->w - 14; cx += pitch) {
+                float fx = (float)(cx + stagger);
+                if (fx > (float)(z->x + z->w - 14)) continue;
+                chevron(fx, (float)cy, zu_x, zu_y, size, alpha);
             }
         }
     }
@@ -601,14 +759,13 @@ static void draw_header(void) {
     text(26, 42, "MINI GOLF CLUB", C_MUTED, 1);
     for (int i = 0; i < COURSE_COUNT; i++) {
         char label[3] = {(char)('0' + i + 1), '\0', '\0'};
-        draw_button(330 + i * 54, 20, 42, 36, label, i == current_course);
+        draw_button(COURSE_BTN_X + i * COURSE_BTN_STEP, 20, COURSE_BTN_W, 36, label, i == current_course);
     }
     draw_button(624, 20, 88, 36, "REPLAY", 0);
     draw_button(722, 20, 126, 36, "SCORECARD", scorecard_open);
 
     const Course* course = &courses[current_course];
     text(FIELD_X, 76, course->name, C_INK, 2);
-    text(250, 84, course->note, C_MUTED, 1);
 
     char parline[8] = "PAR ";
     parline[4] = (char)('0' + course->par);
@@ -621,7 +778,7 @@ static void draw_header(void) {
 static void draw_statusbar(void) {
     fill_rect(FIELD_X, BAR_Y, FIELD_W, 30, C_PANEL, 255);
     fill_rect(FIELD_X, BAR_Y, FIELD_W, 1, 0xFF33453C, 255);
-    text(FIELD_X + 14, BAR_Y + 7, "MOUSE/ARROWS AIM   CLICK/SPACE: POWER, THEN HIT   ESC CANCEL",
+    text(FIELD_X + 14, BAR_Y + 7, "AIM WITH MOUSE   HOLD TO CHARGE   RELEASE TO PUTT   ESC CANCEL",
          C_MUTED, 1);
     text(MET_X - 62, BAR_Y + 7, "POWER", C_MINT, 1);
     fill_rect(MET_X - 2, MET_Y - 2, MET_W + 4, MET_H + 4, 0xFF0C120F, 255);
@@ -688,11 +845,15 @@ static void build_bg(void) {
     for (int i = 0; i < course->obstacle_count; i++) {
         const Obstacle* o = &course->obstacles[i];
         if (o->type == OBSTACLE_BLOCK) wall_shadow(o->x, o->y, o->w, o->h);
+        else if (o->type == OBSTACLE_WALL)
+            capsule((float)o->x + 3.0f, (float)o->y + 4.0f, (float)o->w + 3.0f,
+                    (float)o->h + 4.0f, WALL_THICK, rgb(0, 30, 0), 70);
     }
     for (int i = 0; i < course->obstacle_count; i++) {
         const Obstacle* o = &course->obstacles[i];
         if (o->type == OBSTACLE_BLOCK) wall_body(o->x, o->y, o->w, o->h, 0);
         else if (o->type == OBSTACLE_BUMPER) draw_bumper(o->x, o->y, o->radius);
+        else if (o->type == OBSTACLE_WALL) draw_wall_segment(o);
     }
 }
 
@@ -787,6 +948,61 @@ static void restart_course(void) {
 /* physics                                                            */
 /* ------------------------------------------------------------------ */
 
+/* total push on the ball from every slope / hill it is on (px/s^2) */
+static float slope_accel(float x, float y, float* ax, float* ay) {
+    const Course* course = &courses[current_course];
+    *ax = *ay = 0.0f;
+    for (int i = 0; i < course->zone_count; i++) {
+        const Zone* z = &course->zones[i];
+        if (z->type == ZONE_SLOPE) {
+            if (inside_rect(x, y, z->x, z->y, z->w, z->h)) {
+                *ax += (float)z->slope_x * SLOPE_ACCEL;
+                *ay += (float)z->slope_y * SLOPE_ACCEL;
+            }
+        } else if (z->type == ZONE_HILL) {
+            float r = (float)z->w * 0.5f;
+            float dx = x - ((float)z->x + r), dy = y - ((float)z->y + r);
+            float d2 = dx * dx + dy * dy;
+            if (d2 < r * r && d2 > 0.0001f) {
+                float d = fsqrt(d2);
+                float mag = (float)z->slope_x * SLOPE_ACCEL * (d / r);  /* flat on top, steeper at the rim */
+                *ax += dx / d * mag;
+                *ay += dy / d * mag;
+            }
+        }
+    }
+    return fsqrt(*ax * *ax + *ay * *ay);
+}
+
+static void hit_wall(const Obstacle* o, float* vx, float* vy) {
+    float x0 = (float)o->x, y0 = (float)o->y;
+    float sx = (float)o->w - x0, sy = (float)o->h - y0;
+    float len2 = sx * sx + sy * sy;
+    float t = len2 > 0.0001f ? ((ball_x - x0) * sx + (ball_y - y0) * sy) / len2 : 0.0f;
+    t = clampf(t, 0.0f, 1.0f);
+    float cx = x0 + t * sx, cy = y0 + t * sy;
+    float dx = ball_x - cx, dy = ball_y - cy;
+    float min_d = (float)BALL_RADIUS + WALL_THICK * 0.5f;
+    float d2 = dx * dx + dy * dy;
+    if (d2 >= min_d * min_d) return;
+    float nx, ny;
+    if (d2 > 0.0001f) {
+        float d = fsqrt(d2);
+        nx = dx / d; ny = dy / d;
+    } else {
+        float l = fsqrt(len2);
+        nx = l > 0.01f ? -sy / l : 1.0f;
+        ny = l > 0.01f ? sx / l : 0.0f;
+    }
+    ball_x = cx + nx * min_d;
+    ball_y = cy + ny * min_d;
+    float normal_speed = *vx * nx + *vy * ny;
+    if (normal_speed < 0.0f) {
+        *vx -= 1.8f * normal_speed * nx;
+        *vy -= 1.8f * normal_speed * ny;
+    }
+}
+
 static void hit_rect(float rx0, float ry0, float rw, float rh, float svx,
                      float* vx, float* vy) {
     float x = ball_x, y = ball_y;
@@ -864,12 +1080,10 @@ static void water_penalty(void) {
 static void step_ball(void) {
     const Course* course = &courses[current_course];
     const float dt = 1.0f / (60.0f * (float)SUBSTEPS);
-    const Zone* slope = NULL;
-    int on_slope = active_zone(ball_x, ball_y, ZONE_SLOPE, &slope);
-    if (on_slope) {
-        ball_vx += (float)slope->slope_x * SLOPE_ACCEL * dt;
-        ball_vy += (float)slope->slope_y * SLOPE_ACCEL * dt;
-    }
+    float sax, say;
+    float slope_mag = slope_accel(ball_x, ball_y, &sax, &say);
+    ball_vx += sax * dt;
+    ball_vy += say * dt;
 
     ball_x += ball_vx * dt;
     ball_y += ball_vy * dt;
@@ -889,6 +1103,8 @@ static void step_ball(void) {
             float gx = (float)object_x(o, gate_clock);
             float gv = (float)(object_x(o, gate_clock + 16) - object_x(o, gate_clock)) / 0.016f;
             hit_rect(gx, (float)o->y, (float)o->w, (float)o->h, gv, &ball_vx, &ball_vy);
+        } else if (o->type == OBSTACLE_WALL) {
+            hit_wall(o, &ball_vx, &ball_vy);
         } else {
             hit_rect((float)o->x, (float)o->y, (float)o->w, (float)o->h, 0.0f,
                      &ball_vx, &ball_vy);
@@ -940,7 +1156,7 @@ static void step_ball(void) {
     else if (active_zone(ball_x, ball_y, ZONE_ROUGH, NULL)) friction = 0.98742f;
     ball_vx *= friction;
     ball_vy *= friction;
-    if (!on_slope && fsqrt(ball_vx * ball_vx + ball_vy * ball_vy) < 6.0f) {
+    if (slope_mag < SLOPE_REST && fsqrt(ball_vx * ball_vx + ball_vy * ball_vy) < 6.0f) {
         ball_vx = ball_vy = 0.0f;
         ball_moving = 0;
     }
@@ -957,6 +1173,7 @@ static void start_power(void) {
 static void cancel_power(void) {
     if (!power_active) return;
     power_active = 0;
+    charging = 0;
     meter = 0.0f;
     meter_dirty = ball_dirty = 1;
 }
@@ -1166,8 +1383,8 @@ static void draw_scorecard(void) {
     text(590, 202, "+/-", C_MUTED, 1);
     int total = 0, par_total = 0;
     for (int i = 0; i < COURSE_COUNT; i++) {
-        int y = 232 + i * 43;
-        if (i == current_course) fill_rect(232, y - 3, 438, 34, 0xFF284238, 255);
+        int y = 226 + i * 32;
+        if (i == current_course) fill_rect(232, y - 4, 438, 28, 0xFF284238, 255);
         text(246, y, courses[i].name, C_INK, 1);
         number_text(432, y, courses[i].par, C_MUTED, 1);
         if (holed[i]) {
@@ -1304,8 +1521,9 @@ static void toggle_scorecard(void) {
 
 static void click(int x, int y) {
     if (scorecard_open) { toggle_scorecard(); return; }
-    if (y >= 20 && y < 56 && x >= 330 && x < 330 + COURSE_COUNT * 54) {
-        select_course((x - 330) / 54);
+    if (y >= 20 && y < 56 && x >= COURSE_BTN_X &&
+        x < COURSE_BTN_X + COURSE_COUNT * COURSE_BTN_STEP) {
+        select_course((x - COURSE_BTN_X) / COURSE_BTN_STEP);
     } else if (in_button(x, y, 624, 20, 88, 36)) {
         restart_course();
     } else if (in_button(x, y, 722, 20, 126, 36)) {
@@ -1319,6 +1537,7 @@ static void click(int x, int y) {
         if (!power_active) {
             aim_at(x, y);
             start_power();
+            charging = power_active;
         } else {
             fire();
         }
@@ -1330,8 +1549,7 @@ static void mouse_event(const syscall_window_event_t* event) {
     int left = (event->buttons & SYSCALL_MOUSE_BTN_LEFT) != 0;
     mouse_x = x;
     mouse_y = y;
-    if ((x != last_mx || y != last_my) && ball_aiming() && !power_active &&
-        !scorecard_open) {
+    if ((x != last_mx || y != last_my) && ball_aiming() && !scorecard_open) {
         last_mx = x;
         last_my = y;
         if (x >= FIELD_X && x < FIELD_X + FIELD_W && y >= FIELD_Y && y < FIELD_Y + FIELD_H) {
@@ -1340,6 +1558,10 @@ static void mouse_event(const syscall_window_event_t* event) {
         }
     }
     if (left && !mouse_down) click(x, y);
+    if (!left && mouse_down) {
+        if (charging && power_active) fire();      /* release = hit the ball */
+        charging = 0;
+    }
     mouse_down = left;
 }
 
