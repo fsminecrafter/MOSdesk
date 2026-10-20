@@ -18,3 +18,19 @@ uint32_t* settings_click(int32_t x, int32_t y, uint32_t w, uint32_t h) {
     draw_window();
     return surface.pixels;
 }
+/* Any window event for the Settings client (hover, click, wheel). Returns the
+ * redrawn surface, or NULL when the event changed nothing visible. */
+uint32_t* settings_event(const syscall_window_event_t* e, uint32_t w, uint32_t h) {
+    bool changed = false;
+    if (e->type == SYSCALL_WINDOW_EVENT_MOUSE) {
+        changed = mouse_changed_window(e);
+    } else if (e->type == SYSCALL_WINDOW_EVENT_MOUSE_WHEEL) {
+        int32_t before_page = appearance_scroll, before_nav = nav_scroll;
+        handle_wheel(e);
+        changed = before_page != appearance_scroll || before_nav != nav_scroll;
+    }
+    if (!changed) return NULL;
+    resize_surface(w, h);
+    draw_window();
+    return surface.pixels;
+}

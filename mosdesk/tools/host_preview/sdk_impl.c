@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <stdlib.h>
 #include <unistd.h>
 uint32_t harness_cursor_status; uint64_t harness_uptime_ms;
 uint32_t* harness_fb; uint32_t harness_w = 1280, harness_h = 720;
@@ -20,6 +21,7 @@ struct { uint16_t year; uint8_t month, day, hour, minute, second; } harness_time
 void (*hook_exec)(const char* path);
 void (*hook_event)(uint32_t id, const syscall_window_event_t* e);
 void (*hook_bounds)(uint32_t id, uint32_t w, uint32_t h);
+const char* harness_exec_arg;   /* first argument of the last SYS_EXEC, if any */
 
 static char hid_to_ascii(uint32_t key, uint32_t mods) {
     int shift = (mods & (1u << 1)) != 0;
@@ -44,6 +46,29 @@ uint64_t mos_syscall3(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
     case SYS_RANDOM: { uint8_t* p = (uint8_t*)(uintptr_t)a; for (uint64_t i = 0; i < b; i++) p[i] = (uint8_t)(i * 37 + 11); return b; }
     case SYS_LISTDIR: {
         const char* p = (const char*)(uintptr_t)a; syscall_dirent_t* e = (syscall_dirent_t*)(uintptr_t)b;
+        /* Lists the directory in the host sandbox (cwd holds "0:/..."), sorted by name. */
+        DIR* d = opendir(p);
+        if (d) {
+            static char names[256][64]; unsigned n = 0; struct dirent* de;
+            while ((de = readdir(d)) && n < 256u) {
+                if (de->d_name[0] == '.' || strlen(de->d_name) >= 64u) continue;
+                strcpy(names[n++], de->d_name);
+            }
+            closedir(d);
+            qsort(names, n, sizeof names[0], (int (*)(const void*, const void*))strcmp);
+            if (n > c) n = (unsigned)c;
+            memset(e, 0, sizeof(*e) * (size_t)c);
+            for (unsigned i = 0; i < n; i++) {
+                char full[512]; struct stat st; size_t len = strlen(names[i]);
+                snprintf(full, sizeof full, "%s/%s", p, names[i]);
+                strcpy(e[i].name, names[i]);
+                if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) e[i].type = SYSCALL_DIRENT_TYPE_DIR;
+                else if (len > 4u && !strcmp(names[i] + len - 4u, ".run")) e[i].type = SYSCALL_DIRENT_TYPE_EXECUTABLE;
+                else e[i].type = SYSCALL_DIRENT_TYPE_FILE;
+            }
+            return n;
+        }
+        /* No such directory on the host: keep the original tiny fixed tree. */
         memset(e, 0, sizeof(*e) * 4);
         if (!strcmp(p, "0:/programs")) {
             strcpy(e[0].name, "mosdesk"); e[0].type = SYSCALL_DIRENT_TYPE_DIR;
@@ -54,9 +79,14 @@ uint64_t mos_syscall3(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
         if (!strcmp(p, "0:/programs/mosWM"))   { strcpy(e[0].name, "mosWM.run");   e[0].type = SYSCALL_DIRENT_TYPE_EXECUTABLE; return 1; }
         return (uint64_t)-1;
     }
+    case SYS_EXISTS: { struct stat st; return stat((const char*)(uintptr_t)a, &st) == 0 ? 1u : 0u; }
+    case SYS_RMDIR: return rmdir((const char*)(uintptr_t)a) == 0 ? 0 : (uint64_t)-1;
     case SYS_IS_DIR: { struct stat st; return stat((const char*)(uintptr_t)a, &st) == 0 && S_ISDIR(st.st_mode); }
     case SYS_MKDIR: return mkdir((const char*)(uintptr_t)a, 0755) == 0 ? 0 : (uint64_t)-1;
-    case SYS_EXEC: if (hook_exec) hook_exec((const char*)(uintptr_t)a); return 1;
+    case SYS_EXEC:
+        harness_exec_arg = (c >= 1u && b) ? *(const char* const*)(uintptr_t)b : NULL;
+        if (hook_exec) hook_exec((const char*)(uintptr_t)a);
+        return 1;
     default: return (uint64_t)-1;
     }
 }
@@ -113,14 +143,56 @@ void mos_register_cleanup(void (*fn)(void)) { (void)fn; }
 void mos_exit() { exit(0); }
 void mos_sleep(uint32_t ms) { (void)ms; }
 uint64_t mos_write(const char* s, uint32_t n) { return (uint64_t)write(2, s, n); }
-uint32_t mos_window_create(uint32_t a, int32_t x, int32_t y, uint32_t w, uint32_t h, const char* t) { (void)a;(void)x;(void)y;(void)w;(void)h;(void)t; return 1; }
-uint64_t mos_window_close(uint32_t id) { (void)id; return 0; }
-uint64_t mos_window_set_resizable(uint32_t id, bool b) { (void)id; (void)b; return 0; }
-uint64_t mos_window_set_style(uint32_t id, syscall_window_style_t s) { (void)id; (void)s; return 0; }
 uint64_t mos_window_next_event(uint32_t id, syscall_window_event_t* e) { (void)id; (void)e; return 1; }
 uint64_t mos_window_get_info(uint32_t id, syscall_window_info_t* i) {
     for (int k = 0; k < harness_nwin; k++) if (harness_windows[k].id == id) { *i = harness_windows[k]; return 0; }
     return (uint64_t)-1;
 }
 uint64_t mos_window_get_cursor_state(syscall_cursor_state_t* state) { if (state) { memset(state, 0, sizeof(*state)); state->status = harness_cursor_status; } return 0; }
-uint64_t mos_window_present(uint32_t id, const uint32_t* px, uint32_t pitch, int32_t x, int32_t y, int32_t w, int32_t h) { (void)id;(void)px;(void)pitch;(void)x;(void)y;(void)w;(void)h; return 0; }
+
+/* ---- tiny window server: windows created by mosWM itself (the Files window) ---- */
+static uint32_t harness_next_id = 100;
+static uint8_t harness_owned[8];          /* frame buffer allocated here, freed on close */
+static int window_index(uint32_t id) { for (int i = 0; i < harness_nwin; i++) if (harness_windows[i].id == id) return i; return -1; }
+/* Adds a window whose frame buffer the caller owns (used by the driver for Settings). */
+uint32_t harness_add_window(const syscall_window_info_t* info, uint32_t* frame) {
+    if (harness_nwin >= 8) return 0;
+    harness_windows[harness_nwin] = *info; harness_frames[harness_nwin] = frame; harness_owned[harness_nwin] = 0;
+    harness_nwin++;
+    return info->id;
+}
+void harness_remove_window(uint32_t id) {
+    int i = window_index(id); if (i < 0) return;
+    if (harness_owned[i]) free(harness_frames[i]);
+    for (int k = i; k + 1 < harness_nwin; k++) {
+        harness_windows[k] = harness_windows[k + 1]; harness_frames[k] = harness_frames[k + 1]; harness_owned[k] = harness_owned[k + 1];
+    }
+    harness_nwin--;
+}
+uint32_t mos_window_create(uint32_t a, int32_t x, int32_t y, uint32_t w, uint32_t h, const char* t) {
+    (void)a; if (harness_nwin >= 8) return 0;
+    int i = harness_nwin++;
+    syscall_window_info_t* wi = &harness_windows[i]; memset(wi, 0, sizeof *wi);
+    wi->id = harness_next_id++; wi->frame_version = 1; wi->x = x; wi->y = y; wi->width = w; wi->height = h;
+    wi->flags = SYSCALL_WINDOW_VISIBLE;
+    strncpy(wi->title, t, sizeof(wi->title) - 1u);
+    harness_frames[i] = calloc((size_t)harness_w * harness_h, 4); harness_owned[i] = 1;
+    return wi->id;
+}
+uint64_t mos_window_close(uint32_t id) { if (window_index(id) < 0) return (uint64_t)-1; harness_remove_window(id); return 0; }
+uint64_t mos_window_set_resizable(uint32_t id, bool b) {
+    int i = window_index(id); if (i < 0) return (uint64_t)-1;
+    if (b) harness_windows[i].flags |= SYSCALL_WINDOW_RESIZABLE; else harness_windows[i].flags &= ~SYSCALL_WINDOW_RESIZABLE;
+    return 0;
+}
+uint64_t mos_window_set_style(uint32_t id, syscall_window_style_t st) {
+    int i = window_index(id); if (i < 0) return (uint64_t)-1;
+    harness_windows[i].style = st; harness_windows[i].frame_version++; return 0;
+}
+uint64_t mos_window_present(uint32_t id, const uint32_t* px, uint32_t pitch, int32_t x, int32_t y, int32_t w, int32_t h) {
+    int i = window_index(id); (void)x; (void)y; if (i < 0 || !harness_frames[i]) return (uint64_t)-1;
+    /* get_frame reads a dense width*height buffer, so repack rows here. */
+    for (int32_t row = 0; row < h && (uint32_t)row < harness_h; row++)
+        memcpy(harness_frames[i] + (size_t)row * (uint32_t)w, (const uint8_t*)px + (size_t)row * pitch, (size_t)w * 4u);
+    harness_windows[i].frame_version++; return 0;
+}
