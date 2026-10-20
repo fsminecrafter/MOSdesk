@@ -9,8 +9,7 @@ The project is split into a desktop implementation, the Minimal-OS SDK toolchain
   <a href="mosdesk_demo.mp4">Watch the MOSdesk demo (mosdesk_demo.mp4)</a>
 </video>
 
-[▶ Watch the demo: `mosdesk_demo.mp4`](mosdesk_demo.mp4) — a 66 second scripted session on the real compositor: first-run setup, Start menu and built-in apps, Files, photo wallpapers, Settings, window management and sign-in.
-
+https://github.com/user-attachments/assets/f69558d4-2eb4-4ade-a4f1-567f23482287
 
 ## Features
 
