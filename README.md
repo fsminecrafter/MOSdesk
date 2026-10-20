@@ -5,7 +5,11 @@ MOSdesk is a user-space desktop environment for [Minimal-OS](https://github.com/
 The project is split into a desktop implementation, the Minimal-OS SDK toolchain, and the underlying OS sources used to build and package the system.
 
 
-https://github.com/user-attachments/assets/bddd45a1-8dfb-4670-86b6-80896696b8b8
+<video src="https://github.com/fsminecrafter/MOSdesk/raw/main/mosdesk_demo.mp4" controls muted width="100%">
+  <a href="mosdesk_demo.mp4">Watch the MOSdesk demo (mosdesk_demo.mp4)</a>
+</video>
+
+[▶ Watch the demo: `mosdesk_demo.mp4`](mosdesk_demo.mp4) — a 66 second scripted session on the real compositor: first-run setup, Start menu and built-in apps, Files, photo wallpapers, Settings, window management and sign-in.
 
 
 ## Features
@@ -147,10 +151,23 @@ Builds the real mosWM cursor loader on the host and writes
 ```
 
 Drives the real mosWM compositor and Settings client with scripted keyboard and
-mouse input (first-run and sign-in screens, desktop, start menu, Settings theme
-change, window drag/maximize) and writes PNG stills plus `mosdesk_demo.mp4` and
-`.gif` (ffmpeg needed for the video). The host stubs use a stand-in password hash
-because the real one needs the Minimal-OS-SDK submodule.
+mouse input and writes PNG stills plus `mosdesk_demo.mp4` and `.gif` (ffmpeg
+needed for the video). The repo-root `mosdesk_demo.mp4` is this script's output.
+The session covers:
+
+1. First run: choose a username, set a password, land on the desktop
+2. Start menu with the System entries and the six built-in apps
+3. Files: Home, Documents and Pictures, then opening a photo as the wallpaper
+4. Desktop right-click menu, Change wallpaper
+5. Settings: Minimal-OS theme, photo wallpapers, photo fit, pointer fill, Debug page
+6. Window drag, maximize, restore and close
+7. A restart: wrong then right password at sign-in, with the settings kept
+
+The host build lists the built-in apps but cannot run them (they need the
+Minimal-OS SDK), so they appear with the generic app icon and are not launched.
+The host stubs use a stand-in password hash for the same reason, and the
+taskbar clock is a fixed host stub. To update the video, run the script and copy
+`mosdesk_demo.mp4` from the output folder to the repo root.
 
 ## Preview MOSdesk
 
