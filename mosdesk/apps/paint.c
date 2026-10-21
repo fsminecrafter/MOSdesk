@@ -67,7 +67,7 @@ static void toolbar(void) {
     }
     int x = 10 + COLORS * 34 + 12;
     rect(x, 20 - brush / 2, brush, brush, 0xFFFFFFFF);
-    draw_text(pixels, width, height, x + 24, 16, "wheel: size  C: clear", 0xFF9BB0BC, 1);
+    draw_text(pixels, width, height, x + 40, 14, "wheel: size  C: clear", 0xFF9BB0BC, 1);
 }
 
 static void clear(void) {

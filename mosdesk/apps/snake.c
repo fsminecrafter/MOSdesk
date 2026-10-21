@@ -31,10 +31,13 @@ static void rect(int x, int y, int w, int h, uint32_t c) {
             if (px >= 0 && py >= 0 && px < (int)W && py < (int)H) pixels[py * W + px] = c;
 }
 
-static int occupied(int x, int y) {
-    for (int i = 0; i < length; i++) if (body[i].x == x && body[i].y == y) return 1;
+// Is (x, y) covered by the first `n` body cells?
+static int occupied_by(int x, int y, int n) {
+    for (int i = 0; i < n; i++) if (body[i].x == x && body[i].y == y) return 1;
     return 0;
 }
+
+static int occupied(int x, int y) { return occupied_by(x, y, length); }
 
 static void place_food(void) {
     do {
@@ -55,8 +58,14 @@ static void reset(void) {
 static void step(void) {
     dir_x = next_x; dir_y = next_y;
     int nx = body[0].x + dir_x, ny = body[0].y + dir_y;
-    if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS || occupied(nx, ny)) { dead = 1; if (score > best) best = score; return; }
     int grow = nx == food.x && ny == food.y;
+    // The tail moves out of the way this step unless the snake grows.
+    int solid = grow ? length : length - 1;
+    if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS || occupied_by(nx, ny, solid)) {
+        dead = 1;
+        if (score > best) best = score;
+        return;
+    }
     if (grow && length < MAX_LEN) length++;
     memmove(&body[1], &body[0], sizeof(Cell) * (size_t)(length - 1));
     body[0].x = nx; body[0].y = ny;
@@ -103,21 +112,26 @@ int main(void) {
     if (!pixels) return 1;
     reset();
     long last = mos_uptime();
+    int changed = 1;
     for (;;) {
         syscall_window_event_t ev;
         while (mos_window_next_event(window_id, &ev) == SYS_SUCCESS) {
             if (ev.type == SYSCALL_WINDOW_EVENT_CLOSE_REQUEST) { mos_window_close(window_id); return 0; }
             if (ev.type != SYSCALL_WINDOW_EVENT_KEY || !ev.buttons) continue;   // key presses only
-            if (ev.key == KEY_SPACE && dead) reset();
+            if (ev.key == KEY_SPACE && dead) { reset(); last = mos_uptime(); changed = 1; }
             if (ev.key == KEY_RIGHT && dir_x != -1) { next_x = 1; next_y = 0; }
             if (ev.key == KEY_LEFT && dir_x != 1) { next_x = -1; next_y = 0; }
             if (ev.key == KEY_DOWN && dir_y != -1) { next_x = 0; next_y = 1; }
             if (ev.key == KEY_UP && dir_y != 1) { next_x = 0; next_y = -1; }
         }
         long now = mos_uptime();
-        if (!dead && now - last >= 110) { step(); last = now; }
-        draw();
-        mos_window_present(window_id, pixels, W * 4, 0, 0, W, H);
+        if (!dead && now - last >= 110) { step(); last = now; changed = 1; }
+        // Only present when something changed, as mosWM recommends.
+        if (changed) {
+            draw();
+            mos_window_present(window_id, pixels, W * 4, 0, 0, W, H);
+            changed = 0;
+        }
         mos_sleep(16);
     }
 }
