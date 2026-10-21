@@ -61,9 +61,16 @@ produces `mosdesk/dist/mosdesk.mpkg` and `mosWM/dist/mosWM.mpkg`.
 Apps in `mosdesk/apps/` are built and delivered with MOSdesk. Each one is
 installed into `0:/programs` with a `mos_` prefix:
 
-| Source | Built as | Installed at |
+| Source | Built as | What it is |
 | --- | --- | --- |
-| `mosdesk/apps/edit.c` | `mos_edit.run` | `0:/programs/mos_edit.run` |
+| `mosdesk/apps/calc.c` | `0:/programs/mos_calc.run` | Calculator (easyui) |
+| `mosdesk/apps/clock.c` | `0:/programs/mos_clock.run` | Analogue clock |
+| `mosdesk/apps/cube.c` | `0:/programs/mos_cube.run` | 3D cube with FarcadeGL: built-in lighting or an FGSL shader (L / S keys) |
+| `mosdesk/apps/edit.c` | `0:/programs/mos_edit.run` | Text editor |
+| `mosdesk/apps/golf.c` | `0:/programs/mos_golf.run` | Mini golf |
+| `mosdesk/apps/installer.c` | `0:/programs/mos_installer.run` | Installs Minimal-OS on a disk (easyui) |
+| `mosdesk/apps/paint.c` | `0:/programs/mos_paint.run` | Paint with the mouse |
+| `mosdesk/apps/snake.c` | `0:/programs/mos_snake.run` | Snake (arrow keys) |
 
 To add an app, drop `<name>.c` (or a `<name>/` folder with a `main.c`) into
 `mosdesk/apps/` and run `./mosdesk/build.sh`. For each app the build runs the
