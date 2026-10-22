@@ -15,6 +15,9 @@ https://github.com/user-attachments/assets/f69558d4-2eb4-4ade-a4f1-567f23482287
 
 - Composites desktop layers and window surfaces with dirty-rectangle updates
 - Keeps desktop shortcut positions across restarts, with optional grid snapping
+- Shows only Home and System on the desktop by itself; everything else comes from the user's Desktop folder. "Add to desktop" (right-click an app in the launcher or anything in Files) puts a `.lnk` shortcut there
+- Files can copy or move an item into any folder through a "Copy to... / Move to..." folder picker
+- Offers a "2000s Aero" window style next to the modern one (Settings > Appearance > Window style): blurred, accent-tinted glass frames and panel, Windows 7 style caption buttons and a start orb; easyui apps follow it
 - Includes six coordinated color themes and eight photo wallpapers selectable in Settings > Appearance, with fill, crop, stretch, and rotation controls
 - Renders smooth, anti-aliased OpenType/TrueType text (Inter, bundled) through the reusable `ttrend` / `ttrend_outline` libraries, with the bitmap font as a fallback
 - Produces SDK `.slib` bundles that can be consumed by other freestanding programs

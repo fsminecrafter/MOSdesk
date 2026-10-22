@@ -34,10 +34,18 @@
 #define MOSDESK_PASSWORD_SALT_SIZE 16u
 #define MOSDESK_PASSWORD_HASH_SIZE 32u
 #define MOSDESK_WALLPAPER_PATH_SIZE 192u
-/* Home, System, up to 32 applications and up to 32 items of the user's
- * Desktop folder. Settings files from before the Desktop folder held 34. */
+/* Saved desktop icon positions, by icon: 0 Home, 1 System, then the items of
+ * the user's Desktop folder. Up to v6 the installed applications sat in
+ * slots 2-33 and the Desktop folder in 34-65; loading such a file moves the
+ * Desktop folder positions down. Files from before the Desktop folder held
+ * 34 slots. */
 #define MOSDESK_DESKTOP_ICON_COUNT 66u
 #define MOSDESK_DESKTOP_ICON_COUNT_V5 34u
+#define MOSDESK_DESKTOP_ICON_FIRST_ITEM 2u
+#define MOSDESK_DESKTOP_ICON_V6_FIRST_FILE 34u
+/* Window and panel style, Settings > Appearance. */
+#define MOSDESK_UI_STYLE_MODERN 0u
+#define MOSDESK_UI_STYLE_AERO 1u
 #define MOSDESK_USERNAME_SIZE 32u
 #define MOSDESK_WALLPAPER_FILL 0u
 #define MOSDESK_WALLPAPER_CROP 1u
@@ -65,7 +73,41 @@ typedef struct {
     uint32_t debug_fps;
     uint32_t debug_profiler;
     char username[MOSDESK_USERNAME_SIZE];
+    uint32_t ui_style;
 } mosdesk_settings_t;
+
+/* easyui (Minimal-OS-SDK/include/easyui.h) reads ui_style straight from the
+ * file at this offset, so apps can follow the Aero style; keep them equal. */
+#define MOSDESK_SETTINGS_UI_STYLE_OFFSET 860u
+_Static_assert(offsetof(mosdesk_settings_t, ui_style) ==
+                   MOSDESK_SETTINGS_UI_STYLE_OFFSET,
+               "easyui reads ui_style at this offset");
+
+/* The layout before the window style, when applications still had desktop
+ * icons (see MOSDESK_DESKTOP_ICON_COUNT). */
+typedef struct {
+    uint32_t magic;
+    uint32_t mouse_speed;
+    uint32_t accent_color;
+    uint32_t cursor_fill;
+    uint32_t cursor_scale;
+    uint32_t cursor_pack;
+    uint32_t wallpaper;
+    uint32_t onboarding_complete;
+    uint32_t login_enabled;
+    uint8_t password_salt[MOSDESK_PASSWORD_SALT_SIZE];
+    uint8_t password_hash[MOSDESK_PASSWORD_HASH_SIZE];
+    uint32_t click_once_open;
+    uint32_t grid_enabled;
+    uint32_t wallpaper_mode;
+    uint32_t wallpaper_rotation;
+    char wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE];
+    uint32_t desktop_icon_x[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t debug_fps;
+    uint32_t debug_profiler;
+    char username[MOSDESK_USERNAME_SIZE];
+} mosdesk_settings_v6_t;
 
 /* The layout before the username and the Desktop folder icons. */
 typedef struct {
@@ -259,6 +301,26 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
                 (uintptr_t)&settings, sizeof(settings)) !=
             (long)sizeof(settings))
             settings = mosdesk_settings_default();
+    } else if (size == (long)sizeof(mosdesk_settings_v6_t)) {
+        /* v6 is the leading part of the current layout; only the icon
+         * slots change meaning (applications are no longer on the desktop,
+         * so the Desktop folder items move down into their slots). */
+        if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
+                (uintptr_t)&settings, (uint64_t)size) == size) {
+            settings.ui_style = MOSDESK_UI_STYLE_MODERN;
+            for (uint32_t i = MOSDESK_DESKTOP_ICON_FIRST_ITEM;
+                 i < MOSDESK_DESKTOP_ICON_COUNT; i++) {
+                uint32_t from = i - MOSDESK_DESKTOP_ICON_FIRST_ITEM +
+                                MOSDESK_DESKTOP_ICON_V6_FIRST_FILE;
+                bool moved = from < MOSDESK_DESKTOP_ICON_COUNT;
+                settings.desktop_icon_x[i] =
+                    moved ? settings.desktop_icon_x[from] : UINT32_MAX;
+                settings.desktop_icon_y[i] =
+                    moved ? settings.desktop_icon_y[from] : UINT32_MAX;
+            }
+        } else {
+            settings = mosdesk_settings_default();
+        }
     } else if (size == (long)sizeof(mosdesk_settings_v5_t) ||
                size == (long)sizeof(mosdesk_settings_v4_t)) {
         /* v4 is the leading part of v5; the debug switches stay off. */
@@ -271,7 +333,9 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
             for (size_t i = 0;
                  i < offsetof(mosdesk_settings_v5_t, desktop_icon_x); i++)
                 to[i] = from[i];
-            for (uint32_t i = 0; i < MOSDESK_DESKTOP_ICON_COUNT_V5; i++) {
+            /* Only Home and System keep their places: the other slots held
+             * applications, which are no longer on the desktop. */
+            for (uint32_t i = 0; i < MOSDESK_DESKTOP_ICON_FIRST_ITEM; i++) {
                 settings.desktop_icon_x[i] = legacy.desktop_icon_x[i];
                 settings.desktop_icon_y[i] = legacy.desktop_icon_y[i];
             }
@@ -366,6 +430,7 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         settings.onboarding_complete > 1u ||
         settings.login_enabled > 1u ||
         settings.click_once_open > 1u ||
+        settings.ui_style > MOSDESK_UI_STYLE_AERO ||
         settings.username[MOSDESK_USERNAME_SIZE - 1u] != '\0')
         return mosdesk_settings_default();
     /* An unusable name is asked for again rather than used as a path. */

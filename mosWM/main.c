@@ -29,6 +29,7 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 
 /* The text editor shipped with MOSdesk (mosdesk/apps/edit.c). */
 #define MOSDESK_EDITOR_PATH "0:/programs/mos_edit.run"
+#define MOSDESK_PLAYER_PATH "0:/programs/mos_player.run"
 
 #define SYS_HEAP_ALLOC 1u
 #define SYS_HEAP_FREE 2u
@@ -70,10 +71,13 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define BROWSER_FOOTER_HEIGHT 26u
 #define BROWSER_TOOL_COUNT 5u
 #define CURSOR_PATCH_SIZE (CURSOR_MAX_SIZE * 2u)
-#define MENU_MAX_ITEMS 8u
+#define MENU_MAX_ITEMS 10u
 #define MENU_WIDTH 204
 #define MENU_ITEM_HEIGHT 30
-#define START_MENU_MAX_ROWS 9u
+/* Three fixed launcher rows plus every application; fewer are shown when
+ * the screen is too short (start_menu_row_limit). */
+#define START_MENU_MAX_ROWS (3u + MAX_DESKTOP_APPS)
+#define SHORTCUT_EXTENSION ".lnk"
 #define FILE_TREE_MAX_DEPTH 6u
 #define FILE_COPY_CHUNK (64u * 1024u)
 #define FRAME_INTERVAL_MS 16u
@@ -129,11 +133,17 @@ typedef struct {
     uint32_t icon_pixels[DESKTOP_ICON_PIXELS];
 } desktop_app_t;
 
-/* A file or folder inside the user's Desktop folder. */
+/* A file or folder inside the user's Desktop folder. A shortcut (a .lnk
+ * file holding the path of what it opens) shows its target's icon. */
 typedef struct {
     char path[DESKTOP_APP_PATH_SIZE];
     char name[DESKTOP_APP_NAME_SIZE];
+    char label[DESKTOP_APP_NAME_SIZE];
+    char target[DESKTOP_APP_PATH_SIZE];
     uint32_t type;
+    uint32_t target_type;
+    bool has_icon;
+    uint32_t icon_pixels[DESKTOP_ICON_PIXELS];
 } desktop_file_t;
 
 typedef enum {
@@ -158,7 +168,10 @@ typedef enum {
     MENU_ACTION_REFRESH,
     MENU_ACTION_FILES,
     MENU_ACTION_WALLPAPERS,
-    MENU_ACTION_SETTINGS
+    MENU_ACTION_SETTINGS,
+    MENU_ACTION_ADD_TO_DESKTOP,
+    MENU_ACTION_COPY_TO,
+    MENU_ACTION_MOVE_TO
 } menu_action_t;
 
 typedef struct {
@@ -173,7 +186,8 @@ typedef enum {
     DIALOG_NONE,
     DIALOG_RENAME,
     DIALOG_NEW_FOLDER,
-    DIALOG_DELETE
+    DIALOG_DELETE,
+    DIALOG_PICK_FOLDER
 } dialog_kind_t;
 
 typedef struct {
@@ -244,6 +258,8 @@ static uint32_t cursor_scale = 1u;
 static uint32_t cursor_pack = MOSDESK_CURSOR_PACK_POSY;
 static uint32_t mouse_speed = 100u;
 static uint32_t accent_color = 0xFF3DAEE9u;
+/* MOSDESK_UI_STYLE_MODERN, or MOSDESK_UI_STYLE_AERO for the glass look. */
+static uint32_t ui_style;
 static uint32_t wallpaper_style;
 static uint32_t wallpaper_mode;
 static uint32_t wallpaper_rotation;
@@ -446,6 +462,7 @@ static void load_desktop_settings(void) {
     if (user_changed) update_user_paths();
     mouse_speed = settings.mouse_speed;
     accent_color = settings.accent_color;
+    ui_style = settings.ui_style;
     cursor_fill_color = settings.cursor_fill;
     cursor_scale = settings.cursor_scale;
     cursor_pack = settings.cursor_pack;
@@ -1159,27 +1176,34 @@ static bool is_run_name(const char* name) {
     return length > 4u && !strcmp(name + length - 4u, ".run");
 }
 
+/* The name an application is shown under: "edit.run" -> "edit". Built-in
+ * apps are installed as mos_<name>.run; they show as "Name". */
+static bool app_label(char* output, size_t capacity, const char* run_name) {
+    if (!is_run_name(run_name)) return false;
+    size_t name_length = strlen(run_name) - 4u;
+    const char* label = run_name;
+    if (!strncmp(run_name, "mos_", 4u) && name_length > 4u) {
+        label += 4;
+        name_length -= 4u;
+    }
+    if (!name_length || name_length >= capacity) return false;
+    memcpy(output, label, name_length);
+    output[name_length] = '\0';
+    if (label != run_name && output[0] >= 'a' && output[0] <= 'z')
+        output[0] = (char)(output[0] - 'a' + 'A');
+    return true;
+}
+
 static void add_desktop_app(const char* path, const char* run_name) {
     if (desktop_app_count >= MAX_DESKTOP_APPS ||
         !is_run_name(run_name) || !strcmp(run_name, "mosWM.run"))
         return;
     desktop_app_t* app = &desktop_apps[desktop_app_count];
     size_t path_length = strlen(path);
-    size_t name_length = strlen(run_name) - 4u;
     if (path_length >= sizeof(app->path) ||
-        !name_length || name_length >= sizeof(app->name))
+        !app_label(app->name, sizeof(app->name), run_name))
         return;
     memcpy(app->path, path, path_length + 1u);
-    /* Built-in apps are installed as mos_<name>.run; show them as "Name". */
-    const char* label = run_name;
-    if (!strncmp(run_name, "mos_", 4u) && name_length > 4u) {
-        label += 4;
-        name_length -= 4u;
-    }
-    memcpy(app->name, label, name_length);
-    app->name[name_length] = '\0';
-    if (label != run_name && app->name[0] >= 'a' && app->name[0] <= 'z')
-        app->name[0] = (char)(app->name[0] - 'a' + 'A');
     app->has_icon = read_bundle_icon(app->path, app->icon_pixels);
     desktop_app_count++;
 }
@@ -1231,6 +1255,81 @@ static void load_desktop_apps(void) {
     }
 }
 
+static bool name_has_extension(const char* name, const char* extension);
+static const char* path_name(const char* path);
+
+/* A shortcut is a small text file whose first line is the path it opens,
+ * for example "0:/programs/mos_edit.run". */
+static bool read_shortcut(const char* path, char* target, size_t capacity) {
+    long fd = (long)mos_syscall3(SYS_OPEN, (uint64_t)(uintptr_t)path,
+                                 SYS_O_RDONLY, 0);
+    if (fd < 0 || capacity < 4u) {
+        if (fd >= 0) mos_syscall3(SYS_CLOSE, (uint64_t)fd, 0, 0);
+        return false;
+    }
+    long got = (long)mos_syscall3(SYS_READ, (uint64_t)fd,
+        (uint64_t)(uintptr_t)target, capacity - 1u);
+    mos_syscall3(SYS_CLOSE, (uint64_t)fd, 0, 0);
+    if (got <= 0) return false;
+    size_t length = 0;
+    while (length < (size_t)got && target[length] != '\n' &&
+           target[length] != '\r' && target[length] != '\0')
+        length++;
+    while (length && target[length - 1u] == ' ') length--;
+    target[length] = '\0';
+    /* Only absolute paths, and never another shortcut. */
+    return length > 3u && target[1] == ':' && target[2] == '/' &&
+           !name_has_extension(target, SHORTCUT_EXTENSION);
+}
+
+static bool write_shortcut(const char* path, const char* target) {
+    char line[DESKTOP_APP_PATH_SIZE + 1u];
+    size_t length = strlen(target);
+    if (length + 1u >= sizeof(line)) return false;
+    memcpy(line, target, length);
+    line[length++] = '\n';
+    if (mos_syscall3(SYS_CREATE, (uint64_t)(uintptr_t)path,
+            (uint64_t)(uintptr_t)"text", (uint64_t)(uintptr_t)"txt") !=
+        SYS_SUCCESS)
+        return false;
+    long fd = (long)mos_syscall3(SYS_OPEN, (uint64_t)(uintptr_t)path,
+                                 SYS_O_RDWR, 0);
+    if (fd < 0) return false;
+    bool ok = (long)mos_syscall3(SYS_FWRITE, (uint64_t)fd,
+        (uint64_t)(uintptr_t)line, length) == (long)length;
+    mos_syscall3(SYS_CLOSE, (uint64_t)fd, 0, 0);
+    if (!ok) mos_syscall3(SYS_DELETE, (uint64_t)(uintptr_t)path, 0, 0);
+    return ok;
+}
+
+/* Name, target and icon of one Desktop folder item. */
+static void describe_desktop_file(desktop_file_t* item) {
+    size_t length = strlen(item->name);
+    item->target[0] = '\0';
+    item->target_type = item->type;
+    item->has_icon = false;
+    memcpy(item->label, item->name, length + 1u);
+    if (name_has_extension(item->name, SHORTCUT_EXTENSION) &&
+        item->type != SYSCALL_DIRENT_TYPE_DIR &&
+        read_shortcut(item->path, item->target, sizeof(item->target))) {
+        item->label[length - (sizeof(SHORTCUT_EXTENSION) - 1u)] = '\0';
+        if (mos_syscall3(SYS_IS_DIR, (uint64_t)(uintptr_t)item->target,
+                         0, 0) == 1u)
+            item->target_type = SYSCALL_DIRENT_TYPE_DIR;
+        else
+            item->target_type = is_run_name(item->target)
+                ? SYSCALL_DIRENT_TYPE_EXECUTABLE : SYSCALL_DIRENT_TYPE_FILE;
+        if (is_run_name(item->target))
+            item->has_icon = read_bundle_icon(item->target,
+                                              item->icon_pixels);
+        return;
+    }
+    if (item->type != SYSCALL_DIRENT_TYPE_DIR && is_run_name(item->name)) {
+        app_label(item->label, sizeof(item->label), item->name);
+        item->has_icon = read_bundle_icon(item->path, item->icon_pixels);
+    }
+}
+
 /* Re-reads the user's Desktop folder. Returns true (and redraws the
  * desktop) only when what is in it has changed. */
 static bool reload_desktop_files(void) {
@@ -1266,6 +1365,7 @@ static bool reload_desktop_files(void) {
         memcpy(item->name, entries[i].name, length);
         item->name[length] = '\0';
         item->type = entries[i].type;
+        describe_desktop_file(item);
         desktop_file_count++;
     }
     desktop_apps_generation++;
@@ -1711,7 +1811,7 @@ static moswm_file_icon_t icon_for_entry(uint32_t type, const char* name) {
         {".bmp", MOSWM_ICON_IMAGE}, {".png", MOSWM_ICON_IMAGE},
         {".jpg", MOSWM_ICON_IMAGE}, {".ico", MOSWM_ICON_IMAGE},
         {".thm", MOSWM_ICON_IMAGE}, {".wav", MOSWM_ICON_AUDIO},
-        {".mp3", MOSWM_ICON_AUDIO}, {".mp4", MOSWM_ICON_VIDEO},
+        {".mp3", MOSWM_ICON_AUDIO}, {".adi", MOSWM_ICON_AUDIO}, {".mp4", MOSWM_ICON_VIDEO},
         {".txt", MOSWM_ICON_TEXT}, {".md", MOSWM_ICON_TEXT},
         {".log", MOSWM_ICON_TEXT}, {".otf", MOSWM_ICON_TEXT},
         {".ttf", MOSWM_ICON_TEXT}, {".font", MOSWM_ICON_TEXT},
@@ -1723,7 +1823,7 @@ static moswm_file_icon_t icon_for_entry(uint32_t type, const char* name) {
         {".cfg", MOSWM_ICON_SETTINGS}, {".dat", MOSWM_ICON_SETTINGS},
         {".conf", MOSWM_ICON_SETTINGS},
         {".desc", MOSWM_ICON_SETTINGS}, {".cur", MOSWM_ICON_POINTER},
-        {".ani", MOSWM_ICON_POINTER}
+        {".ani", MOSWM_ICON_POINTER}, {SHORTCUT_EXTENSION, MOSWM_ICON_APP}
     };
     if (type == SYSCALL_DIRENT_TYPE_DIR) return MOSWM_ICON_FOLDER;
     for (uint32_t i = 0; i < sizeof(known) / sizeof(known[0]); i++)
@@ -2066,7 +2166,9 @@ static void browser_render(void) {
                     list_right - 56 - (show_kind ? 110 : 0), 1u);
         wm_text(48, y + 9, label, 0xFF273640u, 0, 1u);
         if (show_kind)
-            wm_text(list_right - 104, y + 9, kind_for_icon(icon),
+            wm_text(list_right - 104, y + 9,
+                    name_has_extension(entry->name, SHORTCUT_EXTENSION)
+                        ? "Shortcut" : kind_for_icon(icon),
                     0xFF7A8A95u, 0, 1u);
     }
     if (!browser_entry_count && visible_rows)
@@ -2215,14 +2317,25 @@ static void open_note(bool in_files, const char* message, bool is_error) {
 }
 
 /* Opens a file or folder from Files or the desktop: folders in Files, .qoi
- * images as the wallpaper, programs by running them and text files in the
- * bundled editor. */
+ * images as the wallpaper, programs by running them, .adi audio in the
+ * bundled player and text files in the bundled editor. */
 static void open_file(const char* path, bool executable, bool in_files) {
     if (fs_is_directory(path)) {
         browser_open(path);
         return;
     }
     const char* name = path_name(path);
+    if (name_has_extension(name, SHORTCUT_EXTENSION)) {
+        char target[BROWSER_PATH_SIZE];
+        if (!read_shortcut(path, target, sizeof(target)))
+            open_note(in_files, "This shortcut is broken", true);
+        else if (!fs_exists(target))
+            open_note(in_files, "The shortcut's target no longer exists",
+                      true);
+        else
+            open_file(target, false, in_files);
+        return;
+    }
     if (name_has_extension(name, ".qoi")) {
         set_wallpaper_image(path);
         return;
@@ -2231,6 +2344,18 @@ static void open_file(const char* path, bool executable, bool in_files) {
         if ((int64_t)mos_syscall3(SYS_EXEC,
                 (uint64_t)(uintptr_t)path, 0, 0) < 0)
             open_note(in_files, "Unable to run this item", true);
+        return;
+    }
+    if (name_has_extension(name, ".adi")) {
+        if (!fs_exists(MOSDESK_PLAYER_PATH)) {
+            open_note(in_files, "The audio player is not installed", true);
+            return;
+        }
+        const char* arguments[1] = {path};
+        if ((int64_t)mos_syscall3(SYS_EXEC,
+                (uint64_t)(uintptr_t)MOSDESK_PLAYER_PATH,
+                (uint64_t)(uintptr_t)arguments, 1u) < 0)
+            open_note(in_files, "Unable to open the audio player", true);
         return;
     }
     if (is_text_name(name) && fs_exists(MOSDESK_EDITOR_PATH)) {
@@ -2353,6 +2478,235 @@ static void fill_rounded_rect(int32_t x, int32_t y, int32_t width,
 }
 
 static uint32_t* wallpaper;
+
+/* --------------------------------------------------------------- Aero glass
+ *
+ * The "2000s Aero" style (Settings > Appearance > Window style) draws window
+ * frames, the panel and the launcher as tinted glass. Glass shows a blurred
+ * copy of the wallpaper (made once per wallpaper, so a partial repaint looks
+ * exactly like a full one) with a little of whatever is underneath, the
+ * accent colour as a tint and a glossy highlight on its upper part. */
+static uint32_t* glass_source;
+static uint32_t glass_generation = UINT32_MAX;
+
+static inline uint32_t mix_color(uint32_t from, uint32_t to, uint32_t t) {
+    uint32_t inverse = 255u - t;
+    return 0xFF000000u |
+        div255(((from >> 16) & 255u) * inverse + ((to >> 16) & 255u) * t) << 16 |
+        div255(((from >> 8) & 255u) * inverse + ((to >> 8) & 255u) * t) << 8 |
+        div255((from & 255u) * inverse + (to & 255u) * t);
+}
+
+/* One box-blur pass of `radius` along rows (step 1) or columns (step =
+ * width), from `source` into `target`. */
+static void box_blur_pass(uint32_t* target, const uint32_t* source,
+                          uint32_t lines, uint32_t length, size_t line_step,
+                          size_t step, uint32_t radius) {
+    uint32_t span = radius * 2u + 1u;
+    for (uint32_t line = 0; line < lines; line++) {
+        const uint32_t* in = source + line * line_step;
+        uint32_t* out = target + line * line_step;
+        uint32_t r = 0, g = 0, b = 0;
+        /* Edges repeat the first and last pixel. */
+        for (int32_t i = -(int32_t)radius; i <= (int32_t)radius; i++) {
+            uint32_t at = i < 0 ? 0u : (uint32_t)i >= length ? length - 1u
+                                                          : (uint32_t)i;
+            uint32_t c = in[at * step];
+            r += (c >> 16) & 255u;
+            g += (c >> 8) & 255u;
+            b += c & 255u;
+        }
+        for (uint32_t i = 0; i < length; i++) {
+            out[i * step] = 0xFF000000u | (r / span) << 16 |
+                            (g / span) << 8 | (b / span);
+            uint32_t leave = i < radius ? 0u : i - radius;
+            uint32_t enter = i + radius + 1u >= length ? length - 1u
+                                                       : i + radius + 1u;
+            uint32_t old = in[leave * step], add = in[enter * step];
+            r += ((add >> 16) & 255u) - ((old >> 16) & 255u);
+            g += ((add >> 8) & 255u) - ((old >> 8) & 255u);
+            b += (add & 255u) - (old & 255u);
+        }
+    }
+}
+
+/* How far row `row` of a rounded rectangle `height` tall with corner
+ * radius `r` is inset at each end. */
+static int32_t rounded_inset(int32_t row, int32_t height, int32_t r) {
+    int32_t from_edge = row < r ? row
+        : (row >= height - r ? height - 1 - row : r);
+    if (from_edge >= r) return 0;
+    int64_t dy2 = 2 * (int64_t)r - 2 * (int64_t)from_edge - 1;
+    int64_t span2 = 4 * (int64_t)r * r - dy2 * dy2;
+    int32_t inset = r - (int32_t)((isqrt_u64((uint64_t)span2) + 1u) / 2u);
+    return inset < 0 ? 0 : inset;
+}
+
+/* Keeps glass_source a blurred copy of the current wallpaper. */
+static void ensure_glass(void) {
+    if (ui_style != MOSDESK_UI_STYLE_AERO || !wallpaper ||
+        glass_generation == wallpaper_generation)
+        return;
+    size_t pixels = (size_t)display.width * display.height;
+    if (!glass_source) {
+        glass_source = (uint32_t*)wm_malloc(pixels * sizeof(uint32_t));
+        if (!glass_source) return;
+    }
+    uint32_t* scratch = (uint32_t*)wm_malloc(pixels * sizeof(uint32_t));
+    if (!scratch) return;
+    /* Two box passes each way come close to a Gaussian blur. */
+    box_blur_pass(scratch, wallpaper, display.height, display.width,
+                  display.width, 1u, 7u);
+    box_blur_pass(glass_source, scratch, display.width, display.height,
+                  1u, display.width, 7u);
+    box_blur_pass(scratch, glass_source, display.height, display.width,
+                  display.width, 1u, 7u);
+    box_blur_pass(glass_source, scratch, display.width, display.height,
+                  1u, display.width, 7u);
+    wm_free(scratch);
+    glass_generation = wallpaper_generation;
+}
+
+/* One row of glass from x0 to x1: `tint` at `tint_alpha` over the blurred
+ * wallpaper (with a quarter of what is already there), then `shine` of
+ * white. */
+static void glass_span(int32_t x0, int32_t x1, int32_t y, uint32_t tint,
+                       uint32_t tint_alpha, uint32_t shine) {
+    rect_t bounds = draw_bounds();
+    if (y < bounds.top || y >= bounds.bottom) return;
+    if (x0 < bounds.left) x0 = bounds.left;
+    if (x1 > bounds.right) x1 = bounds.right;
+    uint32_t* row = canvas + (size_t)y * display.width;
+    const uint32_t* blur = glass_source && glass_generation ==
+        wallpaper_generation ? glass_source + (size_t)y * display.width : NULL;
+    for (int32_t x = x0; x < x1; x++) {
+        uint32_t color = blur ? mix_color(row[x], blur[x], 190u) : row[x];
+        color = mix_color(color, tint, tint_alpha);
+        if (shine) color = mix_color(color, 0xFFFFFFFFu, shine);
+        row[x] = color;
+    }
+}
+
+/* A rounded glass panel, minus `hole` (left, top, right, bottom; NULL for
+ * none). The top `gloss_rows` rows shine with `gloss` fading to half; below
+ * them the glass keeps a faint sheen. */
+static void glass_rounded(int32_t x, int32_t y, int32_t width, int32_t height,
+                          uint32_t radius, uint32_t tint, uint32_t tint_alpha,
+                          uint32_t gloss, int32_t gloss_rows,
+                          const int32_t* hole) {
+    if (width <= 0 || height <= 0) return;
+    if (radius * 2u > (uint32_t)width) radius = (uint32_t)width / 2u;
+    if (radius * 2u > (uint32_t)height) radius = (uint32_t)height / 2u;
+    int32_t r = (int32_t)radius;
+    if (gloss_rows < 1) gloss_rows = 1;
+    for (int32_t row = 0; row < height; row++) {
+        int32_t inset = rounded_inset(row, height, r);
+        uint32_t shine = row < gloss_rows
+            ? gloss - gloss * (uint32_t)row / (2u * (uint32_t)gloss_rows)
+            : gloss / 6u;
+        int32_t left = x + inset, right = x + width - inset;
+        if (hole && y + row >= hole[1] && y + row < hole[3] &&
+            hole[0] < right && hole[2] > left) {
+            glass_span(left, hole[0], y + row, tint, tint_alpha, shine);
+            glass_span(hole[2], right, y + row, tint, tint_alpha, shine);
+        } else {
+            glass_span(left, right, y + row, tint, tint_alpha, shine);
+        }
+    }
+}
+
+/* A vertical gradient from `top` to `bottom` (alpha included) in a rounded
+ * rectangle. */
+static void fill_gradient_rounded(int32_t x, int32_t y, int32_t width,
+                                  int32_t height, uint32_t radius,
+                                  uint32_t top, uint32_t bottom) {
+    if (width <= 0 || height <= 0) return;
+    if (radius * 2u > (uint32_t)width) radius = (uint32_t)width / 2u;
+    if (radius * 2u > (uint32_t)height) radius = (uint32_t)height / 2u;
+    int32_t r = (int32_t)radius;
+    for (int32_t row = 0; row < height; row++) {
+        uint32_t t = height > 1 ? (uint32_t)(row * 255 / (height - 1)) : 0u;
+        uint32_t alpha = div255((top >> 24) * (255u - t) + (bottom >> 24) * t);
+        uint32_t color = (mix_color(top, bottom, t) & 0x00FFFFFFu) |
+                         alpha << 24;
+        int32_t inset = rounded_inset(row, height, r);
+        fill_rect(x + inset, y + row, width - 2 * inset, 1, color);
+    }
+}
+
+/* A one-pixel outline of a rounded rectangle. */
+static void stroke_rounded_rect(int32_t x, int32_t y, int32_t width,
+                                int32_t height, uint32_t radius,
+                                uint32_t color) {
+    if (width <= 0 || height <= 0) return;
+    if (radius * 2u > (uint32_t)width) radius = (uint32_t)width / 2u;
+    if (radius * 2u > (uint32_t)height) radius = (uint32_t)height / 2u;
+    int32_t r = (int32_t)radius;
+    for (int32_t row = 0; row < height; row++) {
+        int32_t inset = rounded_inset(row, height, r);
+        if (row == 0 || row == height - 1) {
+            fill_rect(x + inset, y + row, width - 2 * inset, 1, color);
+            continue;
+        }
+        /* Reach the neighbouring rows' edges so curves stay unbroken. */
+        int32_t above = rounded_inset(row - 1, height, r);
+        int32_t below = rounded_inset(row + 1, height, r);
+        int32_t reach = (above > below ? above : below) - inset;
+        if (reach < 1) reach = 1;
+        fill_rect(x + inset, y + row, reach, 1, color);
+        fill_rect(x + width - inset - reach, y + row, reach, 1, color);
+    }
+}
+
+/* An Aero push button: grey glass, or pale blue when hovered or default. */
+static void aero_button(int32_t x, int32_t y, int32_t width, int32_t height,
+                        bool hover, bool emphasis) {
+    stroke_rounded_rect(x, y, width, height, 3u,
+                        hover ? 0xFF3C7FB1u : emphasis ? 0xFF3C7FB1u
+                                                       : 0xFF707070u);
+    int32_t half = (height - 2) / 2;
+    if (hover) {
+        fill_gradient_rounded(x + 1, y + 1, width - 2, half, 2u,
+                              0xFFEAF6FDu, 0xFFD9F0FCu);
+        fill_gradient_rounded(x + 1, y + 1 + half, width - 2,
+                              height - 2 - half, 2u, 0xFFBEE6FDu, 0xFFA7D9F5u);
+    } else {
+        fill_gradient_rounded(x + 1, y + 1, width - 2, half, 2u,
+                              0xFFF2F2F2u, 0xFFEBEBEBu);
+        fill_gradient_rounded(x + 1, y + 1 + half, width - 2,
+                              height - 2 - half, 2u, 0xFFDDDDDDu, 0xFFCFCFCFu);
+    }
+    stroke_rounded_rect(x + 1, y + 1, width - 2, height - 2, 2u,
+                        emphasis && !hover ? 0x9048C6F4u : 0x70FFFFFFu);
+}
+
+/* Where the caption buttons are, in window coordinates (`right` is the
+ * width + 1). Modern: three 24 px round buttons. Aero: Windows 7 style,
+ * hanging from the top edge, with a wide close button. */
+typedef struct {
+    int32_t minimize_x, maximize_x, close_x;
+    int32_t small_width, close_width;
+} caption_layout_t;
+
+static caption_layout_t caption_layout(int32_t right) {
+    if (ui_style == MOSDESK_UI_STYLE_AERO)
+        return (caption_layout_t){right - 101, right - 75, right - 49, 26, 43};
+    return (caption_layout_t){right - 72, right - 48, right - 24, 24, 24};
+}
+
+/* The caption button under (x, y) in window coordinates: 0 none,
+ * 1 minimize, 2 maximize, 3 close. */
+static uint32_t caption_button_at(int32_t x, int32_t y, int32_t right) {
+    if (y < 0 || y >= (int32_t)TITLE_HEIGHT) return 0u;
+    caption_layout_t layout = caption_layout(right);
+    if (x >= layout.close_x && x < layout.close_x + layout.close_width)
+        return 3u;
+    if (x >= layout.maximize_x && x < layout.maximize_x + layout.small_width)
+        return 2u;
+    if (x >= layout.minimize_x && x < layout.minimize_x + layout.small_width)
+        return 1u;
+    return 0u;
+}
 
 static uint32_t lerp_channel(uint32_t from, uint32_t to, uint32_t t) {
     return (from * (255u - t) + to * t) / 255u;
@@ -2560,10 +2914,11 @@ static void paint_wallpaper(uint32_t* target) {
 static void draw_desktop_icons(void);
 static rect_t desktop_icon_highlight(uint32_t index);
 
-/* Desktop icons: 0 Home, 1 System, then the applications, then the items
- * of the user's Desktop folder. */
+/* Desktop icons: 0 Home, 1 System, then the items of the user's Desktop
+ * folder. Applications are not put on the desktop by themselves; the user
+ * adds them there (Add to desktop makes a shortcut in the Desktop folder). */
 static uint32_t desktop_icon_count(void) {
-    return 2u + desktop_app_count + desktop_file_count;
+    return MOSDESK_DESKTOP_ICON_FIRST_ITEM + desktop_file_count;
 }
 
 static void ensure_wallpaper(void) {
@@ -2732,11 +3087,7 @@ static click_action_t desktop_shortcut_at(int32_t px, int32_t py,
     if (index == UINT32_MAX) return CLICK_ACTION_NONE;
     if (index == 0u) return CLICK_ACTION_HOME;
     if (index == 1u) return CLICK_ACTION_SYSTEM;
-    if (index - 2u < desktop_app_count) {
-        if (app_index) *app_index = index - 2u;
-        return CLICK_ACTION_APPLICATION;
-    }
-    if (app_index) *app_index = index - 2u - desktop_app_count;
+    if (app_index) *app_index = index - MOSDESK_DESKTOP_ICON_FIRST_ITEM;
     return CLICK_ACTION_DESKTOP_FILE;
 }
 
@@ -2769,24 +3120,43 @@ static void draw_desktop_icons(void) {
             y - 16 >= bounds.bottom || y + 104 <= bounds.top)
             continue;
         if (hover_desktop_icon == i) {
-            fill_rounded_rect(x - 10, y - 4, 84, 94, 8, 0x30FFFFFFu);
-            fill_rounded_rect(x - 9, y - 3, 82, 92, 7, 0x18000000u);
+            if (ui_style == MOSDESK_UI_STYLE_AERO) {
+                /* Windows 7 style: pale blue glass with a light edge. */
+                fill_rounded_rect(x - 10, y - 4, 84, 94, 4, 0x90B9D7F3u);
+                fill_rounded_rect(x - 9, y - 3, 82, 92, 3, 0x38569DE5u);
+                fill_rounded_rect(x - 8, y - 2, 80, 44, 3, 0x22FFFFFFu);
+            } else {
+                fill_rounded_rect(x - 10, y - 4, 84, 94, 8, 0x30FFFFFFu);
+                fill_rounded_rect(x - 9, y - 3, 82, 92, 7, 0x18000000u);
+            }
         }
-        bool is_file = i >= 2u + desktop_app_count;
-        const desktop_file_t* file = is_file
-            ? &desktop_files[i - 2u - desktop_app_count] : NULL;
+        const desktop_file_t* file = i >= MOSDESK_DESKTOP_ICON_FIRST_ITEM
+            ? &desktop_files[i - MOSDESK_DESKTOP_ICON_FIRST_ITEM] : NULL;
         const char* name = i == 0u ? "Home" : i == 1u ? "System"
-            : file ? file->name : desktop_apps[i - 2u].name;
-        if (i < 2u) {
+            : file->label;
+        if (!file) {
             wm_icon(x, y, i == 0u ? MOSWM_ICON_HOME : MOSWM_ICON_COMPUTER, 64u);
-        } else if (file) {
+        } else if (file->has_icon) {
+            draw_custom_icon(file->icon_pixels, x + 8, y + 6, 48u);
+        } else if (file->target[0]) {
+            wm_icon(x + 4, y + 2,
+                    icon_for_entry(file->target_type, file->target), 56u);
+        } else {
             wm_icon(x + 4, y + 2, icon_for_entry(file->type, file->name),
                     56u);
-        } else if (desktop_apps[i - 2u].has_icon) {
-            draw_custom_icon(desktop_apps[i - 2u].icon_pixels, x + 8, y + 6,
-                             48u);
-        } else {
-            wm_icon(x + 4, y + 2, MOSWM_ICON_APP, 56u);
+        }
+        if (file && file->target[0]) {
+            /* Shortcut badge: a small arrow in the bottom-left corner. */
+            fill_rounded_rect(x + 6, y + 42, 17, 17, 3, 0xFFFFFFFFu);
+            stroke_rect(x + 6, y + 42, 17, 17, 0xFF8899A6u);
+            for (int32_t t = 0; t < 2; t++) {
+                draw_wallpaper_line(x + 10, y + 54 + t, x + 18, y + 46 + t,
+                                    0xFF2F6FB5u);
+                draw_wallpaper_line(x + 13 + t, y + 46, x + 19, y + 46,
+                                    0xFF2F6FB5u);
+                draw_wallpaper_line(x + 18 + t, y + 46, x + 18 + t, y + 52,
+                                    0xFF2F6FB5u);
+            }
         }
         char label[DESKTOP_APP_NAME_SIZE];
         fit_text_px(label, sizeof(label), name, 86, 2u);
@@ -2984,6 +3354,47 @@ static void composite_window(const syscall_window_info_t* info,
             (int32_t)CORNER_RADIUS};
     const int32_t* filled = entry && entry->pixels && entry->opaque
         ? content : NULL;
+    if (ui_style == MOSDESK_UI_STYLE_AERO) {
+        /* Glass frame: the title bar plus a border a few pixels wide that
+         * reaches outside the window (inside the shadow margin, so damage
+         * tracking still covers it). Its colour comes from the accent,
+         * whatever style the application asked for, as in Windows 7. */
+        const int32_t border = 4;
+        const int32_t glass_hole[4] = {
+            x + 1, y + (int32_t)TITLE_HEIGHT + 1,
+            x + 1 + (int32_t)info->width,
+            y + (int32_t)TITLE_HEIGHT + 1 + (int32_t)info->height -
+                (int32_t)CORNER_RADIUS};
+        fill_rounded_rect_around(x - border - 3, y - border, outer_width +
+                                 2 * border + 6, outer_height + 2 * border + 7,
+                                 12u, 0x14000000u, glass_hole);
+        fill_rounded_rect_around(x - border - 1, y - border + 1, outer_width +
+                                 2 * border + 2, outer_height + 2 * border + 2,
+                                 10u, window_focused ? 0x40000000u
+                                                     : 0x22000000u,
+                                 glass_hole);
+        glass_rounded(x - border, y - border, outer_width + 2 * border,
+                      outer_height + 2 * border, 8u,
+                      0xFF000000u | (accent_color & 0x00FFFFFFu),
+                      window_focused ? 0x78u : 0x48u,
+                      window_focused ? 0x58u : 0x30u,
+                      (int32_t)TITLE_HEIGHT / 2 + border, glass_hole);
+        /* Dark outer edge, light inner edge. */
+        stroke_rounded_rect(x - border, y - border, outer_width + 2 * border,
+                            outer_height + 2 * border, 8u,
+                            window_focused ? 0xB0182838u : 0x80304050u);
+        stroke_rounded_rect(x - border + 1, y - border + 1,
+                            outer_width + 2 * border - 2,
+                            outer_height + 2 * border - 2, 7u, 0x60FFFFFFu);
+        if (!filled)
+            fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT + 1,
+                      (int32_t)info->width, (int32_t)info->height,
+                      0xFF000000u | info->style.content_background);
+        stroke_rect(x - 1, y + (int32_t)TITLE_HEIGHT - 1, outer_width + 2,
+                    (int32_t)info->height + 4, 0x58FFFFFFu);
+        stroke_rect(x, y + (int32_t)TITLE_HEIGHT, outer_width,
+                    (int32_t)info->height + 2, 0xA0243447u);
+    } else {
     fill_rounded_rect_around(x - 4, y - 1, outer_width + 8,
                              outer_height + 10, CORNER_RADIUS + 4u,
                              0x16000000u, covered);
@@ -3010,6 +3421,7 @@ static void composite_window(const syscall_window_info_t* info,
               0x30000000u);
     fill_rect(x + (int32_t)CORNER_RADIUS, y + 1,
               outer_width - (int32_t)CORNER_RADIUS * 2, 1, 0x1CFFFFFFu);
+    }
 
     if (entry && entry->pixels) {
         int32_t content_x = x + 1;
@@ -3065,6 +3477,83 @@ static uint32_t opaque(uint32_t color) {
     return 0xFF000000u | (color & 0x00FFFFFFu);
 }
 
+/* Hovered caption button of the window under the pointer (0 none,
+ * 1 minimize, 2 maximize, 3 close), for the Aero highlight. */
+static uint32_t caption_hover_button;
+static uint32_t caption_hover_window;
+
+/* Windows 7 style title: icon, left-aligned dark text on a soft white glow,
+ * and the caption buttons hanging from the top edge. */
+static void draw_chrome_aero(const syscall_window_info_t* info,
+                             const cached_window_t* entry) {
+    int32_t x = (int32_t)info->x;
+    int32_t y = (int32_t)info->y;
+    bool focused = info->id == focused_id;
+    caption_layout_t layout = caption_layout((int32_t)info->width + 1);
+    int32_t min_x = x + layout.minimize_x;
+    int32_t max_x = x + layout.maximize_x;
+    int32_t close_x = x + layout.close_x;
+    int32_t bw = layout.small_width, cw = layout.close_width;
+    int32_t top = y - 3, bh = 20;
+
+    char title[SYSCALL_WINDOW_MAX_TITLE];
+    int32_t title_x = x + (entry && entry->has_icon ? 30 : 8);
+    fit_text_px(title, sizeof(title), info->title, min_x - title_x - 10, 2);
+    if (entry && entry->has_icon)
+        draw_custom_icon(entry->icon_pixels, x + 6, y + 4, 20u);
+    int32_t text_width = (int32_t)moswm_text_width(title, 2);
+    if (text_width > 0) {
+        /* The glow: two soft white pills behind the text. */
+        fill_rounded_rect(title_x - 10, y + 2, text_width + 20, 24, 12u,
+                          focused ? 0x30FFFFFFu : 0x1CFFFFFFu);
+        fill_rounded_rect(title_x - 5, y + 5, text_width + 10, 18, 9u,
+                          focused ? 0x40FFFFFFu : 0x22FFFFFFu);
+    }
+    wm_text(title_x, y + ((int32_t)TITLE_HEIGHT - 16) / 2, title,
+            focused ? 0xFF0B1A2Bu : 0xFF3F4F5Fu, 0, 2);
+
+    uint32_t hover = caption_hover_window == info->id
+        ? caption_hover_button : 0u;
+    /* Minimize and maximize share one glass strip; close is red. */
+    stroke_rounded_rect(min_x - 1, top, bw * 2 + 2, bh + 1, 4u, 0xC0203040u);
+    fill_gradient_rounded(min_x, top + 1, bw * 2, bh / 2, 0u,
+                          hover == 1u || hover == 2u ? 0xC0E8F4FFu
+                                                     : 0x90E4EEF6u,
+                          hover == 1u || hover == 2u ? 0xB0C6E2F8u
+                                                     : 0x70C3D3E0u);
+    fill_gradient_rounded(min_x, top + 1 + bh / 2, bw * 2, bh - bh / 2, 0u,
+                          0x60708A9Eu, 0x80A6C3D8u);
+    if (hover == 1u || hover == 2u)
+        fill_rect(hover == 1u ? min_x : max_x, top + 1, bw, bh,
+                  0x5040A8F0u);
+    fill_rect(max_x, top + 1, 1, bh, 0x90304050u);
+    stroke_rounded_rect(close_x - 1, top, cw + 1, bh + 1, 4u, 0xC0401010u);
+    fill_gradient_rounded(close_x, top + 1, cw - 1, bh / 2, 0u,
+                          hover == 3u ? 0xFFF0A08Cu : 0xFFE6A08Fu,
+                          hover == 3u ? 0xFFE45B47u : 0xFFD06451u);
+    fill_gradient_rounded(close_x, top + 1 + bh / 2, cw - 1, bh - bh / 2, 0u,
+                          hover == 3u ? 0xFFD3321Bu : 0xFFB72F1Bu,
+                          hover == 3u ? 0xFFF07A4Cu : 0xFFD0603Eu);
+    /* Glyphs, white with a dark outline. */
+    uint32_t glyph = 0xFFFFFFFFu, edge = 0xA0101820u;
+    int32_t gy = top + 6;
+    fill_rect(min_x + bw / 2 - 5, gy + 6, 10, 4, edge);
+    fill_rect(min_x + bw / 2 - 4, gy + 7, 8, 2, glyph);
+    stroke_rect(max_x + bw / 2 - 6, gy - 1, 12, 10, edge);
+    stroke_rect(max_x + bw / 2 - 5, gy, 10, 8, glyph);
+    fill_rect(max_x + bw / 2 - 5, gy + 1, 10, 2, glyph);
+    int32_t cx = close_x + cw / 2 - 1;
+    for (int32_t t = -1; t <= 1; t++) {
+        uint32_t c = t ? edge : glyph;
+        draw_wallpaper_line(cx - 4 + t, gy, cx + 4 + t, gy + 8, c);
+        draw_wallpaper_line(cx + 4 + t, gy, cx - 4 + t, gy + 8, c);
+    }
+    draw_wallpaper_line(cx - 4, gy, cx + 4, gy + 8, glyph);
+    draw_wallpaper_line(cx + 4, gy, cx - 4, gy + 8, glyph);
+    draw_wallpaper_line(cx - 3, gy, cx + 5, gy + 8, glyph);
+    draw_wallpaper_line(cx + 5, gy, cx - 3, gy + 8, glyph);
+}
+
 static void draw_chrome_text(const syscall_window_info_t* info,
                              const cached_window_t* entry) {
     int32_t x = (int32_t)info->x;
@@ -3076,6 +3565,10 @@ static void draw_chrome_text(const syscall_window_info_t* info,
     int32_t max_x = right - 48;
     int32_t min_x = right - 72;
     bool focused = info->id == focused_id;
+    if (ui_style == MOSDESK_UI_STYLE_AERO) {
+        draw_chrome_aero(info, entry);
+        return;
+    }
 
     /* Breeze-style centred title, dimmed when the window is not focused. */
     char title[SYSCALL_WINDOW_MAX_TITLE];
@@ -3304,11 +3797,21 @@ static void draw_mini_logo(int32_t x, int32_t y, uint32_t color) {
     }
 }
 
+/* How many launcher rows fit above the panel. */
+static uint32_t start_menu_row_limit(void) {
+    int32_t room = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 18 -
+                   (66 + 26 + 30 + 40);
+    int32_t rows = room / 38;
+    if (rows < 3) rows = 3;
+    if (rows > (int32_t)START_MENU_MAX_ROWS) rows = (int32_t)START_MENU_MAX_ROWS;
+    return (uint32_t)rows;
+}
+
 /* Launcher rows: three fixed entries, then the installed applications. */
 static uint32_t start_menu_rows(uint32_t* apps) {
     uint32_t count = 0;
-    for (uint32_t i = 0; i < desktop_app_count &&
-         count + 3u < START_MENU_MAX_ROWS; i++) {
+    uint32_t limit = start_menu_row_limit();
+    for (uint32_t i = 0; i < desktop_app_count && count + 3u < limit; i++) {
         if (!strcmp(desktop_apps[i].name, "mosdesk")) continue;
         if (apps) apps[count] = i;
         count++;
@@ -3322,6 +3825,8 @@ static void start_menu_bounds(int32_t* x, int32_t* y, int32_t* width,
     *width = 286;
     *height = 66 + 26 + 3 * 38 + (apps ? 30 + (int32_t)apps * 38 : 0) + 40;
     *x = 12;
+    if (*height > (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 18)
+        *height = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 18;
     *y = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 10 - *height;
 }
 
@@ -3353,6 +3858,33 @@ static void draw_taskbar(const syscall_window_info_t* windows,
     int32_t width = (int32_t)display.width;
     uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
 
+    bool aero = ui_style == MOSDESK_UI_STYLE_AERO;
+    if (aero) {
+        /* Glass panel: dark tinted glass, a bright top edge and a gloss on
+         * its upper half. */
+        glass_rounded(0, top, width, (int32_t)TASKBAR_HEIGHT, 0u,
+                      mix_color(accent, 0xFF000000u, 150u), 0xA0u, 0x30u,
+                      (int32_t)TASKBAR_HEIGHT / 2, NULL);
+        fill_rect(0, top, width, 1, 0xA0FFFFFFu);
+        fill_rect(0, top + 1, width, 1, 0x40000000u);
+        /* The start orb. */
+        bool lit = start_menu_open || hover_taskbar == 0u;
+        uint32_t orb = lit ? mix_color(accent, 0xFFFFFFFFu, 60u) : accent;
+        fill_rounded_rect(3, top + 3, 42, 42, 21u, 0x70000000u);
+        for (int32_t ring = 0; ring < 19; ring++) {
+            /* Darker at the rim, brighter towards the middle. */
+            uint32_t shade = ring < 10
+                ? mix_color(orb, 0xFF000000u, (uint32_t)(150 - ring * 15))
+                : mix_color(orb, 0xFFFFFFFFu, (uint32_t)((ring - 10) * 9));
+            fill_rounded_rect(5 + ring, top + 5 + ring, 38 - 2 * ring,
+                              38 - 2 * ring, (uint32_t)(19 - ring), shade);
+        }
+        fill_gradient_rounded(9, top + 7, 30, 17, 9u, 0xB8FFFFFFu,
+                              0x20FFFFFFu);
+        stroke_rounded_rect(5, top + 5, 38, 38, 19u, 0xC0FFFFFFu);
+        stroke_rounded_rect(4, top + 4, 40, 40, 20u, 0x90001020u);
+        draw_mini_logo(12, top + 12, 0xFFFFFFFFu);
+    } else {
     /* Panel: dark, slightly translucent, with a faint highlight edge. */
     fill_rect(0, top, width, (int32_t)TASKBAR_HEIGHT, 0xEC1B1E20u);
     fill_rect(0, top, width, 1, 0x2CFFFFFFu);
@@ -3364,6 +3896,7 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                                           : 0x26FFFFFFu);
     draw_mini_logo(12, top + 12, 0xFFEAF2F8u);
     if (start_menu_open) fill_rect(8, top + 45, 32, 2, accent);
+    }
 
     /* Task manager: one rounded entry per window, Plasma-style indicator. */
     int32_t x = 60;
@@ -3372,6 +3905,24 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         const syscall_window_info_t* info = &windows[i];
         bool focused = info->id == focused_id;
         bool minimized = (info->flags & SYSCALL_WINDOW_MINIMIZED) != 0;
+        if (aero) {
+            /* Windows 7 task buttons: framed glass, brighter when active. */
+            bool hovered = hover_taskbar == i + 1u;
+            if (focused || hovered || !minimized) {
+                fill_gradient_rounded(x, top + 4, 176, 40, 3u,
+                                      focused ? 0x70FFFFFFu
+                                              : hovered ? 0x50FFFFFFu
+                                                        : 0x28FFFFFFu,
+                                      focused ? 0x30FFFFFFu
+                                              : hovered ? 0x20FFFFFFu
+                                                        : 0x08FFFFFFu);
+                fill_rect(x + 2, top + 24, 172, 18,
+                          focused ? 0x30000000u : 0x18000000u);
+                stroke_rounded_rect(x, top + 4, 176, 40, 3u, 0xB0101820u);
+                stroke_rounded_rect(x + 1, top + 5, 174, 38, 2u,
+                                    focused ? 0x90FFFFFFu : 0x50FFFFFFu);
+            }
+        } else {
         if (focused)
             fill_rounded_rect(x, top + 5, 176, 38, 6, 0x38FFFFFFu);
         else if (hover_taskbar == i + 1u)
@@ -3381,6 +3932,7 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         else
             fill_rect(x + 78, top + 45, 20, 2,
                       minimized ? 0x50FFFFFFu : 0xA0FFFFFFu);
+        }
         char label[SYSCALL_WINDOW_MAX_TITLE];
         cached_window_t* entry = cache_for(info->id);
         bool has_icon = entry && entry->has_icon;
@@ -3391,7 +3943,8 @@ static void draw_taskbar(const syscall_window_info_t* windows,
             wm_icon(x + 8, top + 12, info->id == browser_window_id
                     ? MOSWM_ICON_FOLDER : MOSWM_ICON_APP, 24u);
         wm_text(x + 40, top + 16, label,
-                minimized ? 0xFF8C9BA6u : 0xFFEAF2F8u, 0, 2);
+                minimized ? 0xFF8C9BA6u : 0xFFEAF2F8u,
+                aero ? 0xA0000000u : 0u, 2);
         x += 180;
     }
     if (!count)
@@ -3415,9 +3968,10 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         int32_t center = width - 62;
         fill_rect(width - 124, top + 10, 1, 28, 0x24FFFFFFu);
         wm_text(center - (int32_t)moswm_text_width(hhmm, 2) / 2, top + 9,
-                hhmm, 0xFFEAF2F8u, 0, 2);
+                hhmm, 0xFFEAF2F8u, aero ? 0xA0000000u : 0u, 2);
         wm_text(center - (int32_t)moswm_text_width(date, 1) / 2, top + 30,
-                date, 0xFF9BAFBCu, 0, 1);
+                date, aero ? 0xFFDCE8F2u : 0xFF9BAFBCu,
+                aero ? 0xA0000000u : 0u, 1);
     }
 
     if (start_menu_open) {
@@ -3434,6 +3988,29 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         start_menu_bounds(&mx, &my, &mw, &mh);
         uint32_t apps[START_MENU_MAX_ROWS];
         uint32_t app_count = start_menu_rows(apps);
+        uint32_t row_text = 0xFFF2F6F9u, label_color = accent;
+        if (aero) {
+            /* Windows 7 style: a glass frame around a white list. */
+            fill_rounded_rect(mx - 5, my - 3, mw + 10, mh + 10, 12,
+                              0x2E000000u);
+            glass_rounded(mx, my, mw, mh, 8u, accent, 0x80u, 0x50u, 30,
+                          NULL);
+            stroke_rounded_rect(mx, my, mw, mh, 8u, 0xC0102030u);
+            stroke_rounded_rect(mx + 1, my + 1, mw - 2, mh - 2, 7u,
+                                0x70FFFFFFu);
+            fill_rect(mx + 8, my + 60, mw - 16, mh - 60 - 38, 0xFFFFFFFFu);
+            stroke_rect(mx + 7, my + 59, mw - 14, mh - 59 - 37,
+                        0xFF6A7F94u);
+            fill_rounded_rect(mx + 12, my + 12, 30, 30, 15, accent);
+            fill_gradient_rounded(mx + 15, my + 13, 24, 13, 7u, 0xA0FFFFFFu,
+                                  0x10FFFFFFu);
+            wm_text(mx + 20, my + 19, "M", 0xFFFFFFFFu, 0x80000000u, 2);
+            wm_text(mx + 52, my + 10, "MOSdesk", 0xFFFFFFFFu, 0xA0000000u, 2);
+            wm_text(mx + 52, my + 30, "Minimal-OS", 0xFFE4EEF6u,
+                    0xA0000000u, 1);
+            row_text = 0xFF1E2A36u;
+            label_color = 0xFF1E5AA0u;
+        } else {
         fill_rounded_rect(mx - 5, my - 3, mw + 10, mh + 10, 12, 0x2E000000u);
         fill_rounded_rect(mx, my, mw, mh, 8, 0xFF3A4249u);
         fill_rounded_rect(mx + 1, my + 1, mw - 2, mh - 2, 7, 0xFF1D2125u);
@@ -3442,13 +4019,19 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         wm_text(mx + 52, my + 10, "MOSdesk", 0xFFF2F6F9u, 0, 2);
         wm_text(mx + 52, my + 30, "Minimal-OS", 0xFF9BAFBCu, 0, 1);
         fill_rect(mx + 18, my + 56, mw - 36, 1, 0xFF353C42u);
-        wm_text(mx + 18, my + 72, "SYSTEM", accent, 0, 1);
+        }
+        wm_text(mx + 18, my + 72, "SYSTEM", label_color, 0, 1);
         if (app_count)
             wm_text(mx + 18, start_menu_row_y(3u) - 22, "APPLICATIONS",
-                    accent, 0, 1);
+                    label_color, 0, 1);
         for (uint32_t row = 0; row < 3u + app_count; row++) {
             int32_t row_y = start_menu_row_y(row);
-            if (hover_start_row == row)
+            if (hover_start_row == row && aero) {
+                fill_gradient_rounded(mx + 12, row_y, mw - 24, 36, 3u,
+                                      0xFFF2F8FEu, 0xFFC9E0F9u);
+                stroke_rounded_rect(mx + 12, row_y, mw - 24, 36, 3u,
+                                    0xFF7DA2CEu);
+            } else if (hover_start_row == row)
                 fill_rounded_rect(mx + 8, row_y, mw - 16, 36, 6,
                                   0x55000000u | (accent & 0xFFFFFFu));
             const char* label;
@@ -3468,14 +4051,15 @@ static void draw_taskbar(const syscall_window_info_t* windows,
             }
             char shown[DESKTOP_APP_NAME_SIZE];
             fit_text_px(shown, sizeof(shown), label, mw - 80, 2u);
-            wm_text(mx + 56, row_y + 10, shown, 0xFFF2F6F9u, 0, 2);
+            wm_text(mx + 56, row_y + 10, shown, row_text, 0, 2);
         }
-        fill_rect(mx + 18, my + mh - 34, mw - 36, 1, 0xFF353C42u);
+        if (!aero) fill_rect(mx + 18, my + mh - 34, mw - 36, 1, 0xFF353C42u);
         /* Fitted, because the fallback bitmap font is wider than the menu. */
-        char hint[40];
-        fit_text_px(hint, sizeof(hint), "Right-click icons for more actions",
+        char hint[48];
+        fit_text_px(hint, sizeof(hint), "Right-click an app to add it to the desktop",
                     mw - 36, 1);
-        wm_text(mx + 18, my + mh - 22, hint, 0xFF8A9AA6u, 0, 1);
+        wm_text(mx + 18, my + mh - 22, hint,
+                aero ? 0xFFF2F6F9u : 0xFF8A9AA6u, aero ? 0x90000000u : 0u, 1);
     }
     if (status_message[0])
         wm_text(8, 8, status_message, 0xFFFFE696u, 0xAA000000u, 2);
@@ -3519,6 +4103,7 @@ static void menu_show_for_item(click_action_t target, const char* path) {
     if (strlen(path) >= sizeof(menu_path)) return;
     menu_item_count = 0;
     bool editable = !path_is_protected(path);
+    bool on_desktop = user_desktop[0] && path_has_prefix(path, user_desktop);
     menu_add(MENU_ACTION_OPEN, "Open", MOSWM_ICON_FOLDER, false, true);
     if (target == CLICK_ACTION_APPLICATION ||
         target == CLICK_ACTION_DESKTOP_FILE)
@@ -3527,10 +4112,19 @@ static void menu_show_for_item(click_action_t target, const char* path) {
     if (name_has_extension(path, ".qoi"))
         menu_add(MENU_ACTION_SET_WALLPAPER, "Set as wallpaper",
                  MOSWM_ICON_IMAGE, false, true);
+    if ((target == CLICK_ACTION_APPLICATION ||
+         target == CLICK_ACTION_BROWSER_ENTRY) && !on_desktop &&
+        user_desktop[0])
+        menu_add(MENU_ACTION_ADD_TO_DESKTOP, "Add to desktop",
+                 MOSWM_ICON_DESKTOP, false, true);
     if (target == CLICK_ACTION_APPLICATION ||
         target == CLICK_ACTION_BROWSER_ENTRY ||
         target == CLICK_ACTION_DESKTOP_FILE) {
         menu_add(MENU_ACTION_COPY, "Copy", MOSWM_ICON_COPY, true, true);
+        menu_add(MENU_ACTION_COPY_TO, "Copy to...", MOSWM_ICON_COPY, false,
+                 true);
+        menu_add(MENU_ACTION_MOVE_TO, "Move to...", MOSWM_ICON_FOLDER, false,
+                 editable);
         menu_add(MENU_ACTION_RENAME, "Rename", MOSWM_ICON_EDIT, false,
                  editable);
         menu_add(MENU_ACTION_DELETE, "Delete", MOSWM_ICON_TRASH, false,
@@ -3578,25 +4172,49 @@ static void draw_context_menu(void) {
     if (!menu_open) return;
     uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
     int32_t height = menu_height();
+    bool aero = ui_style == MOSDESK_UI_STYLE_AERO;
+    if (aero) {
+        /* Windows 7 menu: light grey, an icon gutter, blue hover. */
+        fill_rect(menu_x + 3, menu_y + 3, MENU_WIDTH, height, 0x40000000u);
+        fill_rect(menu_x, menu_y, MENU_WIDTH, height, 0xFFF0F0F0u);
+        stroke_rect(menu_x, menu_y, MENU_WIDTH, height, 0xFF979797u);
+        fill_rect(menu_x + 2, menu_y + 2, 30, height - 4, 0xFFF1F1F1u);
+        fill_rect(menu_x + 32, menu_y + 2, 1, height - 4, 0xFFE2E3E3u);
+        fill_rect(menu_x + 33, menu_y + 2, 1, height - 4, 0xFFFFFFFFu);
+    } else {
     fill_rounded_rect(menu_x - 4, menu_y - 2, MENU_WIDTH + 8, height + 8, 11,
                       0x30000000u);
     fill_rounded_rect(menu_x, menu_y, MENU_WIDTH, height, 8, 0xFF3A4249u);
     fill_rounded_rect(menu_x + 1, menu_y + 1, MENU_WIDTH - 2, height - 2, 7,
                       0xFF1F2428u);
+    }
     int32_t y = menu_y + 6;
     for (uint32_t i = 0; i < menu_item_count; i++) {
         const menu_item_t* item = &menu_items[i];
         if (item->separator_before) {
-            fill_rect(menu_x + 12, y + 4, MENU_WIDTH - 24, 1, 0xFF3A4249u);
+            if (aero) {
+                fill_rect(menu_x + 36, y + 4, MENU_WIDTH - 40, 1, 0xFFE0E0E0u);
+                fill_rect(menu_x + 36, y + 5, MENU_WIDTH - 40, 1, 0xFFFFFFFFu);
+            } else {
+                fill_rect(menu_x + 12, y + 4, MENU_WIDTH - 24, 1, 0xFF3A4249u);
+            }
             y += 9;
         }
-        if (menu_hover == i)
+        if (menu_hover == i && aero) {
+            fill_gradient_rounded(menu_x + 3, y, MENU_WIDTH - 6,
+                                  MENU_ITEM_HEIGHT, 3u, 0xFFF2F8FEu,
+                                  0xFFDCEBFCu);
+            stroke_rounded_rect(menu_x + 3, y, MENU_WIDTH - 6,
+                                MENU_ITEM_HEIGHT, 3u, 0xFFAECFF7u);
+        } else if (menu_hover == i) {
             fill_rounded_rect(menu_x + 5, y, MENU_WIDTH - 10,
                               MENU_ITEM_HEIGHT, 5,
                               0x66000000u | (accent & 0x00FFFFFFu));
-        wm_icon(menu_x + 13, y + 6, item->icon, 18u);
+        }
+        wm_icon(menu_x + 8 + (aero ? 0 : 5), y + 6, item->icon, 18u);
         wm_text(menu_x + 42, y + 10, item->label,
-                item->enabled ? 0xFFF2F6F9u : 0xFF6F7C86u, 0, 1u);
+                aero ? (item->enabled ? 0xFF000000u : 0xFF8D8D8Du)
+                     : (item->enabled ? 0xFFF2F6F9u : 0xFF6F7C86u), 0, 1u);
         y += MENU_ITEM_HEIGHT;
     }
 }
@@ -3610,16 +4228,299 @@ static void dialog_bounds(int32_t* x, int32_t* y, int32_t* width,
     if (*y < 8) *y = 8;
 }
 
-static void draw_dialog(void) {
-    if (dialog_kind == DIALOG_NONE) return;
-    int32_t x, y, width, height;
-    dialog_bounds(&x, &y, &width, &height);
-    bool deleting = dialog_kind == DIALOG_DELETE;
+/* The box a dialog is drawn in: a dark rounded frame, or in the Aero
+ * style a glass frame around a light panel. */
+static void draw_dialog_frame(int32_t x, int32_t y, int32_t width,
+                              int32_t height) {
     fill_rect(0, 0, (int32_t)display.width, (int32_t)display.height,
               0x660A1218u);
+    if (ui_style == MOSDESK_UI_STYLE_AERO) {
+        fill_rounded_rect(x - 10, y - 6, width + 20, height + 18, 14,
+                          0x30000000u);
+        glass_rounded(x - 7, y - 7, width + 14, height + 14, 8u,
+                      0xFF000000u | (accent_color & 0x00FFFFFFu), 0x80u,
+                      0x50u, 20, NULL);
+        stroke_rounded_rect(x - 7, y - 7, width + 14, height + 14, 8u,
+                            0xC0102030u);
+        stroke_rounded_rect(x - 6, y - 6, width + 12, height + 12, 7u,
+                            0x70FFFFFFu);
+        fill_rect(x, y, width, height, 0xFFF0F0F0u);
+        stroke_rect(x - 1, y - 1, width + 2, height + 2, 0xA0243447u);
+        return;
+    }
     fill_rounded_rect(x - 4, y - 2, width + 8, height + 10, 14, 0x30000000u);
     fill_rounded_rect(x, y, width, height, 12, 0xFF3A4249u);
     fill_rounded_rect(x + 2, y + 2, width - 4, height - 4, 10, 0xFFF3F5F6u);
+}
+
+/* A dialog button: `primary` is the action, `danger` makes it red. */
+static void draw_dialog_button(int32_t x, int32_t y, int32_t width,
+                               int32_t height, const char* label,
+                               bool primary, bool danger, bool hover) {
+    bool aero = ui_style == MOSDESK_UI_STYLE_AERO;
+    uint32_t text = 0xFF34434Cu;
+    if (aero) {
+        aero_button(x, y, width, height, hover, primary);
+        text = 0xFF000000u;
+    } else if (primary) {
+        uint32_t base = danger ? 0xFFC8383Du : (accent_color | 0xFF000000u);
+        fill_rounded_rect(x, y, width, height, 7,
+                          hover ? mix_color(base, 0xFFFFFFFFu, 36u) : base);
+        text = 0xFFFFFFFFu;
+    } else {
+        fill_rounded_rect(x, y, width, height, 7,
+                          hover ? 0xFFD0D8DDu : 0xFFDCE2E6u);
+    }
+    wm_text(x + (width - (int32_t)moswm_text_width(label, 1u)) / 2,
+            y + (height - 12) / 2, label, text, 0, 1);
+}
+
+/* ------------------------------------------ Copy to / Move to folder picker
+ *
+ * A popup over the desktop that lists folders: click one to go into it,
+ * use Home, System and Up to move around, then Copy here / Move here. */
+#define PICKER_ROW_HEIGHT 30
+static bool picker_move;
+static char picker_dir[BROWSER_PATH_SIZE];
+static syscall_dirent_t* picker_folders;
+static uint32_t picker_folder_count;
+static uint32_t picker_scroll;
+static uint32_t picker_hover = UINT32_MAX;
+static uint32_t picker_tool_hover = UINT32_MAX;
+static uint32_t picker_button_hover;    /* 0 none, 1 cancel, 2 confirm */
+static uint32_t picker_generation;
+
+static void picker_bounds(int32_t* x, int32_t* y, int32_t* width,
+                          int32_t* height) {
+    int32_t work = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT;
+    *width = display.width > 532u ? 500 : (int32_t)display.width - 32;
+    *height = work > 472 ? 440 : work - 32;
+    *x = ((int32_t)display.width - *width) / 2;
+    *y = (work - *height) / 2;
+    if (*y < 8) *y = 8;
+}
+
+static int32_t picker_list_top(void) {
+    int32_t x, y, width, height;
+    picker_bounds(&x, &y, &width, &height);
+    return y + 118;
+}
+
+static uint32_t picker_visible_rows(void) {
+    int32_t x, y, width, height;
+    picker_bounds(&x, &y, &width, &height);
+    int32_t rows = (y + height - 64 - picker_list_top()) / PICKER_ROW_HEIGHT;
+    return rows > 0 ? (uint32_t)rows : 0u;
+}
+
+/* Lists the folders of `directory` (sorted by name). */
+static void picker_load(const char* directory) {
+    if (strlen(directory) >= sizeof(picker_dir)) return;
+    memmove(picker_dir, directory, strlen(directory) + 1u);
+    wm_free(picker_folders);
+    uint32_t count = 0;
+    picker_folders = fs_list(picker_dir, &count);
+    picker_folder_count = 0;
+    for (uint32_t i = 0; picker_folders && i < count; i++) {
+        if (picker_folders[i].hidden ||
+            picker_folders[i].type != SYSCALL_DIRENT_TYPE_DIR)
+            continue;
+        syscall_dirent_t moving = picker_folders[i];
+        uint32_t slot = picker_folder_count++;
+        while (slot > 0 &&
+               compare_names(picker_folders[slot - 1u].name, moving.name) > 0) {
+            picker_folders[slot] = picker_folders[slot - 1u];
+            slot--;
+        }
+        picker_folders[slot] = moving;
+    }
+    picker_scroll = 0;
+    picker_hover = UINT32_MAX;
+    picker_generation++;
+}
+
+static void picker_open(bool move, const char* source) {
+    char parent[BROWSER_PATH_SIZE];
+    if (!path_parent(parent, sizeof(parent), source)) strcpy(parent, "0:/");
+    open_dialog(DIALOG_PICK_FOLDER, source, "");
+    picker_move = move;
+    picker_button_hover = 0;
+    picker_tool_hover = UINT32_MAX;
+    picker_load(parent);
+}
+
+static void close_dialog(void) {
+    dialog_kind = DIALOG_NONE;
+    wm_free(picker_folders);
+    picker_folders = NULL;
+    picker_folder_count = 0;
+}
+
+static void picker_go_up(void) {
+    char parent[BROWSER_PATH_SIZE];
+    if (strcmp(picker_dir, "0:/") &&
+        path_parent(parent, sizeof(parent), picker_dir))
+        picker_load(parent);
+}
+
+/* Toolbar: Home, System, Up. */
+static int32_t picker_tool_x(uint32_t index) {
+    int32_t x, y, width, height;
+    picker_bounds(&x, &y, &width, &height);
+    return x + 20 + (int32_t)index * 38;
+}
+
+static uint32_t picker_tool_at(int32_t px, int32_t py) {
+    int32_t x, y, width, height;
+    picker_bounds(&x, &y, &width, &height);
+    if (py < y + 72 || py >= y + 106) return UINT32_MAX;
+    for (uint32_t i = 0; i < 3u; i++)
+        if (px >= picker_tool_x(i) && px < picker_tool_x(i) + 34) return i;
+    return UINT32_MAX;
+}
+
+static uint32_t picker_row_at(int32_t px, int32_t py) {
+    int32_t x, y, width, height;
+    picker_bounds(&x, &y, &width, &height);
+    int32_t top = picker_list_top();
+    if (px < x + 20 || px >= x + width - 20 || py < top) return UINT32_MAX;
+    uint32_t row = (uint32_t)(py - top) / PICKER_ROW_HEIGHT;
+    if (row >= picker_visible_rows() ||
+        picker_scroll + row >= picker_folder_count)
+        return UINT32_MAX;
+    return picker_scroll + row;
+}
+
+/* 1 Cancel, 2 Copy/Move here, 0 neither. */
+static uint32_t picker_button_at(int32_t px, int32_t py) {
+    int32_t x, y, width, height;
+    picker_bounds(&x, &y, &width, &height);
+    int32_t button_y = y + height - 50;
+    int32_t confirm_x = x + width - 20 - 132;
+    int32_t cancel_x = confirm_x - 10 - 100;
+    if (py < button_y || py >= button_y + 34) return 0u;
+    if (px >= confirm_x && px < confirm_x + 132) return 2u;
+    if (px >= cancel_x && px < cancel_x + 100) return 1u;
+    return 0u;
+}
+
+static void draw_picker(void) {
+    int32_t x, y, width, height;
+    picker_bounds(&x, &y, &width, &height);
+    bool aero = ui_style == MOSDESK_UI_STYLE_AERO;
+    uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
+    draw_dialog_frame(x, y, width, height);
+    wm_icon(x + 20, y + 16, picker_move ? MOSWM_ICON_FOLDER : MOSWM_ICON_COPY,
+            28u);
+    wm_text(x + 60, y + 14, picker_move ? "Move to..." : "Copy to...",
+            0xFF273640u, 0, 2);
+    char line[SYSCALL_DIRENT_NAME_SIZE + 24];
+    strcpy(line, "Choose a folder for ");
+    fit_text_px(line + 20, sizeof(line) - 20u, path_name(dialog_path),
+                width - 210, 1u);
+    wm_text(x + 60, y + 42, line, 0xFF667680u, 0, 1);
+
+    static const moswm_file_icon_t tools[3] = {
+        MOSWM_ICON_HOME, MOSWM_ICON_COMPUTER, MOSWM_ICON_UP};
+    for (uint32_t i = 0; i < 3u; i++) {
+        int32_t tx = picker_tool_x(i);
+        if (picker_tool_hover == i)
+            fill_rounded_rect(tx, y + 72, 34, 34, 6,
+                              aero ? 0xFFDCEBFCu : 0xFFD4E4EFu);
+        wm_icon(tx + 6, y + 78, tools[i], 22u);
+    }
+    int32_t field_x = picker_tool_x(3u) + 6;
+    int32_t field_width = x + width - 20 - field_x;
+    fill_rounded_rect(field_x, y + 74, field_width, 30, aero ? 2u : 6u,
+                      aero ? 0xFFABADB3u : 0xFFC9D3DAu);
+    fill_rounded_rect(field_x + 1, y + 75, field_width - 2, 28,
+                      aero ? 1u : 5u, 0xFFFFFFFFu);
+    char shown[BROWSER_PATH_SIZE];
+    fit_text_px(shown, sizeof(shown), picker_dir, field_width - 20, 1u);
+    wm_text(field_x + 10, y + 84, shown, 0xFF34434Cu, 0, 1u);
+
+    /* Folder list. */
+    int32_t top = picker_list_top();
+    uint32_t rows = picker_visible_rows();
+    int32_t list_height = (int32_t)rows * PICKER_ROW_HEIGHT + 4;
+    fill_rect(x + 18, top - 2, width - 36, list_height, 0xFFFFFFFFu);
+    stroke_rect(x + 18, top - 2, width - 36, list_height,
+                aero ? 0xFFABADB3u : 0xFFD2D9DEu);
+    for (uint32_t row = 0; row < rows; row++) {
+        uint32_t index = picker_scroll + row;
+        if (index >= picker_folder_count) break;
+        int32_t ry = top + (int32_t)row * PICKER_ROW_HEIGHT;
+        if (picker_hover == index) {
+            if (aero) {
+                fill_gradient_rounded(x + 21, ry, width - 42,
+                                      PICKER_ROW_HEIGHT - 2, 3u, 0xFFF2F8FEu,
+                                      0xFFDCEBFCu);
+                stroke_rounded_rect(x + 21, ry, width - 42,
+                                    PICKER_ROW_HEIGHT - 2, 3u, 0xFFAECFF7u);
+            } else {
+                fill_rounded_rect(x + 21, ry, width - 42,
+                                  PICKER_ROW_HEIGHT - 2, 5,
+                                  0x38000000u | (accent & 0x00FFFFFFu));
+            }
+        }
+        wm_icon(x + 30, ry + 4, MOSWM_ICON_FOLDER, 20u);
+        char label[SYSCALL_DIRENT_NAME_SIZE];
+        fit_text_px(label, sizeof(label), picker_folders[index].name,
+                    width - 110, 1u);
+        wm_text(x + 60, ry + 9, label, 0xFF273640u, 0, 1u);
+    }
+    if (!picker_folder_count)
+        wm_text(x + 32, top + 12, "No folders here", 0xFF7A8A95u, 0, 1u);
+    if (picker_folder_count > rows && rows) {
+        int32_t track = list_height - 8;
+        int32_t thumb = track * (int32_t)rows / (int32_t)picker_folder_count;
+        if (thumb < 20) thumb = 20;
+        uint32_t max_scroll = picker_folder_count - rows;
+        int32_t thumb_y = top + 2 + (track - thumb) * (int32_t)picker_scroll /
+                          (int32_t)max_scroll;
+        fill_rounded_rect(x + width - 28, thumb_y, 5, thumb, 2, 0xFFA9B8C3u);
+    }
+
+    if (dialog_error[0])
+        wm_text(x + 20, y + height - 72 + 4, dialog_error, 0xFFB43A32u, 0, 1);
+    int32_t button_y = y + height - 50;
+    int32_t confirm_x = x + width - 20 - 132;
+    int32_t cancel_x = confirm_x - 10 - 100;
+    draw_dialog_button(cancel_x, button_y, 100, 34, "Cancel", false, false,
+                       picker_button_hover == 1u);
+    draw_dialog_button(confirm_x, button_y, 132, 34,
+                       picker_move ? "Move here" : "Copy here", true, false,
+                       picker_button_hover == 2u);
+}
+
+static void picker_update_hover(void) {
+    picker_hover = picker_row_at(cursor_x, cursor_y);
+    picker_tool_hover = picker_tool_at(cursor_x, cursor_y);
+    picker_button_hover = picker_button_at(cursor_x, cursor_y);
+}
+
+static void picker_wheel(int32_t wheel) {
+    uint32_t rows = picker_visible_rows();
+    uint32_t max_scroll = picker_folder_count > rows
+        ? picker_folder_count - rows : 0u;
+    if (wheel < 0)
+        picker_scroll = picker_scroll + 3u > max_scroll ? max_scroll
+                                                        : picker_scroll + 3u;
+    else if (wheel > 0)
+        picker_scroll = picker_scroll > 3u ? picker_scroll - 3u : 0u;
+    picker_update_hover();
+}
+
+static void draw_dialog(void) {
+    if (dialog_kind == DIALOG_NONE) return;
+    if (dialog_kind == DIALOG_PICK_FOLDER) {
+        draw_picker();
+        return;
+    }
+    int32_t x, y, width, height;
+    dialog_bounds(&x, &y, &width, &height);
+    bool deleting = dialog_kind == DIALOG_DELETE;
+    draw_dialog_frame(x, y, width, height);
     wm_icon(x + 22, y + 18, deleting ? MOSWM_ICON_TRASH
             : dialog_kind == DIALOG_RENAME ? MOSWM_ICON_EDIT
             : MOSWM_ICON_NEWFOLDER, 28u);
@@ -3656,13 +4557,10 @@ static void draw_dialog(void) {
     int32_t cancel_x = confirm_x - 10 - 100;
     const char* confirm = deleting ? "Delete"
         : dialog_kind == DIALOG_RENAME ? "Rename" : "Create";
-    fill_rounded_rect(cancel_x, button_y, 100, 34, 7, 0xFFDCE2E6u);
-    wm_text(cancel_x + (100 - (int32_t)moswm_text_width("Cancel", 1u)) / 2,
-            button_y + 11, "Cancel", 0xFF34434Cu, 0, 1);
-    fill_rounded_rect(confirm_x, button_y, 112, 34, 7,
-                      deleting ? 0xFFC8383Du : (accent_color | 0xFF000000u));
-    wm_text(confirm_x + (112 - (int32_t)moswm_text_width(confirm, 1u)) / 2,
-            button_y + 11, confirm, 0xFFFFFFFFu, 0, 1);
+    draw_dialog_button(cancel_x, button_y, 100, 34, "Cancel", false, false,
+                       false);
+    draw_dialog_button(confirm_x, button_y, 112, 34, confirm, true, deleting,
+                       false);
 }
 
 static void reload_desktop_apps(void) {
@@ -3684,9 +4582,126 @@ static void after_file_change(const char* directory, const char* select) {
         reload_desktop_files();
 }
 
+/* Copies or moves dialog_path into the folder the picker shows. */
+static void picker_confirm(void) {
+    char parent[BROWSER_PATH_SIZE];
+    char target[BROWSER_PATH_SIZE];
+    const char* name = path_name(dialog_path);
+    if (!fs_exists(dialog_path)) {
+        strcpy(dialog_error, "The item no longer exists.");
+        return;
+    }
+    if (path_has_prefix(picker_dir, dialog_path)) {
+        strcpy(dialog_error, "A folder cannot go inside itself.");
+        return;
+    }
+    bool have_parent = path_parent(parent, sizeof(parent), dialog_path);
+    if (picker_move && have_parent && !strcmp(parent, picker_dir)) {
+        strcpy(dialog_error, "It is already in this folder.");
+        return;
+    }
+    if (picker_move) {
+        if (!path_join(target, sizeof(target), picker_dir, name)) {
+            strcpy(dialog_error, "That path is too long.");
+            return;
+        }
+        if (fs_exists(target)) {
+            strcpy(dialog_error, "That name is already used there.");
+            return;
+        }
+        if (!fs_rename(dialog_path, target)) {
+            strcpy(dialog_error, "Unable to move the item there.");
+            return;
+        }
+        if (path_has_prefix(clipboard_path, dialog_path))
+            clipboard_path[0] = '\0';
+    } else {
+        if (!unique_copy_path(target, sizeof(target), picker_dir, name)) {
+            strcpy(dialog_error, "Unable to choose a name for the copy.");
+            return;
+        }
+        if (!fs_copy_tree(dialog_path, target, 0)) {
+            if (fs_exists(target)) fs_delete_tree(target, 0);
+            strcpy(dialog_error, "Unable to copy the item there.");
+            return;
+        }
+    }
+    char destination[BROWSER_PATH_SIZE];
+    strcpy(destination, picker_dir);
+    bool moved = picker_move;
+    close_dialog();
+    if (moved && have_parent) after_file_change(parent, NULL);
+    after_file_change(destination, path_name(target));
+    browser_note(moved ? "Moved" : "Copied", false);
+}
+
+static void picker_click(void) {
+    uint32_t tool = picker_tool_at(cursor_x, cursor_y);
+    if (tool == 0u) {
+        picker_load(user_home);
+    } else if (tool == 1u) {
+        picker_load("0:/");
+    } else if (tool == 2u) {
+        picker_go_up();
+    } else {
+        uint32_t row = picker_row_at(cursor_x, cursor_y);
+        uint32_t button = picker_button_at(cursor_x, cursor_y);
+        char next[BROWSER_PATH_SIZE];
+        if (row != UINT32_MAX &&
+            path_join(next, sizeof(next), picker_dir,
+                      picker_folders[row].name))
+            picker_load(next);
+        else if (button == 1u)
+            close_dialog();
+        else if (button == 2u)
+            picker_confirm();
+        else
+            return;
+    }
+    dialog_error[0] = '\0';
+    picker_update_hover();
+}
+
+/* "Add to desktop": a shortcut to `path` in the user's Desktop folder. */
+static void add_to_desktop(const char* path) {
+    char name[SYSCALL_DIRENT_NAME_SIZE];
+    char link[BROWSER_PATH_SIZE];
+    bool from_files = browser_window_id && path_has_prefix(path, browser_path);
+    for (uint32_t i = 0; i < desktop_file_count; i++) {
+        if (!strcmp(desktop_files[i].target, path) ||
+            !strcmp(desktop_files[i].path, path)) {
+            open_note(from_files, "It is already on the desktop", false);
+            return;
+        }
+    }
+    const char* base = path_name(path);
+    if (!(fs_is_directory(path) ? false
+          : app_label(name, sizeof(name) - 4u, base))) {
+        size_t length = strlen(base);
+        if (length >= sizeof(name) - 4u) length = sizeof(name) - 5u;
+        memcpy(name, base, length);
+        name[length] = '\0';
+    }
+    memcpy(name + strlen(name), SHORTCUT_EXTENSION,
+           sizeof(SHORTCUT_EXTENSION));
+    if (!user_desktop[0] ||
+        !unique_copy_path(link, sizeof(link), user_desktop, name) ||
+        !write_shortcut(link, path)) {
+        open_note(from_files, "Unable to add it to the desktop", true);
+        return;
+    }
+    after_file_change(user_desktop, path_name(link));
+    /* The new icon says it on the desktop; Files gets a note. */
+    if (from_files) browser_note("Added to the desktop", false);
+}
+
 static void dialog_confirm(void) {
     char parent[BROWSER_PATH_SIZE];
     char target[BROWSER_PATH_SIZE];
+    if (dialog_kind == DIALOG_PICK_FOLDER) {
+        picker_confirm();
+        return;
+    }
     if (dialog_kind == DIALOG_DELETE) {
         if (!path_parent(parent, sizeof(parent), dialog_path) ||
             !fs_delete_tree(dialog_path, 0)) {
@@ -3743,11 +4758,15 @@ static void dialog_confirm(void) {
 
 static void dialog_key(const syscall_input_event_t* input) {
     if (input->key == 41u) {
-        dialog_kind = DIALOG_NONE;
+        close_dialog();
         return;
     }
     if (input->key == 40u) {
         dialog_confirm();
+        return;
+    }
+    if (dialog_kind == DIALOG_PICK_FOLDER) {
+        if (input->key == 42u) picker_go_up();
         return;
     }
     if (dialog_kind == DIALOG_DELETE) return;
@@ -3768,6 +4787,10 @@ static void dialog_key(const syscall_input_event_t* input) {
 }
 
 static void dialog_click(void) {
+    if (dialog_kind == DIALOG_PICK_FOLDER) {
+        picker_click();
+        return;
+    }
     int32_t x, y, width, height;
     dialog_bounds(&x, &y, &width, &height);
     int32_t button_y = y + height - 52;
@@ -3777,7 +4800,7 @@ static void dialog_click(void) {
     if (cursor_x >= confirm_x && cursor_x < confirm_x + 112)
         dialog_confirm();
     else if (cursor_x >= cancel_x && cursor_x < cancel_x + 100)
-        dialog_kind = DIALOG_NONE;
+        close_dialog();
 }
 
 /* Opens MOSdesk Settings, optionally on a named page ("wallpaper"). */
@@ -3851,6 +4874,13 @@ static void run_menu_action(menu_action_t action) {
             break;
         case MENU_ACTION_SETTINGS:
             open_settings(NULL);
+            break;
+        case MENU_ACTION_ADD_TO_DESKTOP:
+            add_to_desktop(menu_path);
+            break;
+        case MENU_ACTION_COPY_TO:
+        case MENU_ACTION_MOVE_TO:
+            picker_open(action == MENU_ACTION_MOVE_TO, menu_path);
             break;
         default:
             break;
@@ -4384,6 +5414,8 @@ static uint64_t compute_scene_signature(const syscall_window_info_t* windows,
     uint64_t hash = 0xCBF29CE484222325ull;
     hash = hash_u64(hash, auth_state);
     hash = hash_u64(hash, accent_color);
+    hash = hash_u64(hash, ui_style);
+    hash = hash_u64(hash, glass_generation);
     hash = hash_text(hash, status_message);
     if (auth_state != AUTH_NONE) {
         hash = hash_u64(hash, wallpaper_generation);
@@ -4404,11 +5436,19 @@ static uint64_t compute_scene_signature(const syscall_window_info_t* windows,
         if (entry && entry->has_icon) hash = hash_u64(hash, entry->icon_sum);
     }
     hash = hash_u64(hash, focused_id);
+    hash = hash_u64(hash, ((uint64_t)caption_hover_window << 8) |
+                          caption_hover_button);
     hash = hash_u64(hash, dialog_kind);
     if (dialog_kind != DIALOG_NONE) {
         hash = hash_text(hash, dialog_path);
         hash = hash_text(hash, dialog_text);
         hash = hash_text(hash, dialog_error);
+    }
+    if (dialog_kind == DIALOG_PICK_FOLDER) {
+        hash = hash_u64(hash, ((uint64_t)picker_generation << 32) |
+                              picker_scroll);
+        hash = hash_u64(hash, ((uint64_t)picker_hover << 32) |
+                              (picker_tool_hover << 4) | picker_button_hover);
     }
     return hash;
 }
@@ -4593,6 +5633,7 @@ static void collect_damage(const syscall_window_info_t* windows,
 
 static void render(const syscall_window_info_t* windows, uint64_t count) {
     ensure_wallpaper();
+    ensure_glass();
     rect_t desktop_changed[2];
     uint32_t desktop_changed_count = update_desktop_layer(desktop_changed);
     region_state_t regions[REGION_COUNT];
@@ -4669,7 +5710,7 @@ static void update_cursor_appearance(syscall_window_info_t* windows,
         int32_t y = cursor_y - (int32_t)under->y;
         int32_t right = (int32_t)under->width + 1;
         if (y < (int32_t)TITLE_HEIGHT) {
-            if (x >= right - 72) status = SYSCALL_CURSOR_HAND;
+            if (caption_button_at(x, y, right)) status = SYSCALL_CURSOR_HAND;
             else status = SYSCALL_CURSOR_MOVE;
             app_window = NULL;
         } else if ((under->flags & SYSCALL_WINDOW_RESIZABLE) &&
@@ -4903,7 +5944,7 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
                 y - (int32_t)TITLE_HEIGHT - 1, info);
             return;
         }
-        if (x >= right - 24) {
+        if (caption_button_at(x, y, right) == 3u) {
             last_click_valid = false;
             browser_close();
             return;
@@ -4911,11 +5952,12 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
     }
     last_click_valid = false;
     if (y < (int32_t)TITLE_HEIGHT) {
-        if (x >= right - 24) {
+        uint32_t button = caption_button_at(x, y, right);
+        if (button == 3u) {
             request_close(info);
-        } else if (x >= right - 48) {
+        } else if (button == 2u) {
             maximize_or_restore(info, cache_for(info->id));
-        } else if (x >= right - 72) {
+        } else if (button == 1u) {
             minimize_window(info);
         } else {
             start_move(info, false);
@@ -4927,9 +5969,21 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
 }
 
 static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
-    start_menu_open = false;
     pending_click_action = CLICK_ACTION_NONE;
     last_click_valid = false;
+    if (start_menu_open) {
+        /* Right-clicking an application in the launcher offers its menu,
+         * Add to desktop included. */
+        uint32_t row = start_menu_row_at(cursor_x, cursor_y);
+        uint32_t apps[START_MENU_MAX_ROWS];
+        uint32_t app_count = start_menu_rows(apps);
+        start_menu_open = false;
+        if (row != UINT32_MAX && row >= 3u && row - 3u < app_count) {
+            menu_show_for_item(CLICK_ACTION_APPLICATION,
+                               desktop_apps[apps[row - 3u]].path);
+            return;
+        }
+    }
     if ((uint32_t)cursor_y >= display.height - TASKBAR_HEIGHT) return;
     syscall_window_info_t* info =
         window_at(windows, count, cursor_x, cursor_y);
@@ -4971,6 +6025,10 @@ static void update_hover(syscall_window_info_t* windows, uint64_t count) {
     menu_hover = UINT32_MAX;
     browser_hover = UINT32_MAX;
     browser_tool_hover = UINT32_MAX;
+    caption_hover_button = 0;
+    caption_hover_window = 0;
+    if (auth_state == AUTH_NONE && dialog_kind == DIALOG_PICK_FOLDER)
+        picker_update_hover();
     if (auth_state != AUTH_NONE || dialog_kind != DIALOG_NONE) return;
     if (menu_open) {
         uint32_t item = menu_item_at(cursor_x, cursor_y);
@@ -5001,6 +6059,12 @@ static void update_hover(syscall_window_info_t* windows, uint64_t count) {
     if (!info) {
         hover_desktop_icon = desktop_icon_at(cursor_x, cursor_y);
         return;
+    }
+    if (ui_style == MOSDESK_UI_STYLE_AERO) {
+        caption_hover_button = caption_button_at(
+            cursor_x - (int32_t)info->x, cursor_y - (int32_t)info->y,
+            (int32_t)info->width + 1);
+        if (caption_hover_button) caption_hover_window = info->id;
     }
     if (info->id != browser_window_id) return;
     int32_t x = cursor_x - (int32_t)info->x - 1;
@@ -5197,6 +6261,10 @@ static void route_input(const syscall_input_event_t* input,
             on_mouse_up(windows, count, input->time_ms);
         if (right_pressed) on_right_down(windows, count);
     } else if (input->type == SYSCALL_INPUT_MOUSE_WHEEL) {
+        if (dialog_kind == DIALOG_PICK_FOLDER) {
+            picker_wheel(input->wheel);
+            return;
+        }
         if (menu_open || dialog_kind != DIALOG_NONE) return;
         syscall_window_info_t* under =
             window_at(windows, count, cursor_x, cursor_y);
@@ -5264,6 +6332,8 @@ static void cleanup(void) {
     desktop_layer = NULL;
     wm_free(wallpaper_source);
     wallpaper_source = NULL;
+    wm_free(glass_source);
+    glass_source = NULL;
     wm_free(font_regular_data);
     font_regular_data = NULL;
     wm_free(font_medium_data);

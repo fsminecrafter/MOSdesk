@@ -265,6 +265,69 @@ static void draw_theme_tile(int32_t x, int32_t y, uint32_t style) {
     }
 }
 
+static uint32_t mix_rgb(uint32_t from, uint32_t to, uint32_t t) {
+    uint32_t r = (((from >> 16) & 255u) * (255u - t) + ((to >> 16) & 255u) * t) / 255u;
+    uint32_t g = (((from >> 8) & 255u) * (255u - t) + ((to >> 8) & 255u) * t) / 255u;
+    uint32_t b = ((from & 255u) * (255u - t) + (to & 255u) * t) / 255u;
+    return 0xFF000000u | r << 16 | g << 8 | b;
+}
+
+/* A miniature window in the given style: MOSDESK_UI_STYLE_MODERN (flat dark
+ * title bar, round buttons) or MOSDESK_UI_STYLE_AERO (tinted glass frame,
+ * glossy title, red close button). */
+static void draw_style_tile(int32_t x, int32_t y, uint32_t style) {
+    uint32_t accent = preferences.accent_color;
+    /* Desktop behind the window. */
+    for (int32_t row = 0; row < (int32_t)THUMB_HEIGHT; row++)
+        fill_rect(x, y + row, (int32_t)THUMB_WIDTH, 1,
+                  mix_rgb(0xFF1C4F7Au, 0xFF5FA3C9u,
+                          (uint32_t)(row * 255 / (int32_t)THUMB_HEIGHT)));
+    int32_t wx = x + 12, wy = y + 8, ww = 72, wh = 46;
+    if (style == MOSDESK_UI_STYLE_AERO) {
+        /* Glass frame with a gloss on the upper half of the title. */
+        for (int32_t row = 0; row < wh; row++) {
+            uint32_t glass = mix_rgb(mix_rgb(0xFF3C78A8u, accent, 120u),
+                                     0xFFFFFFFFu,
+                                     row < 7 ? 120u - (uint32_t)row * 8u : 40u);
+            fill_rect(wx, wy + row, ww, 1, glass);
+        }
+        stroke_rect(wx, wy, ww, wh, 1, 0xFF1D3247u);
+        stroke_rect(wx + 1, wy + 1, ww - 2, wh - 2, 1, 0xFFCFE3F2u);
+        fill_rect(wx + 4, wy + 14, ww - 8, wh - 18, 0xFFF0F0F0u);
+        stroke_rect(wx + 3, wy + 13, ww - 6, wh - 16, 1, 0xFF4A6378u);
+        fill_rect(wx + 6, wy + 5, 22, 4, 0xFF13263Au);
+        /* Minimize/maximize strip and the red close button. */
+        fill_rect(wx + ww - 33, wy + 1, 14, 8, 0xFFB8CEDEu);
+        stroke_rect(wx + ww - 33, wy + 1, 14, 8, 1, 0xFF34495Cu);
+        fill_rect(wx + ww - 19, wy + 1, 15, 8, 0xFFC9452Eu);
+        stroke_rect(wx + ww - 19, wy + 1, 15, 8, 1, 0xFF4A1A12u);
+        fill_rect(wx + ww - 13, wy + 4, 3, 3, 0xFFFFFFFFu);
+    } else {
+        fill_rect(wx, wy, ww, wh, 0xFF536773u);
+        fill_rect(wx + 1, wy + 1, ww - 2, 12, 0xFF263945u);
+        fill_rect(wx + 1, wy + 13, ww - 2, wh - 14, 0xFFF3F5F6u);
+        fill_rect(wx + 24, wy + 5, 24, 3, 0xFFF4F7F8u);
+        for (int32_t i = 0; i < 3; i++)
+            fill_rect(wx + ww - 10 - i * 8, wy + 4, 5, 5,
+                      i ? 0xFF8EA1AEu : accent);
+    }
+    /* A few lines of "content". */
+    for (int32_t i = 0; i < 3; i++)
+        fill_rect(wx + 9, wy + 20 + i * 7, 30 + (i % 2) * 18, 3, 0xFFB6C2CBu);
+    /* The panel along the bottom. */
+    if (style == MOSDESK_UI_STYLE_AERO) {
+        fill_rect(x, y + (int32_t)THUMB_HEIGHT - 6, (int32_t)THUMB_WIDTH, 6,
+                  mix_rgb(0xFF1B3550u, accent, 60u));
+        fill_rect(x, y + (int32_t)THUMB_HEIGHT - 6, (int32_t)THUMB_WIDTH, 1,
+                  0xFFC6DCEBu);
+        fill_rect(x + 2, y + (int32_t)THUMB_HEIGHT - 6, 6, 6,
+                  mix_rgb(accent, 0xFFFFFFFFu, 70u));
+    } else {
+        fill_rect(x, y + (int32_t)THUMB_HEIGHT - 6, (int32_t)THUMB_WIDTH, 6,
+                  0xFF1B1E20u);
+    }
+}
+
 static void draw_photo_tile(int32_t x, int32_t y,
                             const wallpaper_photo_t* photo) {
     if (!photo->has_thumb) {
@@ -297,8 +360,10 @@ static int32_t tile_rows(uint32_t tiles) {
 }
 
 /* Vertical layout of the Appearance page, before scrolling is applied: the
- * accent swatches, then the wallpaper gallery (themes, photos, photo fit). */
-static int32_t accent_y(void) { return 96; }
+ * window style, the accent swatches, then the wallpaper gallery (themes,
+ * photos, photo fit). */
+static int32_t style_y(void) { return 96; }
+static int32_t accent_y(void) { return style_y() + TILE_PITCH_Y + 46; }
 static int32_t wallpaper_themes_y(void) { return accent_y() + 102; }
 static int32_t wallpaper_photos_y(void) {
     return wallpaper_themes_y() + tile_rows(6u) * TILE_PITCH_Y + 34;
@@ -360,6 +425,15 @@ static void draw_appearance_page(void) {
     uint32_t columns = tile_columns();
     bool using_photo = preferences.wallpaper_path[0] != '\0';
 
+    static const char* const style_names[2] = {"Modern", "2000s Aero"};
+    draw_text(left, style_y() - 33 - scroll, "Window style", 0xFF34434Cu,
+              true);
+    for (uint32_t i = 0; i < 2u; i++) {
+        int32_t x = left + (int32_t)i * TILE_PITCH_X;
+        int32_t y = style_y() - scroll;
+        draw_style_tile(x, y, i);
+        draw_tile_frame(x, y, preferences.ui_style == i, style_names[i]);
+    }
     draw_text(left, accent_y() - 33 - scroll, "Desktop accent",
               0xFF34434Cu, true);
     for (uint32_t i = 0; i < 6u; i++) {
@@ -448,6 +522,13 @@ static bool appearance_page_click(int32_t x, int32_t y) {
     int32_t page_y = y + appearance_scroll;
     uint32_t columns = tile_columns();
     if (y < CONTENT_TOP || x < left) return false;
+    if (page_y >= style_y() && page_y < style_y() + (int32_t)THUMB_HEIGHT + 20) {
+        int32_t index = (x - left) / TILE_PITCH_X;
+        if (index >= 2 || x - left - index * TILE_PITCH_X >= (int32_t)THUMB_WIDTH)
+            return false;
+        preferences.ui_style = (uint32_t)index;
+        return true;
+    }
     if (page_y >= accent_y() - 4 && page_y < accent_y() + 36) {
         int32_t index = (x - left) / 50;
         if (index >= 6) return false;
