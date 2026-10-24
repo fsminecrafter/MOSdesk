@@ -74,9 +74,6 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define MENU_MAX_ITEMS 10u
 #define MENU_WIDTH 204
 #define MENU_ITEM_HEIGHT 30
-/* Three fixed launcher rows plus every application; fewer are shown when
- * the screen is too short (start_menu_row_limit). */
-#define START_MENU_MAX_ROWS (3u + MAX_DESKTOP_APPS)
 #define SHORTCUT_EXTENSION ".lnk"
 #define FILE_TREE_MAX_DEPTH 6u
 #define FILE_COPY_CHUNK (64u * 1024u)
@@ -2435,6 +2432,69 @@ static uint32_t isqrt_u64(uint64_t value) {
     return (uint32_t)result;
 }
 
+/* ------------------------------------------------- anti-aliased corners
+ *
+ * How much of each pixel of a corner square lies inside the rounded corner,
+ * 0-255, from 4x4 samples per pixel. aa_corner(r)[fy * r + fx] is the pixel
+ * fx columns and fy rows in from the corner's outer edges. Built once per
+ * radius. */
+#define AA_MAX_RADIUS 64
+static uint8_t* aa_tables[AA_MAX_RADIUS + 1];
+
+static const uint8_t* aa_corner(int32_t r) {
+    if (r <= 0 || r > AA_MAX_RADIUS) return NULL;
+    if (aa_tables[r]) return aa_tables[r];
+    uint8_t* table = (uint8_t*)wm_malloc((size_t)r * (size_t)r);
+    if (!table) return NULL;
+    int64_t limit = (int64_t)(8 * r) * (8 * r);
+    for (int32_t fy = 0; fy < r; fy++) {
+        for (int32_t fx = 0; fx < r; fx++) {
+            uint32_t inside = 0;
+            for (int32_t j = 0; j < 4; j++) {
+                int64_t dy = 8 * r - (8 * fy + 2 * j + 1);
+                for (int32_t i = 0; i < 4; i++) {
+                    int64_t dx = 8 * r - (8 * fx + 2 * i + 1);
+                    if (dx * dx + dy * dy <= limit) inside++;
+                }
+            }
+            table[fy * r + fx] = (uint8_t)(inside * 255u / 16u);
+        }
+    }
+    aa_tables[r] = table;
+    return table;
+}
+
+/* `color` with its alpha scaled by `coverage` (0-255). */
+static inline uint32_t aa_scale(uint32_t color, uint32_t coverage) {
+    return (color & 0x00FFFFFFu) |
+           ((((color >> 24) * coverage + 127u) / 255u) << 24);
+}
+
+/* Row `row` of a rounded rectangle `height` tall: how many rows in from
+ * the nearer of its top and bottom edge (r or more: outside the corners). */
+static inline int32_t aa_row_from_edge(int32_t row, int32_t height, int32_t r) {
+    return row < r ? row : (row >= height - r ? height - 1 - row : r);
+}
+
+/* One row of a filled rounded rectangle, edge pixels blended by coverage. */
+static void aa_fill_row(int32_t x, int32_t y, int32_t width, int32_t row,
+                        int32_t height, int32_t r, uint32_t color) {
+    int32_t from_edge = aa_row_from_edge(row, height, r);
+    const uint8_t* table = from_edge < r ? aa_corner(r) : NULL;
+    if (!table) {
+        fill_rect(x, y + row, width, 1, color);
+        return;
+    }
+    const uint8_t* line = table + from_edge * r;
+    for (int32_t c = 0; c < r; c++) {
+        if (!line[c]) continue;
+        uint32_t shade = line[c] == 255u ? color : aa_scale(color, line[c]);
+        fill_rect(x + c, y + row, 1, 1, shade);
+        fill_rect(x + width - 1 - c, y + row, 1, 1, shade);
+    }
+    fill_rect(x + r, y + row, width - 2 * r, 1, color);
+}
+
 /* Each pixel is painted exactly once, so translucent colours stay even. */
 /* A rounded rectangle, minus the pixels inside `hole` (left, top, right,
  * bottom; NULL for none). Window shadows use it to skip the area the window
@@ -2450,6 +2510,11 @@ static void fill_rounded_rect_around(int32_t x, int32_t y, int32_t width,
         return;
     }
     int32_t r = (int32_t)radius;
+    if (!hole && r <= AA_MAX_RADIUS) {
+        for (int32_t row = 0; row < height; row++)
+            aa_fill_row(x, y, width, row, height, r, color);
+        return;
+    }
     for (int32_t row = 0; row < height; row++) {
         int32_t inset = 0;
         int32_t from_edge = row < r ? row : (row >= height - r ? height - 1 - row : r);
@@ -2587,6 +2652,22 @@ static void glass_span(int32_t x0, int32_t x1, int32_t y, uint32_t tint,
     }
 }
 
+/* One glass pixel blended over what is there by `coverage` (0-255). */
+static void glass_pixel(int32_t px, int32_t py, uint32_t tint,
+                        uint32_t tint_alpha, uint32_t shine, uint32_t coverage,
+                        const int32_t* hole) {
+    if (hole && py >= hole[1] && py < hole[3] && px >= hole[0] && px < hole[2])
+        return;
+    rect_t bounds = draw_bounds();
+    if (px < bounds.left || py < bounds.top || px >= bounds.right ||
+        py >= bounds.bottom)
+        return;
+    uint32_t* at = canvas + (size_t)py * display.width + px;
+    uint32_t before = *at;
+    glass_span(px, px + 1, py, tint, tint_alpha, shine);
+    if (coverage < 255u) *at = mix_color(before, *at, coverage);
+}
+
 /* A rounded glass panel, minus `hole` (left, top, right, bottom; NULL for
  * none). The top `gloss_rows` rows shine with `gloss` fading to half; below
  * them the glass keeps a faint sheen. */
@@ -2599,11 +2680,25 @@ static void glass_rounded(int32_t x, int32_t y, int32_t width, int32_t height,
     if (radius * 2u > (uint32_t)height) radius = (uint32_t)height / 2u;
     int32_t r = (int32_t)radius;
     if (gloss_rows < 1) gloss_rows = 1;
+    const uint8_t* table = r <= AA_MAX_RADIUS ? aa_corner(r) : NULL;
     for (int32_t row = 0; row < height; row++) {
         int32_t inset = rounded_inset(row, height, r);
         uint32_t shine = row < gloss_rows
             ? gloss - gloss * (uint32_t)row / (2u * (uint32_t)gloss_rows)
             : gloss / 6u;
+        int32_t from_edge = aa_row_from_edge(row, height, r);
+        if (table && from_edge < r) {
+            /* Corner rows: whole glass in the middle, blended edges. */
+            const uint8_t* line = table + from_edge * r;
+            for (int32_t c = 0; c < r; c++) {
+                if (!line[c]) continue;
+                glass_pixel(x + c, y + row, tint, tint_alpha, shine, line[c],
+                            hole);
+                glass_pixel(x + width - 1 - c, y + row, tint, tint_alpha,
+                            shine, line[c], hole);
+            }
+            inset = r;
+        }
         int32_t left = x + inset, right = x + width - inset;
         if (hole && y + row >= hole[1] && y + row < hole[3] &&
             hole[0] < right && hole[2] > left) {
@@ -2629,8 +2724,7 @@ static void fill_gradient_rounded(int32_t x, int32_t y, int32_t width,
         uint32_t alpha = div255((top >> 24) * (255u - t) + (bottom >> 24) * t);
         uint32_t color = (mix_color(top, bottom, t) & 0x00FFFFFFu) |
                          alpha << 24;
-        int32_t inset = rounded_inset(row, height, r);
-        fill_rect(x + inset, y + row, width - 2 * inset, 1, color);
+        aa_fill_row(x, y, width, row, height, r, color);
     }
 }
 
@@ -2642,6 +2736,29 @@ static void stroke_rounded_rect(int32_t x, int32_t y, int32_t width,
     if (radius * 2u > (uint32_t)width) radius = (uint32_t)width / 2u;
     if (radius * 2u > (uint32_t)height) radius = (uint32_t)height / 2u;
     int32_t r = (int32_t)radius;
+    const uint8_t* outer = r >= 2 && r <= AA_MAX_RADIUS ? aa_corner(r) : NULL;
+    const uint8_t* inner = outer ? aa_corner(r - 1) : NULL;
+    if (outer && inner) {
+        /* Corners: the outer rounded shape minus the inner one, 1 px in. */
+        for (int32_t fy = 0; fy < r; fy++) {
+            for (int32_t fx = 0; fx < r; fx++) {
+                int32_t cover = outer[fy * r + fx];
+                if (fx >= 1 && fy >= 1)
+                    cover -= inner[(fy - 1) * (r - 1) + (fx - 1)];
+                if (cover <= 0) continue;
+                uint32_t shade = aa_scale(color, (uint32_t)cover);
+                fill_rect(x + fx, y + fy, 1, 1, shade);
+                fill_rect(x + width - 1 - fx, y + fy, 1, 1, shade);
+                fill_rect(x + fx, y + height - 1 - fy, 1, 1, shade);
+                fill_rect(x + width - 1 - fx, y + height - 1 - fy, 1, 1, shade);
+            }
+        }
+        fill_rect(x + r, y, width - 2 * r, 1, color);
+        fill_rect(x + r, y + height - 1, width - 2 * r, 1, color);
+        fill_rect(x, y + r, 1, height - 2 * r, color);
+        fill_rect(x + width - 1, y + r, 1, height - 2 * r, color);
+        return;
+    }
     for (int32_t row = 0; row < height; row++) {
         int32_t inset = rounded_inset(row, height, r);
         if (row == 0 || row == height - 1) {
@@ -3797,56 +3914,162 @@ static void draw_mini_logo(int32_t x, int32_t y, uint32_t color) {
     }
 }
 
-/* How many launcher rows fit above the panel. */
-static uint32_t start_menu_row_limit(void) {
-    int32_t room = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 18 -
-                   (66 + 26 + 30 + 40);
-    int32_t rows = room / 38;
-    if (rows < 3) rows = 3;
-    if (rows > (int32_t)START_MENU_MAX_ROWS) rows = (int32_t)START_MENU_MAX_ROWS;
-    return (uint32_t)rows;
+/* Launcher: a header, pinned rows (Files, Settings, Terminal), then every
+ * other entry A-Z under letter headings. Only the A-Z list scrolls. */
+#define LAUNCHER_ROW 38
+#define LAUNCHER_HEADING 24
+#define LAUNCHER_TOP (66 + 26)      /* header + "SYSTEM" label */
+#define LAUNCHER_LIST_GAP 30        /* "APPLICATIONS" label */
+#define LAUNCHER_FOOT 40
+#define LAUNCHER_MAX_ITEMS (4u + MAX_DESKTOP_APPS)
+
+typedef enum {
+    LAUNCHER_FILES,
+    LAUNCHER_SETTINGS,
+    LAUNCHER_WALLPAPER,
+    LAUNCHER_APP
+} launcher_kind_t;
+
+typedef struct {
+    launcher_kind_t kind;
+    uint32_t app;          /* desktop_apps index, LAUNCHER_APP only */
+    char heading;          /* first entry of its letter: the letter, else 0 */
+    int32_t offset;        /* list items: top of the row inside the list */
+} launcher_item_t;
+
+static launcher_item_t launcher_items[LAUNCHER_MAX_ITEMS];
+static uint32_t launcher_pinned;   /* items[0 .. pinned-1] */
+static uint32_t launcher_count;
+static int32_t launcher_list_height;
+static int32_t launcher_scroll;    /* pixels the A-Z list is scrolled */
+
+static const char* launcher_label(const launcher_item_t* item) {
+    switch (item->kind) {
+    case LAUNCHER_FILES: return "Files";
+    case LAUNCHER_SETTINGS: return "Settings";
+    case LAUNCHER_WALLPAPER: return "Wallpaper";
+    default: return desktop_apps[item->app].name;
+    }
 }
 
-/* Launcher rows: three fixed entries, then the installed applications. */
-static uint32_t start_menu_rows(uint32_t* apps) {
-    uint32_t count = 0;
-    uint32_t limit = start_menu_row_limit();
-    for (uint32_t i = 0; i < desktop_app_count && count + 3u < limit; i++) {
-        if (!strcmp(desktop_apps[i].name, "mosdesk")) continue;
-        if (apps) apps[count] = i;
-        count++;
+static char launcher_upper(char c) {
+    return c >= 'a' && c <= 'z' ? (char)(c - 32) : c;
+}
+
+static int launcher_compare(const launcher_item_t* a,
+                            const launcher_item_t* b) {
+    const char* x = launcher_label(a);
+    const char* y = launcher_label(b);
+    for (;; x++, y++) {
+        char cx = launcher_upper(*x), cy = launcher_upper(*y);
+        if (cx != cy || !cx) return (int)(unsigned char)cx - (int)(unsigned char)cy;
     }
-    return count;
+}
+
+static void launcher_build(void) {
+    uint32_t n = 0, terminal = UINT32_MAX;
+    for (uint32_t i = 0; i < desktop_app_count; i++)
+        if (!strcmp(desktop_apps[i].name, "Terminal")) terminal = i;
+    launcher_items[n++] = (launcher_item_t){LAUNCHER_FILES, 0, 0, 0};
+    launcher_items[n++] = (launcher_item_t){LAUNCHER_SETTINGS, 0, 0, 0};
+    if (terminal != UINT32_MAX)
+        launcher_items[n++] = (launcher_item_t){LAUNCHER_APP, terminal, 0, 0};
+    launcher_pinned = n;
+    launcher_items[n++] = (launcher_item_t){LAUNCHER_WALLPAPER, 0, 0, 0};
+    for (uint32_t i = 0; i < desktop_app_count && n < LAUNCHER_MAX_ITEMS; i++) {
+        if (i == terminal || !strcmp(desktop_apps[i].name, "mosdesk")) continue;
+        launcher_items[n++] = (launcher_item_t){LAUNCHER_APP, i, 0, 0};
+    }
+    /* Insertion sort: a few dozen entries at most. */
+    for (uint32_t i = launcher_pinned + 1u; i < n; i++) {
+        launcher_item_t item = launcher_items[i];
+        uint32_t j = i;
+        while (j > launcher_pinned &&
+               launcher_compare(&launcher_items[j - 1u], &item) > 0) {
+            launcher_items[j] = launcher_items[j - 1u];
+            j--;
+        }
+        launcher_items[j] = item;
+    }
+    int32_t offset = 0;
+    char last = 0;
+    for (uint32_t i = launcher_pinned; i < n; i++) {
+        char letter = launcher_upper(launcher_label(&launcher_items[i])[0]);
+        if (!((letter >= 'A' && letter <= 'Z') || (letter >= '0' && letter <= '9')))
+            letter = '#';
+        launcher_items[i].heading = letter != last ? letter : 0;
+        last = letter;
+        if (launcher_items[i].heading) offset += LAUNCHER_HEADING;
+        launcher_items[i].offset = offset;
+        offset += LAUNCHER_ROW;
+    }
+    launcher_count = n;
+    launcher_list_height = offset;
 }
 
 static void start_menu_bounds(int32_t* x, int32_t* y, int32_t* width,
                               int32_t* height) {
-    uint32_t apps = start_menu_rows(NULL);
+    launcher_build();
     *width = 286;
-    *height = 66 + 26 + 3 * 38 + (apps ? 30 + (int32_t)apps * 38 : 0) + 40;
+    *height = LAUNCHER_TOP + (int32_t)launcher_pinned * LAUNCHER_ROW +
+              LAUNCHER_LIST_GAP + launcher_list_height + LAUNCHER_FOOT;
     *x = 12;
     if (*height > (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 18)
         *height = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 18;
     *y = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - 10 - *height;
 }
 
-static int32_t start_menu_row_y(uint32_t row) {
+/* The scrolling part of the launcher, in screen coordinates. */
+static void launcher_list_area(int32_t* top, int32_t* bottom) {
     int32_t x, y, width, height;
     start_menu_bounds(&x, &y, &width, &height);
-    return y + 66 + 26 + (int32_t)row * 38 + (row >= 3u ? 30 : 0);
+    *top = y + LAUNCHER_TOP + (int32_t)launcher_pinned * LAUNCHER_ROW +
+           LAUNCHER_LIST_GAP;
+    *bottom = y + height - LAUNCHER_FOOT;
 }
 
+static int32_t launcher_max_scroll(void) {
+    int32_t top, bottom;
+    launcher_list_area(&top, &bottom);
+    int32_t extra = launcher_list_height - (bottom - top);
+    return extra > 0 ? extra : 0;
+}
+
+static void launcher_scroll_by(int32_t pixels) {
+    int32_t max = launcher_max_scroll();
+    launcher_scroll += pixels;
+    if (launcher_scroll > max) launcher_scroll = max;
+    if (launcher_scroll < 0) launcher_scroll = 0;
+}
+
+/* Screen y of an item's row (list rows may be scrolled out of view). */
+static int32_t start_menu_row_y(uint32_t item) {
+    int32_t x, y, width, height;
+    start_menu_bounds(&x, &y, &width, &height);
+    if (item < launcher_pinned)
+        return y + LAUNCHER_TOP + (int32_t)item * LAUNCHER_ROW;
+    int32_t top, bottom;
+    launcher_list_area(&top, &bottom);
+    return top + launcher_items[item].offset - launcher_scroll;
+}
+
+/* The launcher item under a point, or UINT32_MAX. */
 static uint32_t start_menu_row_at(int32_t px, int32_t py) {
     int32_t x, y, width, height;
     start_menu_bounds(&x, &y, &width, &height);
     if (px < x + 8 || px >= x + width - 8) return UINT32_MAX;
-    uint32_t rows = 3u + start_menu_rows(NULL);
-    for (uint32_t row = 0; row < rows; row++) {
-        int32_t row_y = start_menu_row_y(row);
-        if (py >= row_y && py < row_y + 36) return row;
+    int32_t top, bottom;
+    launcher_list_area(&top, &bottom);
+    for (uint32_t item = 0; item < launcher_count; item++) {
+        if (item >= launcher_pinned && (py < top || py >= bottom)) break;
+        int32_t row_y = start_menu_row_y(item);
+        if (py >= row_y && py < row_y + 36) return item;
     }
     return UINT32_MAX;
 }
+
+/* Opens a launcher item; menu_for_app asks for the right-click menu. */
+static void launcher_activate(uint32_t item, bool menu_for_app);
 
 static void draw_taskbar(const syscall_window_info_t* windows,
                          uint64_t count) {
@@ -3976,18 +4199,8 @@ static void draw_taskbar(const syscall_window_info_t* windows,
 
     if (start_menu_open) {
         /* Kickoff-style launcher: header, system entries, applications. */
-        static const struct {
-            const char* label;
-            moswm_file_icon_t icon;
-        } fixed[3] = {
-            {"Files", MOSWM_ICON_FOLDER},
-            {"Settings", MOSWM_ICON_SETTINGS},
-            {"Wallpaper", MOSWM_ICON_IMAGE}
-        };
         int32_t mx, my, mw, mh;
         start_menu_bounds(&mx, &my, &mw, &mh);
-        uint32_t apps[START_MENU_MAX_ROWS];
-        uint32_t app_count = start_menu_rows(apps);
         uint32_t row_text = 0xFFF2F6F9u, label_color = accent;
         if (aero) {
             /* Windows 7 style: a glass frame around a white list. */
@@ -4021,11 +4234,39 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         fill_rect(mx + 18, my + 56, mw - 36, 1, 0xFF353C42u);
         }
         wm_text(mx + 18, my + 72, "SYSTEM", label_color, 0, 1);
-        if (app_count)
-            wm_text(mx + 18, start_menu_row_y(3u) - 22, "APPLICATIONS",
-                    label_color, 0, 1);
-        for (uint32_t row = 0; row < 3u + app_count; row++) {
+        int32_t list_top, list_bottom;
+        launcher_list_area(&list_top, &list_bottom);
+        int32_t max_scroll = launcher_max_scroll();
+        if (launcher_scroll > max_scroll) launcher_scroll = max_scroll;
+        if (launcher_count > launcher_pinned)
+            wm_text(mx + 18, list_top - 22, "APPLICATIONS", label_color, 0, 1);
+        rect_t saved_clip = clip;
+        for (uint32_t row = 0; row < launcher_count; row++) {
+            const launcher_item_t* item = &launcher_items[row];
             int32_t row_y = start_menu_row_y(row);
+            if (row == launcher_pinned) {
+                /* The A-Z list draws inside its own area only. */
+                rect_t bounds = draw_bounds();
+                rect_t area = {mx, list_top, mx + mw, list_bottom};
+                if (area.left < bounds.left) area.left = bounds.left;
+                if (area.top < bounds.top) area.top = bounds.top;
+                if (area.right > bounds.right) area.right = bounds.right;
+                if (area.bottom > bounds.bottom) area.bottom = bounds.bottom;
+                if (area.right <= area.left || area.bottom <= area.top)
+                    area = (rect_t){-2, -2, -1, -1};
+                clip = area;
+            }
+            if (row >= launcher_pinned &&
+                (row_y + LAUNCHER_ROW < list_top - LAUNCHER_HEADING ||
+                 row_y - LAUNCHER_HEADING > list_bottom))
+                continue;
+            if (item->heading) {
+                char letter[2] = {item->heading, 0};
+                int32_t hy = row_y - LAUNCHER_HEADING;
+                wm_text(mx + 18, hy + 6, letter, label_color, 0, 1);
+                fill_rect(mx + 34, hy + 13, mw - 52, 1,
+                          aero ? 0xFFC5D3E0u : 0xFF353C42u);
+            }
             if (hover_start_row == row && aero) {
                 fill_gradient_rounded(mx + 12, row_y, mw - 24, 36, 3u,
                                       0xFFF2F8FEu, 0xFFC9E0F9u);
@@ -4034,29 +4275,44 @@ static void draw_taskbar(const syscall_window_info_t* windows,
             } else if (hover_start_row == row)
                 fill_rounded_rect(mx + 8, row_y, mw - 16, 36, 6,
                                   0x55000000u | (accent & 0xFFFFFFu));
-            const char* label;
-            if (row < 3u) {
-                label = fixed[row].label;
-                wm_icon(mx + 16, row_y + 4, fixed[row].icon,
-                    28u);
-            } else {
-                const desktop_app_t* app = &desktop_apps[apps[row - 3u]];
-                label = app->name;
+            if (item->kind == LAUNCHER_APP) {
+                const desktop_app_t* app = &desktop_apps[item->app];
                 if (app->has_icon)
                     draw_custom_icon(app->icon_pixels, mx + 16, row_y + 4,
                                      28u);
                 else
-                    wm_icon(mx + 16, row_y + 4, MOSWM_ICON_APP,
-                        28u);
+                    wm_icon(mx + 16, row_y + 4, MOSWM_ICON_APP, 28u);
+            } else {
+                moswm_file_icon_t icon = item->kind == LAUNCHER_FILES
+                    ? MOSWM_ICON_FOLDER
+                    : item->kind == LAUNCHER_SETTINGS ? MOSWM_ICON_SETTINGS
+                                                      : MOSWM_ICON_IMAGE;
+                wm_icon(mx + 16, row_y + 4, icon, 28u);
             }
             char shown[DESKTOP_APP_NAME_SIZE];
-            fit_text_px(shown, sizeof(shown), label, mw - 80, 2u);
+            fit_text_px(shown, sizeof(shown), launcher_label(item), mw - 80, 2u);
             wm_text(mx + 56, row_y + 10, shown, row_text, 0, 2);
+        }
+        clip = saved_clip;
+        if (max_scroll > 0) {
+            /* Scrollbar for the A-Z list. */
+            int32_t track = list_bottom - list_top;
+            int32_t thumb = track * track / launcher_list_height;
+            if (thumb < 24) thumb = 24;
+            int32_t thumb_y = list_top +
+                (track - thumb) * launcher_scroll / max_scroll;
+            fill_rounded_rect(mx + mw - 9, list_top, 4, track, 2,
+                              aero ? 0x30000000u : 0x30FFFFFFu);
+            fill_rounded_rect(mx + mw - 9, thumb_y, 4, thumb, 2,
+                              aero ? 0xA06A7F94u : 0xA0FFFFFFu);
         }
         if (!aero) fill_rect(mx + 18, my + mh - 34, mw - 36, 1, 0xFF353C42u);
         /* Fitted, because the fallback bitmap font is wider than the menu. */
         char hint[48];
-        fit_text_px(hint, sizeof(hint), "Right-click an app to add it to the desktop",
+        fit_text_px(hint, sizeof(hint),
+                    max_scroll > 0 && launcher_scroll < max_scroll
+                        ? "Scroll for more applications"
+                        : "Right-click an app to add it to the desktop",
                     mw - 36, 1);
         wm_text(mx + 18, my + mh - 22, hint,
                 aero ? 0xFFF2F6F9u : 0xFF8A9AA6u, aero ? 0x90000000u : 0u, 1);
@@ -5549,6 +5805,7 @@ static rect_t window_outer_rect(int32_t x, int32_t y, uint32_t width,
 static void scene_regions(region_state_t* regions) {
     uint64_t hash = 0xCBF29CE484222325ull;
     hash = hash_u64(hash, ((uint64_t)start_menu_open << 32) | hover_taskbar);
+    hash = hash_u64(hash, (uint64_t)(uint32_t)launcher_scroll);
     hash = hash_u64(hash, clock_valid);
     regions[REGION_PANEL].signature =
         hash_bytes(hash, &clock_time, sizeof(clock_time));
@@ -5557,7 +5814,8 @@ static void scene_regions(region_state_t* regions) {
         (int32_t)display.width, (int32_t)display.height};
 
     regions[REGION_START_MENU].signature =
-        ((uint64_t)start_menu_open << 32) | hover_start_row;
+        (((uint64_t)start_menu_open << 32) | hover_start_row) ^
+        ((uint64_t)(uint32_t)launcher_scroll << 40);
     regions[REGION_START_MENU].area = (rect_t){0};
     if (start_menu_open) {
         int32_t x, y, width, height;
@@ -5852,6 +6110,23 @@ static void move_dragged_window(syscall_window_info_t* windows,
     }
 }
 
+static void launcher_activate(uint32_t item, bool menu_for_app) {
+    if (item >= launcher_count) return;
+    const launcher_item_t* entry = &launcher_items[item];
+    switch (entry->kind) {
+    case LAUNCHER_FILES: browser_open(user_home); break;
+    case LAUNCHER_SETTINGS: open_settings(NULL); break;
+    case LAUNCHER_WALLPAPER: open_settings("wallpaper"); break;
+    case LAUNCHER_APP:
+        if (menu_for_app)
+            menu_show_for_item(CLICK_ACTION_APPLICATION,
+                               desktop_apps[entry->app].path);
+        else
+            open_path(CLICK_ACTION_APPLICATION, desktop_apps[entry->app].path);
+        break;
+    }
+}
+
 static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
     pending_click_action = CLICK_ACTION_NONE;
     desktop_icon_drag_index = UINT32_MAX;
@@ -5866,24 +6141,14 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         uint32_t row = start_menu_row_at(cursor_x, cursor_y);
         if (row == UINT32_MAX) return;
         start_menu_open = false;
-        uint32_t apps[START_MENU_MAX_ROWS];
-        uint32_t app_count = start_menu_rows(apps);
-        if (row == 0u) {
-            browser_open(user_home);
-        } else if (row == 1u) {
-            open_settings(NULL);
-        } else if (row == 2u) {
-            open_settings("wallpaper");
-        } else if (row - 3u < app_count) {
-            open_path(CLICK_ACTION_APPLICATION,
-                      desktop_apps[apps[row - 3u]].path);
-        }
+        launcher_activate(row, false);
         return;
     }
     if ((uint32_t)cursor_y >= taskbar_y) {
         last_click_valid = false;
         if (cursor_x < 44) {
             start_menu_open = !start_menu_open;
+            launcher_scroll = 0;
             return;
         }
         uint32_t index = cursor_x >= 60
@@ -5975,12 +6240,9 @@ static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
         /* Right-clicking an application in the launcher offers its menu,
          * Add to desktop included. */
         uint32_t row = start_menu_row_at(cursor_x, cursor_y);
-        uint32_t apps[START_MENU_MAX_ROWS];
-        uint32_t app_count = start_menu_rows(apps);
         start_menu_open = false;
-        if (row != UINT32_MAX && row >= 3u && row - 3u < app_count) {
-            menu_show_for_item(CLICK_ACTION_APPLICATION,
-                               desktop_apps[apps[row - 3u]].path);
+        if (row != UINT32_MAX && launcher_items[row].kind == LAUNCHER_APP) {
+            launcher_activate(row, true);
             return;
         }
     }
@@ -6266,6 +6528,16 @@ static void route_input(const syscall_input_event_t* input,
             return;
         }
         if (menu_open || dialog_kind != DIALOG_NONE) return;
+        if (start_menu_open) {
+            int32_t x, y, width, height;
+            start_menu_bounds(&x, &y, &width, &height);
+            if (cursor_x >= x && cursor_x < x + width && cursor_y >= y &&
+                cursor_y < y + height) {
+                launcher_scroll_by(-input->wheel * 2 * LAUNCHER_ROW);
+                hover_start_row = start_menu_row_at(cursor_x, cursor_y);
+                return;
+            }
+        }
         syscall_window_info_t* under =
             window_at(windows, count, cursor_x, cursor_y);
         if (under && under->id == browser_window_id) {
