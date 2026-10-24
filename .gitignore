@@ -1,1 +1,5 @@
 /mosdesk/dist/
+
+*.run
+*.slib
+*.mpkg
