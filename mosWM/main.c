@@ -4136,6 +4136,334 @@ static uint32_t start_menu_row_at(int32_t px, int32_t py) {
 /* Opens a launcher item; menu_for_app asks for the right-click menu. */
 static void launcher_activate(uint32_t item, bool menu_for_app);
 
+/* ------------------------------------------------------------ sound tray
+ *
+ * A speaker next to the clock. Clicking it opens a panel with mute, the
+ * master volume and the outputs (jacks) to play to (SYS_AUDIO_MIXER).
+ * The choices are saved in settings.dat and applied again at start.
+ */
+
+#define SOUND_ICON_WIDTH 40
+#define SOUND_MENU_WIDTH 330
+#define SOUND_ROW 34
+#define SOUND_HOVER_MUTE 100u
+#define SOUND_TASKBAR_HOVER 1000u        /* hover_taskbar: the speaker */
+
+static bool sound_menu_open;
+static bool sound_dragging;              /* the volume slider follows the pointer */
+static uint32_t sound_hover = UINT32_MAX; /* output row, or SOUND_HOVER_MUTE */
+static syscall_audio_mixer_t sound_state;
+static bool sound_state_valid;
+static uint32_t sound_poll_frames;
+
+/* Runs one mixer op; sound_state holds the state afterwards. */
+static bool sound_call(uint32_t op, uint32_t value) {
+    syscall_audio_mixer_t request;
+    memset(&request, 0, sizeof(request));
+    request.op = op;
+    request.value = value;
+    uint64_t result = mos_syscall1(SYS_AUDIO_MIXER, (uint64_t)(uintptr_t)&request);
+    /* A failed switch still reports the state; an older kernel does not. */
+    if (result == SYS_SUCCESS || op == SYS_AUDIO_MIXER_OUTPUT) {
+        sound_state = request;
+        sound_state_valid = result == SYS_SUCCESS || request.driver[0];
+    } else if (op == SYS_AUDIO_MIXER_GET) {
+        sound_state_valid = false;
+    }
+    return result == SYS_SUCCESS;
+}
+
+/* Keeps volume, mute and the output in settings.dat. Read fresh, so a
+ * change Settings just saved is not overwritten. */
+static void sound_save(void) {
+    if (!sound_state_valid) return;
+    mosdesk_settings_t settings = mosdesk_settings_load();
+    settings.audio_volume = sound_state.volume;
+    settings.audio_muted = sound_state.muted ? 1u : 0u;
+    memset(settings.audio_output, 0, sizeof(settings.audio_output));
+    if (sound_state.output >= 0 &&
+        (uint32_t)sound_state.output < sound_state.output_count)
+        for (uint32_t i = 0; i + 1u < sizeof(settings.audio_output) &&
+             sound_state.outputs[sound_state.output][i]; i++)
+            settings.audio_output[i] = sound_state.outputs[sound_state.output][i];
+    if (mosdesk_settings_save(&settings)) desktop_settings = settings;
+}
+
+/* At start: the saved volume, mute and output. */
+static void sound_restore(void) {
+    if (!sound_call(SYS_AUDIO_MIXER_GET, 0)) return;
+    sound_call(SYS_AUDIO_MIXER_VOLUME, desktop_settings.audio_volume);
+    sound_call(SYS_AUDIO_MIXER_MUTE, desktop_settings.audio_muted);
+    if (!desktop_settings.audio_output[0]) return;
+    for (uint32_t i = 0; i < sound_state.output_count; i++)
+        if (!strcmp(sound_state.outputs[i], desktop_settings.audio_output)) {
+            if ((int32_t)i != sound_state.output) sound_call(SYS_AUDIO_MIXER_OUTPUT, i);
+            break;
+        }
+}
+
+static void sound_icon_rect(int32_t* x, int32_t* y) {
+    *x = (int32_t)display.width - 124 - SOUND_ICON_WIDTH - 6;
+    *y = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT + 4;
+}
+
+static bool sound_icon_hit(int32_t px, int32_t py) {
+    int32_t x, y;
+    sound_icon_rect(&x, &y);
+    return px >= x && px < x + SOUND_ICON_WIDTH && py >= y && py < y + 40;
+}
+
+static uint32_t sound_rows(void) {
+    return sound_state.output_count ? sound_state.output_count : 1u;
+}
+
+static void sound_menu_bounds(int32_t* x, int32_t* y, int32_t* width,
+                              int32_t* height) {
+    *width = SOUND_MENU_WIDTH;
+    *height = 136 + (int32_t)sound_rows() * SOUND_ROW;
+    *x = (int32_t)display.width - *width - 8;
+    *y = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - *height - 8;
+}
+
+static bool sound_menu_hit(int32_t px, int32_t py) {
+    if (!sound_menu_open) return false;
+    int32_t x, y, w, h;
+    sound_menu_bounds(&x, &y, &w, &h);
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+/* The volume slider's track, in screen coordinates. */
+static void sound_track(int32_t* x0, int32_t* x1, int32_t* cy) {
+    int32_t x, y, w, h;
+    sound_menu_bounds(&x, &y, &w, &h);
+    *x0 = x + 70;
+    *x1 = x + w - 66;
+    *cy = y + 66;
+}
+
+/* A speaker in a 20x20 box at (x, y), anti-aliased (4x4 samples per
+ * pixel): body, cone, then `waves` sound arcs, or a cross when muted. */
+static float sound_seg_dist(float px, float py, float ax, float ay, float bx,
+                            float by) {
+    float dx = bx - ax, dy = by - ay;
+    float t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float ex = ax + t * dx - px, ey = ay + t * dy - py;
+    return ex * ex + ey * ey;
+}
+
+static bool sound_icon_inside(float px, float py, uint32_t waves, bool muted) {
+    if (px >= 1.5f && px <= 6.0f && py >= 7.0f && py <= 13.0f) return true;
+    if (px >= 6.0f && px <= 11.0f) {
+        float half = 3.0f + (px - 6.0f);
+        if (py >= 10.0f - half && py <= 10.0f + half) return true;
+    }
+    if (muted) {
+        return sound_seg_dist(px, py, 13.5f, 7.0f, 19.0f, 13.0f) < 0.8f ||
+               sound_seg_dist(px, py, 13.5f, 13.0f, 19.0f, 7.0f) < 0.8f;
+    }
+    float dx = px - 9.0f, dy = py - 10.0f;
+    if (dx <= 0.0f || dy > dx * 1.15f || -dy > dx * 1.15f) return false;
+    float r2 = dx * dx + dy * dy;
+    for (uint32_t k = 1; k <= waves; k++) {
+        float r = 3.6f + 3.2f * (float)k;
+        if (r2 >= (r - 0.85f) * (r - 0.85f) && r2 <= (r + 0.85f) * (r + 0.85f))
+            return true;
+    }
+    return false;
+}
+
+static void draw_speaker(int32_t x, int32_t y, uint32_t color, uint32_t waves,
+                         bool muted) {
+    for (int32_t py = 0; py < 20; py++)
+        for (int32_t px = 0; px < 20; px++) {
+            uint32_t hits = 0;
+            for (int32_t sy = 0; sy < 4; sy++)
+                for (int32_t sx = 0; sx < 4; sx++)
+                    hits += sound_icon_inside((float)px + (sx + 0.5f) / 4.0f,
+                                              (float)py + (sy + 0.5f) / 4.0f,
+                                              waves, muted);
+            if (!hits) continue;
+            uint32_t alpha = ((color >> 24) * hits) / 16u;
+            put_pixel(x + px, y + py, (alpha << 24) | (color & 0x00FFFFFFu));
+        }
+}
+
+static uint32_t sound_waves(void) {
+    uint32_t v = sound_state.volume;
+    return v == 0 ? 0u : v < 34u ? 1u : v < 67u ? 2u : 3u;
+}
+
+static void draw_sound_icon(bool aero) {
+    int32_t x, y;
+    sound_icon_rect(&x, &y);
+    bool lit = sound_menu_open || hover_taskbar == SOUND_TASKBAR_HOVER;
+    if (lit)
+        fill_rounded_rect(x, y, SOUND_ICON_WIDTH, 40, 8,
+                          aero ? 0x40FFFFFFu : 0x26FFFFFFu);
+    bool muted = !sound_state_valid || sound_state.muted ||
+                 !sound_state.output_count;
+    draw_speaker(x + 10, y + 10, sound_state_valid && sound_state.output_count
+                                     ? 0xFFEAF2F8u : 0x90EAF2F8u,
+                 sound_waves(), muted);
+}
+
+static void draw_sound_menu(bool aero) {
+    if (!sound_menu_open) return;
+    int32_t x, y, w, h;
+    sound_menu_bounds(&x, &y, &w, &h);
+    uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
+    uint32_t text = aero ? 0xFF1E2A33u : 0xFFF2F6F9u;
+    uint32_t dim = aero ? 0xFF5C6B76u : 0xFF9BAFBCu;
+    if (aero) {
+        fill_rounded_rect(x - 5, y - 3, w + 10, h + 10, 12, 0x2E000000u);
+        glass_rounded(x, y, w, h, 8u, accent, 0x80u, 0x50u, 30, NULL);
+        fill_rounded_rect(x + 8, y + 8, w - 16, h - 16, 5, 0xF4FFFFFFu);
+        stroke_rounded_rect(x, y, w, h, 8u, 0xC0102030u);
+    } else {
+        fill_rounded_rect(x - 4, y - 2, w + 8, h + 8, 12, 0x40000000u);
+        fill_rounded_rect(x, y, w, h, 10, 0xF41F2327u);
+        stroke_rounded_rect(x, y, w, h, 10u, 0x30FFFFFFu);
+    }
+    wm_text(x + 20, y + 18, "Sound", text, 0, 2);
+    if (sound_state_valid && sound_state.driver[0]) {
+        uint32_t tw = moswm_text_width(sound_state.driver, 1);
+        wm_text(x + w - 20 - (int32_t)tw, y + 22, sound_state.driver, dim, 0, 1);
+    }
+
+    /* Mute button and volume slider. */
+    bool muted = sound_state.muted != 0;
+    uint32_t button = muted ? accent
+                    : sound_hover == SOUND_HOVER_MUTE ? (aero ? 0x30000000u : 0x30FFFFFFu)
+                                                      : (aero ? 0x18000000u : 0x18FFFFFFu);
+    fill_rounded_rect(x + 18, y + 48, 38, 38, 19, button);
+    draw_speaker(x + 27, y + 57, muted ? 0xFFFFFFFFu : text, sound_waves(), muted);
+    int32_t x0, x1, cy;
+    sound_track(&x0, &x1, &cy);
+    int32_t knob = x0 + (x1 - x0) * (int32_t)sound_state.volume / 100;
+    fill_rounded_rect(x0, cy - 2, x1 - x0, 5, 2, aero ? 0x40000000u : 0x40FFFFFFu);
+    fill_rounded_rect(x0, cy - 2, knob - x0, 5, 2, muted ? dim : accent);
+    fill_rounded_rect(knob - 9, cy - 9, 19, 19, 9, muted ? dim : accent);
+    fill_rounded_rect(knob - 4, cy - 4, 9, 9, 4, 0xFFFFFFFFu);
+    char percent[8];
+    uint32_t v = sound_state.volume, at = 0;
+    if (v >= 100u) percent[at++] = '1';
+    if (v >= 10u) percent[at++] = (char)('0' + v / 10u % 10u);
+    percent[at++] = (char)('0' + v % 10u);
+    percent[at++] = '%';
+    percent[at] = '\0';
+    wm_text(x1 + 16, cy - 8, percent, text, 0, 2);
+
+    /* Outputs. */
+    int32_t list_y = y + 104;
+    fill_rect(x + 18, list_y - 6, w - 36, 1, aero ? 0x20000000u : 0x20FFFFFFu);
+    wm_text(x + 20, list_y + 2, "Output", dim, 0, 1);
+    list_y += 22;
+    if (!sound_state_valid || !sound_state.output_count) {
+        wm_text(x + 20, list_y + 10, "No sound card found", dim, 0, 2);
+        return;
+    }
+    for (uint32_t i = 0; i < sound_state.output_count; i++) {
+        int32_t row = list_y + (int32_t)i * SOUND_ROW;
+        bool current = (int32_t)i == sound_state.output;
+        if (sound_hover == i && !current)
+            fill_rounded_rect(x + 10, row, w - 20, SOUND_ROW - 4, 7,
+                              aero ? 0x18000000u : 0x18FFFFFFu);
+        else if (current)
+            fill_rounded_rect(x + 10, row, w - 20, SOUND_ROW - 4, 7,
+                              (accent & 0x00FFFFFFu) | 0x38000000u);
+        /* Radio button. */
+        fill_rounded_rect(x + 20, row + 7, 16, 16, 8, current ? accent : dim);
+        fill_rounded_rect(x + 22, row + 9, 12, 12, 6,
+                          current ? 0xFFFFFFFFu : (aero ? 0xFFFFFFFFu : 0xFF1F2327u));
+        if (current) fill_rounded_rect(x + 25, row + 12, 6, 6, 3, accent);
+        char name[SYSCALL_AUDIO_OUTPUT_NAME];
+        fit_text_px(name, sizeof(name), sound_state.outputs[i], (uint32_t)(w - 70), 2u);
+        wm_text(x + 46, row + 7, name, text, 0, 2);
+    }
+}
+
+static void sound_set_volume_at(int32_t px) {
+    int32_t x0, x1, cy;
+    sound_track(&x0, &x1, &cy);
+    int32_t v = (px - x0) * 100 / (x1 - x0 > 0 ? x1 - x0 : 1);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    if ((uint32_t)v == sound_state.volume) return;
+    sound_call(SYS_AUDIO_MIXER_VOLUME, (uint32_t)v);
+    if (sound_state.muted && v > 0) sound_call(SYS_AUDIO_MIXER_MUTE, 0);
+}
+
+static void sound_wheel(int32_t wheel) {
+    if (!sound_state_valid) return;
+    int32_t v = (int32_t)sound_state.volume + (wheel > 0 ? 5 : -5);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    sound_call(SYS_AUDIO_MIXER_VOLUME, (uint32_t)v);
+    if (sound_state.muted && wheel > 0) sound_call(SYS_AUDIO_MIXER_MUTE, 0);
+    sound_save();
+}
+
+/* What is under the pointer in the open menu. */
+static uint32_t sound_menu_item_at(int32_t px, int32_t py) {
+    int32_t x, y, w, h;
+    sound_menu_bounds(&x, &y, &w, &h);
+    if (px >= x + 18 && px < x + 56 && py >= y + 48 && py < y + 86)
+        return SOUND_HOVER_MUTE;
+    int32_t list_y = y + 126;
+    if (py >= list_y && px >= x + 10 && px < x + w - 10) {
+        uint32_t row = (uint32_t)((py - list_y) / SOUND_ROW);
+        if (row < sound_state.output_count) return row;
+    }
+    return UINT32_MAX;
+}
+
+/* A press inside the open menu. */
+static void sound_menu_press(int32_t px, int32_t py) {
+    int32_t x0, x1, cy;
+    sound_track(&x0, &x1, &cy);
+    if (px >= x0 - 12 && px <= x1 + 12 && py >= cy - 14 && py <= cy + 14) {
+        sound_dragging = true;
+        sound_set_volume_at(px);
+        return;
+    }
+    uint32_t item = sound_menu_item_at(px, py);
+    if (item == SOUND_HOVER_MUTE) {
+        sound_call(SYS_AUDIO_MIXER_MUTE, sound_state.muted ? 0u : 1u);
+        sound_save();
+    } else if (item != UINT32_MAX && (int32_t)item != sound_state.output) {
+        if (!sound_call(SYS_AUDIO_MIXER_OUTPUT, item))
+            strcpy(status_message, "Unable to switch the sound output");
+        sound_save();
+    }
+}
+
+static void sound_tick(void) {
+    if (sound_dragging) {
+        if (sound_menu_open) sound_set_volume_at(cursor_x);
+        else sound_dragging = false;
+    }
+    if (sound_menu_open)
+        sound_hover = sound_menu_item_at(cursor_x, cursor_y);
+    if (++sound_poll_frames >= (sound_menu_open ? 30u : 120u) && !sound_dragging) {
+        sound_poll_frames = 0;
+        sound_call(SYS_AUDIO_MIXER_GET, 0);
+    }
+}
+
+static uint64_t sound_signature(void) {
+    uint64_t hash = 0xCBF29CE484222325ull;
+    hash = hash_u64(hash, ((uint64_t)sound_menu_open << 40) |
+                          ((uint64_t)sound_dragging << 39) |
+                          ((uint64_t)sound_state_valid << 38) |
+                          ((uint64_t)sound_state.muted << 37) |
+                          ((uint64_t)(uint32_t)sound_state.output << 8) |
+                          sound_state.volume);
+    hash = hash_u64(hash, ((uint64_t)sound_hover << 32) | sound_state.output_count);
+    return hash;
+}
+
 static void draw_taskbar(const syscall_window_info_t* windows,
                          uint64_t count) {
     int32_t top = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT;
@@ -4184,7 +4512,7 @@ static void draw_taskbar(const syscall_window_info_t* windows,
 
     /* Task manager: one rounded entry per window, Plasma-style indicator. */
     int32_t x = 60;
-    for (uint64_t i = 0; i < count && (uint32_t)x + 184u < display.width - 126u;
+    for (uint64_t i = 0; i < count && (uint32_t)x + 184u < display.width - 176u;
          i++) {
         const syscall_window_info_t* info = &windows[i];
         bool focused = info->id == focused_id;
@@ -4257,6 +4585,9 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                 date, aero ? 0xFFDCE8F2u : 0xFF9BAFBCu,
                 aero ? 0xA0000000u : 0u, 1);
     }
+
+    draw_sound_icon(aero);
+    draw_sound_menu(aero);
 
     if (start_menu_open) {
         /* Kickoff-style launcher: header, system entries, applications. */
@@ -5824,6 +6155,7 @@ static bool damage_everything;
 typedef enum {
     REGION_PANEL,
     REGION_START_MENU,
+    REGION_SOUND_MENU,
     REGION_CONTEXT_MENU,
     REGION_OVERLAY,
     REGION_COUNT
@@ -5880,8 +6212,17 @@ static void scene_regions(region_state_t* regions) {
     hash = hash_u64(hash, ((uint64_t)desktop_settings.clock_24h << 40) |
                           ((uint64_t)desktop_settings.date_format << 32) |
                           (uint32_t)desktop_settings.utc_offset_minutes);
+    hash = hash_u64(hash, sound_signature());
     regions[REGION_PANEL].signature =
         hash_bytes(hash, &clock_time, sizeof(clock_time));
+    regions[REGION_SOUND_MENU].signature = sound_signature();
+    regions[REGION_SOUND_MENU].area = (rect_t){0};
+    if (sound_menu_open) {
+        int32_t x, y, width, height;
+        sound_menu_bounds(&x, &y, &width, &height);
+        regions[REGION_SOUND_MENU].area =
+            (rect_t){x - 5, y - 3, x + width + 5, y + height + 7};
+    }
     regions[REGION_PANEL].area = (rect_t){
         0, (int32_t)display.height - (int32_t)TASKBAR_HEIGHT,
         (int32_t)display.width, (int32_t)display.height};
@@ -6208,6 +6549,20 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
     uint32_t taskbar_y = display.height - TASKBAR_HEIGHT;
     int32_t menu_left, menu_top, menu_width, menu_tall;
     start_menu_bounds(&menu_left, &menu_top, &menu_width, &menu_tall);
+    /* The speaker and its menu. */
+    if (sound_menu_open && sound_menu_hit(cursor_x, cursor_y)) {
+        last_click_valid = false;
+        sound_menu_press(cursor_x, cursor_y);
+        return;
+    }
+    if (sound_icon_hit(cursor_x, cursor_y)) {
+        last_click_valid = false;
+        sound_menu_open = !sound_menu_open;
+        start_menu_open = false;
+        if (sound_menu_open) sound_call(SYS_AUDIO_MIXER_GET, 0);
+        return;
+    }
+    sound_menu_open = false;
     if (start_menu_open && cursor_x >= menu_left &&
         cursor_x < menu_left + menu_width && cursor_y >= menu_top &&
         cursor_y < menu_top + menu_tall) {
@@ -6360,6 +6715,7 @@ static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
 
 /* Works out what the pointer is resting on, for hover highlights. */
 static void update_hover(syscall_window_info_t* windows, uint64_t count) {
+    sound_tick();
     if (launcher_dragging) {
         if (start_menu_open) launcher_drag_to(cursor_y);
         else launcher_dragging = false;
@@ -6393,6 +6749,8 @@ static void update_hover(syscall_window_info_t* windows, uint64_t count) {
     if ((uint32_t)cursor_y >= display.height - TASKBAR_HEIGHT) {
         if (cursor_x < 44) {
             hover_taskbar = 0u;
+        } else if (sound_icon_hit(cursor_x, cursor_y)) {
+            hover_taskbar = SOUND_TASKBAR_HOVER;
         } else if (cursor_x >= 60 && (uint32_t)(cursor_x - 60) % 180u < 176u) {
             uint32_t index = (uint32_t)(cursor_x - 60) / 180u;
             if (index < count) hover_taskbar = index + 1u;
@@ -6423,6 +6781,10 @@ static void update_hover(syscall_window_info_t* windows, uint64_t count) {
 static void on_mouse_up(syscall_window_info_t* windows, uint64_t count,
                         uint32_t time_ms) {
     launcher_dragging = false;
+    if (sound_dragging) {
+        sound_dragging = false;
+        sound_save();
+    }
     if (desktop_icon_drag_index != UINT32_MAX) {
         if (desktop_icon_drag_moved &&
             !mosdesk_settings_save(&desktop_settings)) {
@@ -6590,8 +6952,9 @@ static void route_input(const syscall_input_event_t* input,
         /* The open launcher covers the windows below it. */
         int32_t lx, ly, lw, lh;
         start_menu_bounds(&lx, &ly, &lw, &lh);
-        bool on_launcher = start_menu_open && cursor_x >= lx &&
-            cursor_x < lx + lw && cursor_y >= ly && cursor_y < ly + lh;
+        bool on_launcher = (start_menu_open && cursor_x >= lx &&
+            cursor_x < lx + lw && cursor_y >= ly && cursor_y < ly + lh) ||
+            sound_menu_hit(cursor_x, cursor_y);
         syscall_window_info_t* under = on_launcher ? NULL :
             window_at(windows, count, cursor_x, cursor_y);
         if (under) {
@@ -6611,6 +6974,11 @@ static void route_input(const syscall_input_event_t* input,
         else if (was_down && !is_down)
             on_mouse_up(windows, count, input->time_ms);
         if (right_pressed) on_right_down(windows, count);
+    } else if (input->type == SYSCALL_INPUT_MOUSE_WHEEL &&
+               dialog_kind == DIALOG_NONE && !menu_open &&
+               (sound_menu_hit(cursor_x, cursor_y) ||
+                sound_icon_hit(cursor_x, cursor_y))) {
+        sound_wheel(input->wheel);
     } else if (input->type == SYSCALL_INPUT_MOUSE_WHEEL) {
         if (dialog_kind == DIALOG_PICK_FOLDER) {
             picker_wheel(input->wheel);
@@ -6748,6 +7116,7 @@ int main(void) {
     cursor_x = (int32_t)(display.width / 2u);
     cursor_y = (int32_t)(display.height / 2u);
     load_desktop_settings();
+    sound_restore();         /* saved volume, mute and output */
     if (mos_syscall3(SYS_IS_DIR,
             (uint64_t)(uintptr_t)MOSDESK_USERS_PATH, 0, 0) != 1u &&
         mos_syscall3(SYS_MKDIR,

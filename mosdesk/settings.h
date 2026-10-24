@@ -61,6 +61,7 @@
 #define MOSDESK_TIME_URL_SIZE 192u
 #define MOSDESK_TIME_POLL_MIN 5u
 #define MOSDESK_TIME_POLL_MAX 60u
+#define MOSDESK_AUDIO_OUTPUT_SIZE 40u
 #define MOSDESK_TIME_DEFAULT_URL \
     "https://timeapi.io/api/v1/time/current/unix_ms"
 
@@ -95,7 +96,45 @@ typedef struct {
     uint32_t time_sync_enabled;
     uint32_t time_sync_interval;        /* seconds */
     char time_sync_url[MOSDESK_TIME_URL_SIZE];
+    /* Sound (the panel's speaker menu). The output is kept by name, as
+     * the order can change when hardware does. */
+    uint32_t audio_volume;              /* 0-100 */
+    uint32_t audio_muted;
+    char audio_output[MOSDESK_AUDIO_OUTPUT_SIZE];
 } mosdesk_settings_t;
+
+/* The layout before the sound settings: a file of this size is the
+ * leading part of mosdesk_settings_t. */
+typedef struct {
+    uint32_t magic;
+    uint32_t mouse_speed;
+    uint32_t accent_color;
+    uint32_t cursor_fill;
+    uint32_t cursor_scale;
+    uint32_t cursor_pack;
+    uint32_t wallpaper;
+    uint32_t onboarding_complete;
+    uint32_t login_enabled;
+    uint8_t password_salt[MOSDESK_PASSWORD_SALT_SIZE];
+    uint8_t password_hash[MOSDESK_PASSWORD_HASH_SIZE];
+    uint32_t click_once_open;
+    uint32_t grid_enabled;
+    uint32_t wallpaper_mode;
+    uint32_t wallpaper_rotation;
+    char wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE];
+    uint32_t desktop_icon_x[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t debug_fps;
+    uint32_t debug_profiler;
+    char username[MOSDESK_USERNAME_SIZE];
+    uint32_t ui_style;
+    uint32_t clock_24h;
+    uint32_t date_format;
+    int32_t utc_offset_minutes;
+    uint32_t time_sync_enabled;
+    uint32_t time_sync_interval;
+    char time_sync_url[MOSDESK_TIME_URL_SIZE];
+} mosdesk_settings_v8_t;
 
 /* easyui (Minimal-OS-SDK/include/easyui.h) reads ui_style straight from the
  * file at this offset, so apps can follow the Aero style; keep them equal. */
@@ -347,6 +386,7 @@ static inline mosdesk_settings_t mosdesk_settings_default(void) {
         settings.desktop_icon_y[i] = UINT32_MAX;
     }
     mosdesk_settings_time_defaults(&settings);
+    settings.audio_volume = 80u;
     return settings;
 }
 
@@ -360,6 +400,11 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
                 (uintptr_t)&settings, sizeof(settings)) !=
             (long)sizeof(settings))
+            settings = mosdesk_settings_default();
+    } else if (size == (long)sizeof(mosdesk_settings_v8_t)) {
+        /* v8 is the leading part; the sound settings keep their defaults. */
+        if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
+                (uintptr_t)&settings, (uint64_t)size) != size)
             settings = mosdesk_settings_default();
     } else if (size == (long)sizeof(mosdesk_settings_v7_t)) {
         /* v7 is the leading part; the time settings keep their defaults. */
@@ -507,6 +552,12 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         settings.time_sync_interval > MOSDESK_TIME_POLL_MAX ||
         settings.time_sync_url[MOSDESK_TIME_URL_SIZE - 1u] != '\0')
         mosdesk_settings_time_defaults(&settings);
+    if (settings.audio_volume > 100u || settings.audio_muted > 1u ||
+        settings.audio_output[MOSDESK_AUDIO_OUTPUT_SIZE - 1u] != '\0') {
+        settings.audio_volume = 80u;
+        settings.audio_muted = 0u;
+        settings.audio_output[0] = '\0';
+    }
     /* An unusable name is asked for again rather than used as a path. */
     if (!mosdesk_username_valid(settings.username))
         settings.username[0] = '\0';
