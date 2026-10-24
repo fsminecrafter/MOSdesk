@@ -127,6 +127,69 @@ static void fill_rect(int32_t x, int32_t y, int32_t width, int32_t height,
 static void draw_text(int32_t x, int32_t y, const char* text,
                       uint32_t color, bool large);
 
+/* One pixel of `color` over the surface, by coverage 0-255. */
+static void blend_pixel(int32_t x, int32_t y, uint32_t color, uint32_t cover) {
+    if (x < 0 || y < 0 || x >= (int32_t)surface.width ||
+        y >= (int32_t)surface.height || !cover)
+        return;
+    uint32_t* at = surface.pixels + (size_t)y * surface.width + x;
+    uint32_t a = ((color >> 24) * cover + 127u) / 255u, keep = 255u - a;
+    uint32_t d = *at;
+    *at = 0xFF000000u |
+        ((((d >> 16) & 255u) * keep + ((color >> 16) & 255u) * a) / 255u) << 16 |
+        ((((d >> 8) & 255u) * keep + ((color >> 8) & 255u) * a) / 255u) << 8 |
+        (((d & 255u) * keep + (color & 255u) * a) / 255u);
+}
+
+/* Share (0-255) of pixel (px, py) inside the disc centred at (cx, cy) with
+ * radius rad, all in 1/8 pixel; 4x4 samples. */
+static uint32_t disc_cover(int32_t px, int32_t py, int32_t cx, int32_t cy,
+                           int32_t rad) {
+    uint32_t inside = 0;
+    for (int32_t j = 0; j < 4; j++) {
+        int32_t dy = py * 8 + 2 * j + 1 - cy;
+        for (int32_t i = 0; i < 4; i++) {
+            int32_t dx = px * 8 + 2 * i + 1 - cx;
+            if (dx * dx + dy * dy <= rad * rad) inside++;
+        }
+    }
+    return inside * 255u / 16u;
+}
+
+/* A rounded rectangle with anti-aliased corners. */
+static void fill_round(int32_t x, int32_t y, int32_t width, int32_t height,
+                       int32_t radius, uint32_t color) {
+    if (width <= 0 || height <= 0) return;
+    if (radius * 2 > width) radius = width / 2;
+    if (radius * 2 > height) radius = height / 2;
+    if (radius <= 0) {
+        fill_rect(x, y, width, height, color);
+        return;
+    }
+    fill_rect(x + radius, y, width - 2 * radius, height, color);
+    fill_rect(x, y + radius, radius, height - 2 * radius, color);
+    fill_rect(x + width - radius, y + radius, radius, height - 2 * radius,
+              color);
+    int32_t r8 = radius * 8;
+    for (int32_t fy = 0; fy < radius; fy++) {
+        for (int32_t fx = 0; fx < radius; fx++) {
+            uint32_t cover = disc_cover(fx, fy, r8, r8, r8);
+            blend_pixel(x + fx, y + fy, color, cover);
+            blend_pixel(x + width - 1 - fx, y + fy, color, cover);
+            blend_pixel(x + fx, y + height - 1 - fy, color, cover);
+            blend_pixel(x + width - 1 - fx, y + height - 1 - fy, color, cover);
+        }
+    }
+}
+
+/* A disc of radius `radius` centred on the middle of pixel (cx, cy). */
+static void fill_disc(int32_t cx, int32_t cy, int32_t radius, uint32_t color) {
+    int32_t c8x = cx * 8 + 4, c8y = cy * 8 + 4, r8 = radius * 8 + 4;
+    for (int32_t py = cy - radius; py <= cy + radius; py++)
+        for (int32_t px = cx - radius; px <= cx + radius; px++)
+            blend_pixel(px, py, color, disc_cover(px, py, c8x, c8y, r8));
+}
+
 static void stroke_rect(int32_t x, int32_t y, int32_t width, int32_t height,
                         int32_t thickness, uint32_t color) {
     fill_rect(x, y, width, thickness, color);
@@ -439,10 +502,10 @@ static void draw_appearance_page(void) {
     for (uint32_t i = 0; i < 6u; i++) {
         int32_t x = left + (int32_t)i * 50;
         int32_t y = accent_y() - scroll;
-        fill_rect(x, y, 30, 30, accent_colors[i]);
+        fill_round(x, y, 30, 30, 7, accent_colors[i]);
         if ((preferences.accent_color & 0x00FFFFFFu) ==
             (accent_colors[i] & 0x00FFFFFFu))
-            fill_rect(x - 2, y - 2, 34, 2, 0xFF34434Cu);
+            fill_round(x - 2, y - 4, 34, 3, 1, 0xFF34434Cu);
         /* One label per swatch: proportional text cannot be aligned with
          * runs of spaces the way the monospace bitmap font was. */
         draw_text(x, y + 36, theme_names[i], 0xFF667680u, false);
@@ -477,7 +540,7 @@ static void draw_appearance_page(void) {
         int32_t x = left + (int32_t)i * 84 + (i == 3u ? 16 : 0);
         int32_t y = wallpaper_fit_y() - scroll;
         bool selected = i < 3u && preferences.wallpaper_mode == i;
-        fill_rect(x, y, 76, 28,
+        fill_round(x, y, 76, 28, 6,
                   selected ? preferences.accent_color : 0xFFDCE2E6u);
         draw_text(x + 14, y + 9, fit_names[i],
                   selected ? 0xFFFFFFFFu : 0xFF34434Cu, false);
@@ -489,10 +552,10 @@ static void draw_appearance_page(void) {
               0xFFF3F5F6u);
     if (appearance_max_scroll() > 0) {
         int32_t x = (int32_t)surface.width - SCROLLBAR_WIDTH - 5;
-        fill_rect(x, scroll_track_top(), SCROLLBAR_WIDTH,
-                  scroll_track_length(), 0xFFDDE4E9u);
-        fill_rect(x, scroll_thumb_top(), SCROLLBAR_WIDTH,
-                  scroll_thumb_length(),
+        fill_round(x, scroll_track_top(), SCROLLBAR_WIDTH,
+                  scroll_track_length(), SCROLLBAR_WIDTH / 2, 0xFFDDE4E9u);
+        fill_round(x, scroll_thumb_top(), SCROLLBAR_WIDTH,
+                  scroll_thumb_length(), SCROLLBAR_WIDTH / 2,
                   scroll_dragging ? preferences.accent_color : 0xFF94A5B1u);
     }
 }
@@ -745,10 +808,11 @@ static void draw_window(void) {
         if (row + NAV_PITCH <= NAV_TOP - 4 || row >= (int32_t)surface.height)
             continue;
         if (page == category) {
-            fill_rect(10, row, 128, NAV_PITCH - 4, 0xFFD4E4EFu);
-            fill_rect(10, row, 3, NAV_PITCH - 4, preferences.accent_color);
+            fill_round(10, row, 128, NAV_PITCH - 4, 7, 0xFFD4E4EFu);
+            fill_round(12, row + 8, 3, NAV_PITCH - 20, 1,
+                       preferences.accent_color);
         } else if (nav_hover == i) {
-            fill_rect(10, row, 128, NAV_PITCH - 4, 0xFFDCE4EAu);
+            fill_round(10, row, 128, NAV_PITCH - 4, 7, 0xFFDCE4EAu);
         }
         moswm_draw_file_icon_sized(surface.pixels, surface.width,
                                    surface.height, 18, row + 3,
@@ -762,8 +826,8 @@ static void draw_window(void) {
         int32_t thumb = track * track /
             ((int32_t)PAGE_COUNT * NAV_PITCH + 8);
         if (thumb < 20) thumb = 20;
-        fill_rect((int32_t)NAV_WIDTH - 6, NAV_TOP + (track - thumb) *
-                  nav_scroll / nav_max_scroll(), 3, thumb, 0xFFA9B8C3u);
+        fill_round((int32_t)NAV_WIDTH - 6, NAV_TOP + (track - thumb) *
+                   nav_scroll / nav_max_scroll(), 3, thumb, 1, 0xFFA9B8C3u);
     }
     fill_rect((int32_t)NAV_WIDTH, 0, 1, (int32_t)surface.height,
               0xFFD2D9DEu);
@@ -782,10 +846,10 @@ static void draw_window(void) {
 
     if (category == PAGE_DEBUG) {
         draw_text(content_left(), 15, "Debug", 0xFF273640u, true);
-        fill_rect((int32_t)NAV_WIDTH + 22, 106, 160, 34,
+        fill_round((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
                   preferences.debug_fps
                       ? preferences.accent_color : 0xFFDCE2E6u);
-        fill_rect((int32_t)NAV_WIDTH + 22, 229, 160, 34,
+        fill_round((int32_t)NAV_WIDTH + 22, 229, 160, 34, 8,
                   preferences.debug_profiler
                       ? preferences.accent_color : 0xFFDCE2E6u);
     } else if (category == 1u) {
@@ -794,45 +858,41 @@ static void draw_window(void) {
         int32_t track_width = (int32_t)surface.width - track_x - 24;
         int32_t marker = track_width *
             (int32_t)(preferences.mouse_speed - 50u) / 150;
-        fill_rect(track_x, track_y, track_width, 5, 0xFFBCC6CDu);
-        fill_rect(track_x, track_y, marker, 5, preferences.accent_color);
-        fill_rect(track_x + marker - 5, track_y - 5, 11, 16,
-                  preferences.accent_color);
+        fill_round(track_x, track_y, track_width, 5, 2, 0xFFBCC6CDu);
+        fill_round(track_x, track_y, marker, 5, 2, preferences.accent_color);
+        fill_disc(track_x + marker, track_y + 2, 9, preferences.accent_color);
+        fill_disc(track_x + marker, track_y + 2, 4, 0xFFFFFFFFu);
     } else if (category == 2u) {
         draw_cursor_icon((int32_t)surface.width - 52, 58, 2u,
                          preferences.cursor_fill);
         for (uint32_t i = 0; i < 4; i++) {
             int32_t x = (int32_t)NAV_WIDTH + 22 + (int32_t)i * 37;
-            fill_rect(x, 106, 25, 25, cursor_colors[i]);
+            fill_round(x, 106, 25, 25, 5, cursor_colors[i]);
             if ((preferences.cursor_fill & 0x00FFFFFFu) ==
                 (cursor_colors[i] & 0x00FFFFFFu))
-                fill_rect(x - 2, 104, 29, 2, preferences.accent_color);
+                fill_round(x - 2, 100, 29, 3, 1, preferences.accent_color);
         }
-        fill_rect((int32_t)NAV_WIDTH + 22, 191, 48, 27, 0xFFDCE2E6u);
-        fill_rect((int32_t)NAV_WIDTH + 78, 191, 48, 27, 0xFFDCE2E6u);
+        fill_round((int32_t)NAV_WIDTH + 22, 191, 48, 27, 6, 0xFFDCE2E6u);
+        fill_round((int32_t)NAV_WIDTH + 78, 191, 48, 27, 6, 0xFFDCE2E6u);
         if (preferences.cursor_scale == 1u)
-            fill_rect((int32_t)NAV_WIDTH + 22, 215, 48, 3,
+            fill_round((int32_t)NAV_WIDTH + 30, 212, 32, 3, 1,
                       preferences.accent_color);
         else
-            fill_rect((int32_t)NAV_WIDTH + 78, 215, 48, 3,
+            fill_round((int32_t)NAV_WIDTH + 86, 212, 32, 3, 1,
                       preferences.accent_color);
-        fill_rect((int32_t)NAV_WIDTH + 22, 234, 84, 28,
+        fill_round((int32_t)NAV_WIDTH + 22, 234, 84, 28, 6,
                   preferences.cursor_pack == MOSDESK_CURSOR_PACK_POSY
                       ? preferences.accent_color : 0xFFDCE2E6u);
-        fill_rect((int32_t)NAV_WIDTH + 116, 234, 84, 28,
+        fill_round((int32_t)NAV_WIDTH + 116, 234, 84, 28, 6,
                   preferences.cursor_pack == MOSDESK_CURSOR_PACK_CLASSIC
                       ? preferences.accent_color : 0xFFDCE2E6u);
     } else if (category == 3u) {
         if (password_editing) {
-            fill_rect((int32_t)NAV_WIDTH + 22, 106,
-                      (int32_t)surface.width - (int32_t)NAV_WIDTH - 44,
-                      38, 0xFFFFFFFFu);
-            fill_rect((int32_t)NAV_WIDTH + 22, 106,
-                      (int32_t)surface.width - (int32_t)NAV_WIDTH - 44,
-                      1, 0xFFBCC6CDu);
-            fill_rect((int32_t)NAV_WIDTH + 22, 143,
-                      (int32_t)surface.width - (int32_t)NAV_WIDTH - 44,
-                      1, 0xFFBCC6CDu);
+            int32_t field_w = (int32_t)surface.width - (int32_t)NAV_WIDTH - 44;
+            fill_round((int32_t)NAV_WIDTH + 22, 106, field_w, 38, 7,
+                       0xFFBCC6CDu);
+            fill_round((int32_t)NAV_WIDTH + 23, 107, field_w - 2, 36, 6,
+                       0xFFFFFFFFu);
             char masked[PASSWORD_MAX_LENGTH + 1u];
             for (uint32_t i = 0; i < password_entry_length; i++)
                 masked[i] = '*';
@@ -840,19 +900,19 @@ static void draw_window(void) {
             draw_text((int32_t)NAV_WIDTH + 34, 118, masked,
                       0xFF34434Cu, false);
         } else if (preferences.login_enabled) {
-            fill_rect((int32_t)NAV_WIDTH + 22, 106, 160, 34,
+            fill_round((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
                       preferences.accent_color);
-            fill_rect((int32_t)NAV_WIDTH + 22, 151, 160, 34,
+            fill_round((int32_t)NAV_WIDTH + 22, 151, 160, 34, 8,
                       0xFFDCE2E6u);
         } else {
-            fill_rect((int32_t)NAV_WIDTH + 22, 106, 160, 34,
+            fill_round((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
                       preferences.accent_color);
         }
     } else {
-        fill_rect((int32_t)NAV_WIDTH + 22, 106, 160, 34,
+        fill_round((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
                   preferences.click_once_open
                       ? preferences.accent_color : 0xFFDCE2E6u);
-        fill_rect((int32_t)NAV_WIDTH + 22, 229, 160, 34,
+        fill_round((int32_t)NAV_WIDTH + 22, 229, 160, 34, 8,
                   preferences.grid_enabled
                       ? preferences.accent_color : 0xFFDCE2E6u);
     }
