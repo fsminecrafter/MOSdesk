@@ -50,6 +50,19 @@
 #define MOSDESK_WALLPAPER_FILL 0u
 #define MOSDESK_WALLPAPER_CROP 1u
 #define MOSDESK_WALLPAPER_STRETCH 2u
+/* Clock and date shown on the panel (Settings > Time). */
+#define MOSDESK_DATE_DAY_MONTH 0u    /* 17 Oct */
+#define MOSDESK_DATE_DMY 1u          /* 17/10/2026 */
+#define MOSDESK_DATE_MDY 2u          /* 10/17/2026 */
+#define MOSDESK_DATE_ISO 3u          /* 2026-10-17 */
+#define MOSDESK_DATE_FORMAT_COUNT 4u
+#define MOSDESK_UTC_OFFSET_MIN (-720)
+#define MOSDESK_UTC_OFFSET_MAX 840
+#define MOSDESK_TIME_URL_SIZE 192u
+#define MOSDESK_TIME_POLL_MIN 5u
+#define MOSDESK_TIME_POLL_MAX 60u
+#define MOSDESK_TIME_DEFAULT_URL \
+    "https://timeapi.io/api/v1/time/current/unix_ms"
 
 typedef struct {
     uint32_t magic;
@@ -74,6 +87,14 @@ typedef struct {
     uint32_t debug_profiler;
     char username[MOSDESK_USERNAME_SIZE];
     uint32_t ui_style;
+    /* Settings > Time. The system clock runs in UTC; the panel shows it
+     * shifted by utc_offset_minutes. */
+    uint32_t clock_24h;
+    uint32_t date_format;
+    int32_t utc_offset_minutes;
+    uint32_t time_sync_enabled;
+    uint32_t time_sync_interval;        /* seconds */
+    char time_sync_url[MOSDESK_TIME_URL_SIZE];
 } mosdesk_settings_t;
 
 /* easyui (Minimal-OS-SDK/include/easyui.h) reads ui_style straight from the
@@ -82,6 +103,33 @@ typedef struct {
 _Static_assert(offsetof(mosdesk_settings_t, ui_style) ==
                    MOSDESK_SETTINGS_UI_STYLE_OFFSET,
                "easyui reads ui_style at this offset");
+
+/* The layout before the clock and internet time settings: a file of this
+ * size is the leading part of mosdesk_settings_t. */
+typedef struct {
+    uint32_t magic;
+    uint32_t mouse_speed;
+    uint32_t accent_color;
+    uint32_t cursor_fill;
+    uint32_t cursor_scale;
+    uint32_t cursor_pack;
+    uint32_t wallpaper;
+    uint32_t onboarding_complete;
+    uint32_t login_enabled;
+    uint8_t password_salt[MOSDESK_PASSWORD_SALT_SIZE];
+    uint8_t password_hash[MOSDESK_PASSWORD_HASH_SIZE];
+    uint32_t click_once_open;
+    uint32_t grid_enabled;
+    uint32_t wallpaper_mode;
+    uint32_t wallpaper_rotation;
+    char wallpaper_path[MOSDESK_WALLPAPER_PATH_SIZE];
+    uint32_t desktop_icon_x[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t desktop_icon_y[MOSDESK_DESKTOP_ICON_COUNT];
+    uint32_t debug_fps;
+    uint32_t debug_profiler;
+    char username[MOSDESK_USERNAME_SIZE];
+    uint32_t ui_style;
+} mosdesk_settings_v7_t;
 
 /* The layout before the window style, when applications still had desktop
  * icons (see MOSDESK_DESKTOP_ICON_COUNT). */
@@ -273,6 +321,17 @@ static inline bool mosdesk_user_prepare(const char* username) {
     return true;
 }
 
+static inline void mosdesk_settings_time_defaults(mosdesk_settings_t* settings) {
+    static const char url[] = MOSDESK_TIME_DEFAULT_URL;
+    settings->clock_24h = 1u;
+    settings->date_format = MOSDESK_DATE_DAY_MONTH;
+    settings->utc_offset_minutes = 0;
+    settings->time_sync_enabled = 0u;
+    settings->time_sync_interval = 30u;
+    for (uint32_t i = 0; i < MOSDESK_TIME_URL_SIZE; i++)
+        settings->time_sync_url[i] = i < sizeof(url) ? url[i] : '\0';
+}
+
 static inline mosdesk_settings_t mosdesk_settings_default(void) {
     mosdesk_settings_t settings = {0};
     settings.magic = MOSDESK_SETTINGS_MAGIC;
@@ -287,6 +346,7 @@ static inline mosdesk_settings_t mosdesk_settings_default(void) {
         settings.desktop_icon_x[i] = UINT32_MAX;
         settings.desktop_icon_y[i] = UINT32_MAX;
     }
+    mosdesk_settings_time_defaults(&settings);
     return settings;
 }
 
@@ -300,6 +360,11 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
                 (uintptr_t)&settings, sizeof(settings)) !=
             (long)sizeof(settings))
+            settings = mosdesk_settings_default();
+    } else if (size == (long)sizeof(mosdesk_settings_v7_t)) {
+        /* v7 is the leading part; the time settings keep their defaults. */
+        if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
+                (uintptr_t)&settings, (uint64_t)size) != size)
             settings = mosdesk_settings_default();
     } else if (size == (long)sizeof(mosdesk_settings_v6_t)) {
         /* v6 is the leading part of the current layout; only the icon
@@ -433,6 +498,15 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         settings.ui_style > MOSDESK_UI_STYLE_AERO ||
         settings.username[MOSDESK_USERNAME_SIZE - 1u] != '\0')
         return mosdesk_settings_default();
+    if (settings.clock_24h > 1u ||
+        settings.date_format >= MOSDESK_DATE_FORMAT_COUNT ||
+        settings.utc_offset_minutes < MOSDESK_UTC_OFFSET_MIN ||
+        settings.utc_offset_minutes > MOSDESK_UTC_OFFSET_MAX ||
+        settings.time_sync_enabled > 1u ||
+        settings.time_sync_interval < MOSDESK_TIME_POLL_MIN ||
+        settings.time_sync_interval > MOSDESK_TIME_POLL_MAX ||
+        settings.time_sync_url[MOSDESK_TIME_URL_SIZE - 1u] != '\0')
+        mosdesk_settings_time_defaults(&settings);
     /* An unusable name is asked for again rather than used as a path. */
     if (!mosdesk_username_valid(settings.username))
         settings.username[0] = '\0';
@@ -471,6 +545,156 @@ static inline bool mosdesk_settings_save(const mosdesk_settings_t* settings) {
         (uintptr_t)settings, sizeof(*settings));
     MOSDESK_SYSCALL(SYS_CLOSE, (uintptr_t)fd, 0, 0);
     return written == (long)sizeof(*settings);
+}
+
+/* ------------------------------------------------------------ clock & date */
+
+/* Shifts a UTC date and time by `offset_minutes`. */
+static inline void mosdesk_apply_utc_offset(uint16_t* year, uint8_t* month,
+                                            uint8_t* day, uint8_t* hour,
+                                            uint8_t* minute,
+                                            int32_t offset_minutes) {
+    static const uint8_t lengths[12] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int32_t total = (int32_t)*hour * 60 + (int32_t)*minute + offset_minutes;
+    int32_t day_shift = 0;
+    while (total < 0) { total += 1440; day_shift--; }
+    while (total >= 1440) { total -= 1440; day_shift++; }
+    *hour = (uint8_t)(total / 60);
+    *minute = (uint8_t)(total % 60);
+    for (; day_shift > 0; day_shift--) {
+        uint32_t length = lengths[*month - 1u];
+        if (*month == 2u && (*year % 4u == 0u &&
+            (*year % 100u != 0u || *year % 400u == 0u)))
+            length = 29u;
+        if (++*day > length) {
+            *day = 1u;
+            if (++*month > 12u) { *month = 1u; ++*year; }
+        }
+    }
+    for (; day_shift < 0; day_shift++) {
+        if (--*day == 0u) {
+            if (--*month == 0u) { *month = 12u; --*year; }
+            uint32_t length = lengths[*month - 1u];
+            if (*month == 2u && (*year % 4u == 0u &&
+                (*year % 100u != 0u || *year % 400u == 0u)))
+                length = 29u;
+            *day = (uint8_t)length;
+        }
+    }
+}
+
+/* "14:05" or "2:05 PM". `output` holds at least 9 bytes. */
+static inline void mosdesk_format_time(char* output, uint8_t hour,
+                                       uint8_t minute, bool clock_24h) {
+    uint32_t at = 0;
+    uint32_t shown = hour;
+    if (!clock_24h) {
+        shown = hour % 12u;
+        if (!shown) shown = 12u;
+    }
+    if (clock_24h || shown >= 10u) output[at++] = (char)('0' + shown / 10u);
+    output[at++] = (char)('0' + shown % 10u);
+    output[at++] = ':';
+    output[at++] = (char)('0' + minute / 10u);
+    output[at++] = (char)('0' + minute % 10u);
+    if (!clock_24h) {
+        output[at++] = ' ';
+        output[at++] = hour < 12u ? 'A' : 'P';
+        output[at++] = 'M';
+    }
+    output[at] = '\0';
+}
+
+/* The date in one of the MOSDESK_DATE_* styles. `output` holds 12 bytes. */
+static inline void mosdesk_format_date(char* output, uint16_t year,
+                                       uint8_t month, uint8_t day,
+                                       uint32_t format) {
+    static const char months[12][4] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    char d[3] = {(char)('0' + day / 10u), (char)('0' + day % 10u), 0};
+    char m[3] = {(char)('0' + month / 10u), (char)('0' + month % 10u), 0};
+    char y[5] = {(char)('0' + year / 1000u % 10u),
+                 (char)('0' + year / 100u % 10u),
+                 (char)('0' + year / 10u % 10u),
+                 (char)('0' + year % 10u), 0};
+    const char* parts[5] = {0};
+    if (format == MOSDESK_DATE_DMY) {
+        parts[0] = d; parts[1] = "/"; parts[2] = m; parts[3] = "/";
+        parts[4] = y;
+    } else if (format == MOSDESK_DATE_MDY) {
+        parts[0] = m; parts[1] = "/"; parts[2] = d; parts[3] = "/";
+        parts[4] = y;
+    } else if (format == MOSDESK_DATE_ISO) {
+        parts[0] = y; parts[1] = "-"; parts[2] = m; parts[3] = "-";
+        parts[4] = d;
+    } else {
+        parts[0] = day >= 10u ? d : d + 1; parts[1] = " ";
+        parts[2] = month >= 1u && month <= 12u ? months[month - 1u] : "?";
+    }
+    uint32_t at = 0;
+    for (uint32_t i = 0; i < 5u; i++)
+        for (const char* p = parts[i]; p && *p; p++) output[at++] = *p;
+    output[at] = '\0';
+}
+
+/* "UTC+02:00". `output` holds 10 bytes. */
+static inline void mosdesk_format_utc_offset(char* output, int32_t minutes) {
+    uint32_t value = (uint32_t)(minutes < 0 ? -minutes : minutes);
+    output[0] = 'U'; output[1] = 'T'; output[2] = 'C';
+    output[3] = minutes < 0 ? '-' : '+';
+    output[4] = (char)('0' + value / 600u);
+    output[5] = (char)('0' + value / 60u % 10u);
+    output[6] = ':';
+    output[7] = (char)('0' + value % 60u / 10u);
+    output[8] = (char)('0' + value % 10u);
+    output[9] = '\0';
+}
+
+/* ----------------------------------------------------------- internet time
+ * SYS_TIMESYNC, as defined in the kernel's x86_64/syscall.h (the SDK copy
+ * may predate it). */
+#ifndef SYS_TIMESYNC
+#define SYS_TIMESYNC 38
+#define SYS_TIMESYNC_CONFIGURE 1u
+#define SYS_TIMESYNC_STATUS    2u
+#define SYS_TIMESYNC_URL_SIZE   192u
+#define SYS_TIMESYNC_ERROR_SIZE 64u
+typedef struct {
+    uint32_t op;
+    uint32_t enabled;
+    uint32_t interval_s;
+    uint32_t synced;
+    char url[SYS_TIMESYNC_URL_SIZE];
+    uint64_t last_unix_ms;
+    uint64_t last_sync_age_ms;
+    uint64_t attempts;
+    char error[SYS_TIMESYNC_ERROR_SIZE];
+} syscall_timesync_t;
+#endif
+
+/* Hands the internet time settings to the kernel. */
+static inline bool mosdesk_timesync_apply(const mosdesk_settings_t* settings) {
+    syscall_timesync_t request;
+    uint8_t* bytes = (uint8_t*)&request;
+    for (size_t i = 0; i < sizeof(request); i++) bytes[i] = 0;
+    request.op = SYS_TIMESYNC_CONFIGURE;
+    request.enabled = settings->time_sync_enabled;
+    request.interval_s = settings->time_sync_interval;
+    for (uint32_t i = 0; i + 1u < SYS_TIMESYNC_URL_SIZE &&
+         i < MOSDESK_TIME_URL_SIZE && settings->time_sync_url[i]; i++)
+        request.url[i] = settings->time_sync_url[i];
+    return MOSDESK_SYSCALL(SYS_TIMESYNC, (uintptr_t)&request, 0, 0) ==
+           SYS_SUCCESS;
+}
+
+static inline bool mosdesk_timesync_status(syscall_timesync_t* status) {
+    uint8_t* bytes = (uint8_t*)status;
+    for (size_t i = 0; i < sizeof(*status); i++) bytes[i] = 0;
+    status->op = SYS_TIMESYNC_STATUS;
+    return MOSDESK_SYSCALL(SYS_TIMESYNC, (uintptr_t)status, 0, 0) ==
+           SYS_SUCCESS;
 }
 
 #endif

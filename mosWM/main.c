@@ -166,6 +166,7 @@ typedef enum {
     MENU_ACTION_FILES,
     MENU_ACTION_WALLPAPERS,
     MENU_ACTION_SETTINGS,
+    MENU_ACTION_TIME_SETTINGS,
     MENU_ACTION_ADD_TO_DESKTOP,
     MENU_ACTION_COPY_TO,
     MENU_ACTION_MOVE_TO
@@ -443,6 +444,23 @@ static void wm_free(void* pointer) {
                      (uint64_t)(uintptr_t)pointer, 0);
 }
 
+/* Gives the kernel the internet time settings whenever they change. */
+static void apply_time_sync(void) {
+    static bool applied;
+    static uint32_t applied_enabled, applied_interval;
+    static char applied_url[MOSDESK_TIME_URL_SIZE];
+    if (applied && applied_enabled == desktop_settings.time_sync_enabled &&
+        applied_interval == desktop_settings.time_sync_interval &&
+        !strcmp(applied_url, desktop_settings.time_sync_url))
+        return;
+    if (!mosdesk_timesync_apply(&desktop_settings))
+        log_message("mosWM: internet time is not available\n");
+    applied = true;
+    applied_enabled = desktop_settings.time_sync_enabled;
+    applied_interval = desktop_settings.time_sync_interval;
+    strcpy(applied_url, desktop_settings.time_sync_url);
+}
+
 static void load_desktop_settings(void) {
     mosdesk_settings_t settings = mosdesk_settings_load();
     bool wallpaper_changed = strcmp(settings.wallpaper_path,
@@ -468,6 +486,7 @@ static void load_desktop_settings(void) {
     wallpaper_rotation = settings.wallpaper_rotation;
     debug_fps = settings.debug_fps != 0u;
     debug_profiler = settings.debug_profiler != 0u;
+    apply_time_sync();
 }
 
 static uint16_t read_u16le(const uint8_t* bytes) {
@@ -4035,6 +4054,52 @@ static int32_t launcher_max_scroll(void) {
     return extra > 0 ? extra : 0;
 }
 
+/* The A-Z list's scrollbar thumb: screen y and height. */
+static bool launcher_dragging;      /* the thumb follows the pointer */
+static int32_t launcher_grab;       /* where on the thumb it was taken */
+
+static void launcher_thumb(int32_t* thumb_y, int32_t* thumb_height) {
+    int32_t top, bottom;
+    launcher_list_area(&top, &bottom);
+    int32_t track = bottom - top, max = launcher_max_scroll();
+    int32_t thumb = launcher_list_height > 0
+        ? track * track / launcher_list_height : track;
+    if (thumb < 24) thumb = 24;
+    if (thumb > track) thumb = track;
+    *thumb_height = thumb;
+    *thumb_y = top + (max > 0 ? (track - thumb) * launcher_scroll / max : 0);
+}
+
+/* Scrolls so the thumb's grab point sits at screen y `py`. */
+static void launcher_drag_to(int32_t py) {
+    int32_t top, bottom, thumb_y, thumb;
+    launcher_list_area(&top, &bottom);
+    launcher_thumb(&thumb_y, &thumb);
+    int32_t travel = bottom - top - thumb, max = launcher_max_scroll();
+    int32_t position = py - launcher_grab - top;
+    if (position < 0) position = 0;
+    if (position > travel) position = travel;
+    launcher_scroll = travel > 0 ? position * max / travel : 0;
+}
+
+/* A press on the scrollbar (16 px wide strip at the list's right edge)
+ * takes the thumb, or jumps there when it lands on the track. */
+static bool launcher_scrollbar_press(int32_t px, int32_t py) {
+    int32_t x, y, width, height, top, bottom;
+    start_menu_bounds(&x, &y, &width, &height);
+    launcher_list_area(&top, &bottom);
+    if (launcher_max_scroll() <= 0 || px < x + width - 18 ||
+        px >= x + width || py < top || py >= bottom)
+        return false;
+    int32_t thumb_y, thumb;
+    launcher_thumb(&thumb_y, &thumb);
+    launcher_grab = py >= thumb_y && py < thumb_y + thumb ? py - thumb_y
+                                                          : thumb / 2;
+    launcher_dragging = true;
+    launcher_drag_to(py);
+    return true;
+}
+
 static void launcher_scroll_by(int32_t pixels) {
     int32_t max = launcher_max_scroll();
     launcher_scroll += pixels;
@@ -4073,10 +4138,6 @@ static void launcher_activate(uint32_t item, bool menu_for_app);
 
 static void draw_taskbar(const syscall_window_info_t* windows,
                          uint64_t count) {
-    static const char* const months[] = {
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
-    };
     int32_t top = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT;
     int32_t width = (int32_t)display.width;
     uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
@@ -4175,19 +4236,19 @@ static void draw_taskbar(const syscall_window_info_t* windows,
 
     /* System tray: separator + two-line clock. */
     if (clock_valid) {
-        char hhmm[6] = { (char)('0' + clock_time.hour / 10u),
-                         (char)('0' + clock_time.hour % 10u), ':',
-                         (char)('0' + clock_time.minute / 10u),
-                         (char)('0' + clock_time.minute % 10u), '\0' };
-        char date[8];
-        uint32_t di = 0;
-        if (clock_time.day >= 10u)
-            date[di++] = (char)('0' + clock_time.day / 10u);
-        date[di++] = (char)('0' + clock_time.day % 10u);
-        date[di++] = ' ';
-        for (uint32_t k = 0; k < 3u; k++)
-            date[di++] = months[clock_time.month - 1u][k];
-        date[di] = '\0';
+        /* The kernel clock runs in UTC; Settings > Time gives the offset
+         * and the formats. */
+        uint16_t year = clock_time.year;
+        uint8_t month = clock_time.month, day = clock_time.day;
+        uint8_t hour = clock_time.hour, minute = clock_time.minute;
+        mosdesk_apply_utc_offset(&year, &month, &day, &hour, &minute,
+                                 desktop_settings.utc_offset_minutes);
+        char hhmm[12];
+        mosdesk_format_time(hhmm, hour, minute,
+                            desktop_settings.clock_24h != 0u);
+        char date[12];
+        mosdesk_format_date(date, year, month, day,
+                            desktop_settings.date_format);
         int32_t center = width - 62;
         fill_rect(width - 124, top + 10, 1, 28, 0x24FFFFFFu);
         wm_text(center - (int32_t)moswm_text_width(hhmm, 2) / 2, top + 9,
@@ -4295,16 +4356,15 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         }
         clip = saved_clip;
         if (max_scroll > 0) {
-            /* Scrollbar for the A-Z list. */
-            int32_t track = list_bottom - list_top;
-            int32_t thumb = track * track / launcher_list_height;
-            if (thumb < 24) thumb = 24;
-            int32_t thumb_y = list_top +
-                (track - thumb) * launcher_scroll / max_scroll;
-            fill_rounded_rect(mx + mw - 9, list_top, 4, track, 2,
+            /* Scrollbar for the A-Z list; it can be dragged. */
+            int32_t track = list_bottom - list_top, thumb_y, thumb;
+            launcher_thumb(&thumb_y, &thumb);
+            fill_rounded_rect(mx + mw - 10, list_top, 6, track, 3,
                               aero ? 0x30000000u : 0x30FFFFFFu);
-            fill_rounded_rect(mx + mw - 9, thumb_y, 4, thumb, 2,
-                              aero ? 0xA06A7F94u : 0xA0FFFFFFu);
+            fill_rounded_rect(mx + mw - 10, thumb_y, 6, thumb, 3,
+                              launcher_dragging ? (0xE0000000u |
+                                  (accent_color & 0x00FFFFFFu))
+                              : aero ? 0xA06A7F94u : 0xA0FFFFFFu);
         }
         if (!aero) fill_rect(mx + 18, my + mh - 34, mw - 36, 1, 0xFF353C42u);
         /* Fitted, because the fallback bitmap font is wider than the menu. */
@@ -4398,6 +4458,13 @@ static void menu_show_for_folder(const char* directory) {
              false, true);
     menu_add(MENU_ACTION_REFRESH, "Refresh", MOSWM_ICON_REFRESH, true, true);
     menu_show(CLICK_ACTION_NONE, directory);
+}
+
+static void menu_show_for_clock(void) {
+    menu_item_count = 0;
+    menu_add(MENU_ACTION_TIME_SETTINGS, "Date & time settings",
+             MOSWM_ICON_SETTINGS, false, true);
+    menu_show(CLICK_ACTION_NONE, "");
 }
 
 static void menu_show_for_desktop(void) {
@@ -5131,6 +5198,9 @@ static void run_menu_action(menu_action_t action) {
         case MENU_ACTION_SETTINGS:
             open_settings(NULL);
             break;
+        case MENU_ACTION_TIME_SETTINGS:
+            open_settings("time");
+            break;
         case MENU_ACTION_ADD_TO_DESKTOP:
             add_to_desktop(menu_path);
             break;
@@ -5807,6 +5877,9 @@ static void scene_regions(region_state_t* regions) {
     hash = hash_u64(hash, ((uint64_t)start_menu_open << 32) | hover_taskbar);
     hash = hash_u64(hash, (uint64_t)(uint32_t)launcher_scroll);
     hash = hash_u64(hash, clock_valid);
+    hash = hash_u64(hash, ((uint64_t)desktop_settings.clock_24h << 40) |
+                          ((uint64_t)desktop_settings.date_format << 32) |
+                          (uint32_t)desktop_settings.utc_offset_minutes);
     regions[REGION_PANEL].signature =
         hash_bytes(hash, &clock_time, sizeof(clock_time));
     regions[REGION_PANEL].area = (rect_t){
@@ -5815,7 +5888,8 @@ static void scene_regions(region_state_t* regions) {
 
     regions[REGION_START_MENU].signature =
         (((uint64_t)start_menu_open << 32) | hover_start_row) ^
-        ((uint64_t)(uint32_t)launcher_scroll << 40);
+        ((uint64_t)(uint32_t)launcher_scroll << 40) ^
+        ((uint64_t)launcher_dragging << 31);
     regions[REGION_START_MENU].area = (rect_t){0};
     if (start_menu_open) {
         int32_t x, y, width, height;
@@ -6138,6 +6212,7 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         cursor_x < menu_left + menu_width && cursor_y >= menu_top &&
         cursor_y < menu_top + menu_tall) {
         last_click_valid = false;
+        if (launcher_scrollbar_press(cursor_x, cursor_y)) return;
         uint32_t row = start_menu_row_at(cursor_x, cursor_y);
         if (row == UINT32_MAX) return;
         start_menu_open = false;
@@ -6246,7 +6321,11 @@ static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
             return;
         }
     }
-    if ((uint32_t)cursor_y >= display.height - TASKBAR_HEIGHT) return;
+    if ((uint32_t)cursor_y >= display.height - TASKBAR_HEIGHT) {
+        /* Right-clicking the clock offers the date and time settings. */
+        if (cursor_x >= (int32_t)display.width - 124) menu_show_for_clock();
+        return;
+    }
     syscall_window_info_t* info =
         window_at(windows, count, cursor_x, cursor_y);
     if (info) {
@@ -6281,6 +6360,10 @@ static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
 
 /* Works out what the pointer is resting on, for hover highlights. */
 static void update_hover(syscall_window_info_t* windows, uint64_t count) {
+    if (launcher_dragging) {
+        if (start_menu_open) launcher_drag_to(cursor_y);
+        else launcher_dragging = false;
+    }
     hover_desktop_icon = UINT32_MAX;
     hover_taskbar = UINT32_MAX;
     hover_start_row = UINT32_MAX;
@@ -6339,6 +6422,7 @@ static void update_hover(syscall_window_info_t* windows, uint64_t count) {
 
 static void on_mouse_up(syscall_window_info_t* windows, uint64_t count,
                         uint32_t time_ms) {
+    launcher_dragging = false;
     if (desktop_icon_drag_index != UINT32_MAX) {
         if (desktop_icon_drag_moved &&
             !mosdesk_settings_save(&desktop_settings)) {
@@ -6503,7 +6587,12 @@ static void route_input(const syscall_input_event_t* input,
             if (!right_pressed) return;
             menu_open = false;
         }
-        syscall_window_info_t* under =
+        /* The open launcher covers the windows below it. */
+        int32_t lx, ly, lw, lh;
+        start_menu_bounds(&lx, &ly, &lw, &lh);
+        bool on_launcher = start_menu_open && cursor_x >= lx &&
+            cursor_x < lx + lw && cursor_y >= ly && cursor_y < ly + lh;
+        syscall_window_info_t* under = on_launcher ? NULL :
             window_at(windows, count, cursor_x, cursor_y);
         if (under) {
             focus_window(under);

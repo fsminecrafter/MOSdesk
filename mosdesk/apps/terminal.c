@@ -756,10 +756,7 @@ static void start_program(const char* path, int argc, char** argv) {
             args[i] = resolved[i];
     }
     long result = mos_exec(path, argc ? args : NULL, argc);
-    if (result < 0) { error_line(base_name(path), "could not start it"); return; }
-    outc("Started ", color_dim);
-    outc(path, color_dim);
-    outc(" as a user process.\n", color_dim);
+    if (result < 0) error_line(base_name(path), "could not start it");
 }
 
 static void cmd_run(int argc, char** argv) {

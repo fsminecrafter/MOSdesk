@@ -27,7 +27,8 @@
 #define PAGE_DESKTOP 4u
 #define PAGE_DEBUG 5u
 #define PAGE_ABOUT 6u
-#define PAGE_COUNT 7u
+#define PAGE_TIME 7u
+#define PAGE_COUNT 8u
 
 #define WALLPAPER_DIRECTORY "0:/programs/mosWM/assets/wallpapers"
 #define THUMB_WIDTH 96u
@@ -74,8 +75,11 @@ static bool photos_loaded;
 
 static const uint32_t nav_order[PAGE_COUNT] = {
     PAGE_APPEARANCE, PAGE_MOUSE, PAGE_CURSOR, PAGE_LOGIN, PAGE_DESKTOP,
-    PAGE_DEBUG, PAGE_ABOUT
+    PAGE_TIME, PAGE_DEBUG, PAGE_ABOUT
 };
+/* Scroll offset of the Time page (Appearance has appearance_scroll). */
+static int32_t time_scroll;
+static int32_t time_page_height(void);
 static ttrend_font_t small_font = {1, 1, 0, 0};
 static ttrend_font_t large_font = {2, 1, 1, 0};
 static ttrend_font_t loaded_font;
@@ -447,18 +451,51 @@ static int32_t scroll_track_top(void) { return CONTENT_TOP + 6; }
 static int32_t scroll_track_length(void) {
     return (int32_t)surface.height - CONTENT_TOP - 12;
 }
+/* The scrolling page shown now: Appearance or Time. */
+static int32_t page_height(void) {
+    return category == PAGE_TIME ? time_page_height()
+                                 : appearance_page_height();
+}
+static int32_t* page_scroll(void) {
+    return category == PAGE_TIME ? &time_scroll : &appearance_scroll;
+}
+static int32_t page_max_scroll(void) {
+    int32_t overflow = page_height() - (int32_t)surface.height;
+    return overflow > 0 ? overflow : 0;
+}
+static void scroll_page_by(int32_t step) {
+    int32_t* scroll = page_scroll();
+    *scroll += step;
+    if (*scroll > page_max_scroll()) *scroll = page_max_scroll();
+    if (*scroll < 0) *scroll = 0;
+}
 static int32_t scroll_thumb_length(void) {
     int32_t track = scroll_track_length();
-    int32_t thumb = track * (int32_t)surface.height / appearance_page_height();
+    int32_t thumb = track * (int32_t)surface.height / page_height();
     if (thumb < SCROLLBAR_MIN_THUMB) thumb = SCROLLBAR_MIN_THUMB;
     return thumb > track ? track : thumb;
 }
 static int32_t scroll_thumb_top(void) {
-    int32_t max_scroll = appearance_max_scroll();
+    int32_t max_scroll = page_max_scroll();
     if (max_scroll <= 0) return scroll_track_top();
     return scroll_track_top() +
            (scroll_track_length() - scroll_thumb_length()) *
-               appearance_scroll / max_scroll;
+               *page_scroll() / max_scroll;
+}
+
+/* Covers scrolled content under the page header and draws the scrollbar. */
+static void draw_page_scrollbar(void) {
+    fill_rect((int32_t)NAV_WIDTH + 1, 0,
+              (int32_t)surface.width - (int32_t)NAV_WIDTH - 1, CONTENT_TOP,
+              0xFFF3F5F6u);
+    if (page_max_scroll() > 0) {
+        int32_t x = (int32_t)surface.width - SCROLLBAR_WIDTH - 5;
+        fill_round(x, scroll_track_top(), SCROLLBAR_WIDTH,
+                  scroll_track_length(), SCROLLBAR_WIDTH / 2, 0xFFDDE4E9u);
+        fill_round(x, scroll_thumb_top(), SCROLLBAR_WIDTH,
+                  scroll_thumb_length(), SCROLLBAR_WIDTH / 2,
+                  scroll_dragging ? preferences.accent_color : 0xFF94A5B1u);
+    }
 }
 
 static void draw_tile_frame(int32_t x, int32_t y, bool selected,
@@ -547,23 +584,13 @@ static void draw_appearance_page(void) {
     }
 
     /* Scrolled content must not show through the page header. */
-    fill_rect((int32_t)NAV_WIDTH + 1, 0,
-              (int32_t)surface.width - (int32_t)NAV_WIDTH - 1, CONTENT_TOP,
-              0xFFF3F5F6u);
-    if (appearance_max_scroll() > 0) {
-        int32_t x = (int32_t)surface.width - SCROLLBAR_WIDTH - 5;
-        fill_round(x, scroll_track_top(), SCROLLBAR_WIDTH,
-                  scroll_track_length(), SCROLLBAR_WIDTH / 2, 0xFFDDE4E9u);
-        fill_round(x, scroll_thumb_top(), SCROLLBAR_WIDTH,
-                  scroll_thumb_length(), SCROLLBAR_WIDTH / 2,
-                  scroll_dragging ? preferences.accent_color : 0xFF94A5B1u);
-    }
+    draw_page_scrollbar();
 }
 
 /* Dragging the scrollbar thumb, or pressing the track to jump there. Returns
  * true while the pointer belongs to the scrollbar. */
-static bool appearance_scroll_drag(int32_t x, int32_t y, bool pressed) {
-    int32_t max_scroll = appearance_max_scroll();
+static bool page_scroll_drag(int32_t x, int32_t y, bool pressed) {
+    int32_t max_scroll = page_max_scroll();
     if (pressed && max_scroll > 0 && y >= CONTENT_TOP &&
         x >= (int32_t)surface.width - SCROLLBAR_GRAB) {
         int32_t offset = y - scroll_thumb_top();
@@ -576,7 +603,7 @@ static bool appearance_scroll_drag(int32_t x, int32_t y, bool pressed) {
     int32_t position = y - scroll_grab_offset - scroll_track_top();
     if (position < 0) position = 0;
     if (position > travel) position = travel;
-    appearance_scroll = travel > 0 ? position * max_scroll / travel : 0;
+    *page_scroll() = travel > 0 ? position * max_scroll / travel : 0;
     return true;
 }
 
@@ -776,6 +803,8 @@ static void draw_control_labels(void) {
     }
 }
 
+static void draw_time_page(void);
+
 static void draw_settings_message(void) {
     if (settings_message[0])
         draw_text((int32_t)NAV_WIDTH + 22,
@@ -789,17 +818,20 @@ static void draw_window(void) {
     if (nav_scroll > nav_max_scroll()) nav_scroll = nav_max_scroll();
     if (appearance_scroll > appearance_max_scroll())
         appearance_scroll = appearance_max_scroll();
+    if (category == PAGE_TIME && time_scroll > page_max_scroll())
+        time_scroll = page_max_scroll();
     if (category == PAGE_APPEARANCE) draw_appearance_page();
     else if (category == PAGE_ABOUT) draw_about_page();
+    else if (category == PAGE_TIME) draw_time_page();
 
     /* Sidebar: rows scroll underneath the fixed title. */
     static const moswm_file_icon_t nav_icons[PAGE_COUNT] = {
         MOSWM_ICON_APPEARANCE, MOSWM_ICON_MOUSE, MOSWM_ICON_POINTER,
         MOSWM_ICON_LOCK, MOSWM_ICON_DESKTOP, MOSWM_ICON_TERMINAL,
-        MOSWM_ICON_INFO};
+        MOSWM_ICON_INFO, MOSWM_ICON_NETWORK};
     static const char* const nav_names[PAGE_COUNT] = {
         "Appearance", "Mouse", "Cursor", "Login", "Desktop", "Debug",
-        "About"};
+        "About", "Date & time"};
     fill_rect(0, 0, (int32_t)NAV_WIDTH, (int32_t)surface.height,
               0xFFE6EAEDu);
     for (uint32_t i = 0; i < PAGE_COUNT; i++) {
@@ -841,6 +873,11 @@ static void draw_window(void) {
     }
     if (category == PAGE_ABOUT) {
         draw_text(content_left(), 15, "About", 0xFF273640u, true);
+        return;
+    }
+    if (category == PAGE_TIME) {
+        draw_text(content_left(), 15, "Date & time", 0xFF273640u, true);
+        draw_settings_message();
         return;
     }
 
@@ -978,17 +1015,374 @@ static void save_login_password(void) {
     settings_message[0] = '\0';
 }
 
+/* ------------------------------------------------------------- time page
+ *
+ * Clock style, date format, time zone and internet time. Opened from the
+ * sidebar or by right-clicking the panel clock ("mosdesk.run time").
+ */
+
+#define TIME_CLOCK_Y 60
+#define TIME_DATE_Y 134
+#define TIME_ZONE_Y 208
+#define TIME_SYNC_Y 282
+#define TIME_URL_Y 346
+#define TIME_POLL_Y 414
+#define TIME_STATUS_Y 466
+#define TIME_BUTTON_H 30
+
+static int32_t time_page_height(void) { return TIME_STATUS_Y + 40; }
+
+/* Bumped whenever the page changes in a way the settings do not show
+ * (typing in the address field). */
+static uint32_t time_ui_generation;
+static uint32_t time_status_frames;
+static bool poll_dragging;
+
+/* The server address while it is being edited. */
+static struct {
+    bool active;
+    char text[MOSDESK_TIME_URL_SIZE];
+    uint32_t length;
+} url_entry;
+
+static uint16_t now_year;
+static uint8_t now_month = 1, now_day = 1, now_hour, now_minute;
+
+/* The local date and time, as the panel shows it. */
+static void read_local_time(void) {
+    struct {
+        uint16_t year;
+        uint8_t month, day, hour, minute, second;
+    } now = {0};
+    if (mos_syscall(SYS_GETTIME, (long)(uintptr_t)&now, 0, 0) != SYS_SUCCESS ||
+        now.month < 1u || now.month > 12u)
+        return;
+    now_year = now.year; now_month = now.month; now_day = now.day;
+    now_hour = now.hour; now_minute = now.minute;
+    mosdesk_apply_utc_offset(&now_year, &now_month, &now_day, &now_hour,
+                             &now_minute, preferences.utc_offset_minutes);
+}
+
+static bool inside(int32_t px, int32_t py, int32_t x, int32_t y,
+                   int32_t width, int32_t height) {
+    return px >= x && px < x + width && py >= y && py < y + height;
+}
+
+static void draw_button(int32_t x, int32_t y, int32_t width, const char* label,
+                        bool selected) {
+    fill_round(x, y, width, TIME_BUTTON_H, 7,
+               selected ? preferences.accent_color : 0xFFDCE2E6u);
+    int32_t text_width = (int32_t)ttrend_text_width(label, &small_font);
+    draw_text(x + (width - text_width) / 2, y + 10, label,
+              selected ? 0xFFFFFFFFu : 0xFF34434Cu, false);
+}
+
+static int32_t url_field_width(void) { return content_width() - 78; }
+
+static int32_t poll_track_width(void) {
+    int32_t width = content_width() - 12;
+    return width > 40 ? width : 40;
+}
+
+static void draw_url_field(int32_t x, int32_t y) {
+    int32_t width = url_field_width();
+    fill_round(x, y, width, 34, 7,
+               url_entry.active ? preferences.accent_color : 0xFFBCC6CDu);
+    fill_round(x + 1, y + 1, width - 2, 32, 6, 0xFFFFFFFFu);
+    const char* start = url_entry.active ? url_entry.text
+                                         : preferences.time_sync_url;
+    /* Show the end of a long address, where the caret is. */
+    while (*start &&
+           (int32_t)ttrend_text_width(start, &small_font) > width - 24)
+        start++;
+    draw_text(x + 10, y + 11, start, 0xFF34434Cu, false);
+    if (url_entry.active) {
+        int32_t caret = x + 11 + (int32_t)ttrend_text_width(start, &small_font);
+        fill_rect(caret, y + 8, 2, 18, preferences.accent_color);
+    }
+}
+
+static void append(char* line, size_t capacity, const char* text) {
+    size_t at = strlen(line);
+    while (*text && at + 1u < capacity) line[at++] = *text++;
+    line[at] = '\0';
+}
+
+static void append_number(char* line, size_t capacity, uint64_t value) {
+    char digits[21];
+    uint32_t count = 0;
+    do { digits[count++] = (char)('0' + value % 10u); value /= 10u; }
+    while (value && count < sizeof(digits));
+    char text[22];
+    uint32_t at = 0;
+    while (count) text[at++] = digits[--count];
+    text[at] = '\0';
+    append(line, capacity, text);
+}
+
+static void draw_time_page(void) {
+    int32_t left = content_left();
+    int32_t s = time_scroll;
+    read_local_time();
+    char time_text[12], date_text[12], line[96];
+
+    draw_text(left, TIME_CLOCK_Y - s, "Clock", 0xFF34434Cu, true);
+    draw_button(left, TIME_CLOCK_Y + 26 - s, 100, "24-hour",
+                preferences.clock_24h != 0u);
+    draw_button(left + 108, TIME_CLOCK_Y + 26 - s, 100, "12-hour",
+                preferences.clock_24h == 0u);
+    mosdesk_format_time(time_text, now_hour, now_minute,
+                        preferences.clock_24h != 0u);
+    mosdesk_format_date(date_text, now_year, now_month, now_day,
+                        preferences.date_format);
+    line[0] = '\0';
+    append(line, sizeof line, "Now ");
+    append(line, sizeof line, time_text);
+    append(line, sizeof line, ", ");
+    append(line, sizeof line, date_text);
+    draw_text(left + 224, TIME_CLOCK_Y + 36 - s, line, 0xFF667680u, false);
+
+    draw_text(left, TIME_DATE_Y - s, "Date format", 0xFF34434Cu, true);
+    for (uint32_t i = 0; i < MOSDESK_DATE_FORMAT_COUNT; i++) {
+        mosdesk_format_date(date_text, now_year, now_month, now_day, i);
+        draw_button(left + (int32_t)i * 94, TIME_DATE_Y + 26 - s, 88,
+                    date_text, preferences.date_format == i);
+    }
+
+    draw_text(left, TIME_ZONE_Y - s, "Time zone", 0xFF34434Cu, true);
+    draw_button(left, TIME_ZONE_Y + 26 - s, 30, "-", false);
+    char offset[10];
+    mosdesk_format_utc_offset(offset, preferences.utc_offset_minutes);
+    draw_text(left + 44, TIME_ZONE_Y + 36 - s, offset, 0xFF34434Cu, false);
+    draw_button(left + 124, TIME_ZONE_Y + 26 - s, 30, "+", false);
+    draw_text(left + 170, TIME_ZONE_Y + 36 - s,
+              "Scroll or click to change.", 0xFF667680u, false);
+
+    draw_text(left, TIME_SYNC_Y - s, "Internet time", 0xFF34434Cu, true);
+    draw_button(left, TIME_SYNC_Y + 26 - s, 100,
+                preferences.time_sync_enabled ? "On" : "Off",
+                preferences.time_sync_enabled != 0u);
+    draw_text(left + 116, TIME_SYNC_Y + 36 - s,
+              "Sets the clock from a time server.", 0xFF667680u, false);
+
+    draw_text(left, TIME_URL_Y - s,
+              "Server address (answers with Unix time in ms)",
+              0xFF34434Cu, false);
+    draw_url_field(left, TIME_URL_Y + 18 - s);
+    draw_button(left + url_field_width() + 8, TIME_URL_Y + 20 - s, 70,
+                "Default", false);
+
+    line[0] = '\0';
+    append(line, sizeof line, "Check every ");
+    append_number(line, sizeof line, preferences.time_sync_interval);
+    append(line, sizeof line, " seconds");
+    draw_text(left, TIME_POLL_Y - s, line, 0xFF34434Cu, false);
+    int32_t track_x = left + 6, track_y = TIME_POLL_Y + 28 - s;
+    int32_t track_width = poll_track_width();
+    int32_t marker = track_width *
+        (int32_t)(preferences.time_sync_interval - MOSDESK_TIME_POLL_MIN) /
+        (int32_t)(MOSDESK_TIME_POLL_MAX - MOSDESK_TIME_POLL_MIN);
+    fill_round(track_x, track_y, track_width, 5, 2, 0xFFBCC6CDu);
+    fill_round(track_x, track_y, marker, 5, 2, preferences.accent_color);
+    fill_disc(track_x + marker, track_y + 2, 9, preferences.accent_color);
+    fill_disc(track_x + marker, track_y + 2, 4, 0xFFFFFFFFu);
+
+    syscall_timesync_t status;
+    uint32_t status_color = 0xFF667680u;
+    if (!mosdesk_timesync_status(&status)) {
+        strcpy(line, "This kernel has no internet time support.");
+        status_color = 0xFFB43A32u;
+    } else if (!preferences.time_sync_enabled) {
+        strcpy(line, "Internet time is off.");
+    } else if (status.error[0]) {
+        strcpy(line, "Last attempt failed: ");
+        append(line, sizeof line, status.error);
+        status_color = 0xFFB43A32u;
+    } else if (status.synced) {
+        strcpy(line, "Synced ");
+        append_number(line, sizeof line, status.last_sync_age_ms / 1000u);
+        append(line, sizeof line, " s ago.");
+        status_color = 0xFF2E7D4Fu;
+    } else {
+        strcpy(line, "Waiting for the first answer...");
+    }
+    draw_text(left, TIME_STATUS_Y - s, line, status_color, false);
+    draw_page_scrollbar();
+}
+
+static void save_time_settings(const mosdesk_settings_t* previous) {
+    save_preferences(previous);
+    /* mosWM passes this on too; doing it here makes it take effect now. */
+    mosdesk_timesync_apply(&preferences);
+    time_ui_generation++;
+}
+
+static void url_entry_end(void) {
+    memset(&url_entry, 0, sizeof(url_entry));
+    time_ui_generation++;
+}
+
+static void set_poll_interval(int32_t seconds) {
+    if (seconds < (int32_t)MOSDESK_TIME_POLL_MIN)
+        seconds = (int32_t)MOSDESK_TIME_POLL_MIN;
+    if (seconds > (int32_t)MOSDESK_TIME_POLL_MAX)
+        seconds = (int32_t)MOSDESK_TIME_POLL_MAX;
+    if ((uint32_t)seconds == preferences.time_sync_interval) return;
+    mosdesk_settings_t previous = preferences;
+    preferences.time_sync_interval = (uint32_t)seconds;
+    save_time_settings(&previous);
+}
+
+static void set_utc_offset(int32_t minutes) {
+    if (minutes < MOSDESK_UTC_OFFSET_MIN || minutes > MOSDESK_UTC_OFFSET_MAX)
+        return;
+    mosdesk_settings_t previous = preferences;
+    preferences.utc_offset_minutes = minutes;
+    save_time_settings(&previous);
+}
+
+static void time_page_mouse(int32_t x, int32_t y, bool pressed) {
+    if (x < (int32_t)NAV_WIDTH) {
+        poll_dragging = false;
+        return;
+    }
+    int32_t left = content_left();
+    int32_t py = y + time_scroll;
+    /* The interval slider follows a held button. */
+    if (pressed && y >= CONTENT_TOP)
+        poll_dragging = inside(x, py, left - 6, TIME_POLL_Y + 14,
+                               poll_track_width() + 24, 30);
+    if (poll_dragging) {
+        int32_t relative = x - left - 6, track_width = poll_track_width();
+        if (relative < 0) relative = 0;
+        if (relative > track_width) relative = track_width;
+        set_poll_interval((int32_t)MOSDESK_TIME_POLL_MIN +
+            (relative * (int32_t)(MOSDESK_TIME_POLL_MAX - MOSDESK_TIME_POLL_MIN) +
+             track_width / 2) / track_width);
+        return;
+    }
+    if (!pressed || y < CONTENT_TOP) return;
+    bool on_field = inside(x, py, left, TIME_URL_Y + 18, url_field_width(), 34);
+    if (url_entry.active && !on_field)
+        url_entry_end();        /* clicking elsewhere drops the unsaved edit */
+    mosdesk_settings_t previous = preferences;
+    if (inside(x, py, left, TIME_CLOCK_Y + 26, 208, TIME_BUTTON_H)) {
+        preferences.clock_24h = x < left + 104 ? 1u : 0u;
+    } else if (inside(x, py, left, TIME_DATE_Y + 26,
+                      (int32_t)MOSDESK_DATE_FORMAT_COUNT * 94, TIME_BUTTON_H)) {
+        uint32_t format = (uint32_t)((x - left) / 94);
+        if (format >= MOSDESK_DATE_FORMAT_COUNT) return;
+        preferences.date_format = format;
+    } else if (inside(x, py, left, TIME_ZONE_Y + 26, 30, TIME_BUTTON_H)) {
+        set_utc_offset(preferences.utc_offset_minutes - 30);
+        return;
+    } else if (inside(x, py, left + 124, TIME_ZONE_Y + 26, 30, TIME_BUTTON_H)) {
+        set_utc_offset(preferences.utc_offset_minutes + 30);
+        return;
+    } else if (inside(x, py, left, TIME_SYNC_Y + 26, 100, TIME_BUTTON_H)) {
+        preferences.time_sync_enabled = !preferences.time_sync_enabled;
+    } else if (on_field) {
+        if (!url_entry.active) {
+            memset(&url_entry, 0, sizeof(url_entry));
+            url_entry.active = true;
+            while (preferences.time_sync_url[url_entry.length] &&
+                   url_entry.length + 1u < sizeof(url_entry.text)) {
+                url_entry.text[url_entry.length] =
+                    preferences.time_sync_url[url_entry.length];
+                url_entry.length++;
+            }
+            settings_message[0] = '\0';
+            time_ui_generation++;
+        }
+        return;
+    } else if (inside(x, py, left + url_field_width() + 8, TIME_URL_Y + 20,
+                      70, TIME_BUTTON_H)) {
+        static const char url[] = MOSDESK_TIME_DEFAULT_URL;
+        memset(preferences.time_sync_url, 0, sizeof(preferences.time_sync_url));
+        memcpy(preferences.time_sync_url, url, sizeof(url));
+        url_entry_end();
+    } else {
+        return;
+    }
+    save_time_settings(&previous);
+}
+
+/* The wheel changes the time zone or the interval when it is over them.
+ * Returns false when the page should scroll instead. */
+static bool time_page_wheel(int32_t x, int32_t y, int32_t wheel) {
+    int32_t py = y + time_scroll, left = content_left();
+    int32_t step = wheel > 0 ? 1 : -1;
+    if (y < CONTENT_TOP || x < left - 6) return false;
+    if (inside(x, py, left - 6, TIME_ZONE_Y + 20, 170, 42)) {
+        set_utc_offset(preferences.utc_offset_minutes + step * 30);
+        return true;
+    }
+    if (inside(x, py, left - 6, TIME_POLL_Y + 14, poll_track_width() + 24, 30)) {
+        set_poll_interval((int32_t)preferences.time_sync_interval + step * 5);
+        return true;
+    }
+    return false;
+}
+
+static void time_page_key(const syscall_window_event_t* event) {
+    if (!url_entry.active || !event->buttons) return;
+    time_ui_generation++;
+    if (event->key == 40u) {            /* Enter */
+        if (strncmp(url_entry.text, "http://", 7) != 0 &&
+            strncmp(url_entry.text, "https://", 8) != 0) {
+            strcpy(settings_message, "Start the address with https://");
+            return;
+        }
+        mosdesk_settings_t previous = preferences;
+        memset(preferences.time_sync_url, 0, sizeof(preferences.time_sync_url));
+        memcpy(preferences.time_sync_url, url_entry.text, url_entry.length);
+        url_entry_end();
+        save_time_settings(&previous);
+        return;
+    }
+    if (event->key == 41u) {            /* Esc */
+        url_entry_end();
+        settings_message[0] = '\0';
+        return;
+    }
+    if (event->key == 42u) {            /* Backspace */
+        if (url_entry.length) url_entry.text[--url_entry.length] = '\0';
+        settings_message[0] = '\0';
+        return;
+    }
+    char character = (char)mos_syscall(SYS_USB,
+        SYS_USB_KEY_TO_ASCII, event->key,
+        mosdesk_usb_modifiers(event->mods));
+    if (character < 33 || character > 126) return;
+    if (url_entry.length + 1u >= sizeof(url_entry.text)) return;
+    url_entry.text[url_entry.length++] = character;
+    url_entry.text[url_entry.length] = '\0';
+    settings_message[0] = '\0';
+}
+
 static void handle_wheel(const syscall_window_event_t* event) {
     int32_t step = event->wheel < 0 ? 44 : -44;
+    /* Over the pointer-speed slider the wheel moves the slider. */
+    if (category == 1u && event->x >= (int32_t)NAV_WIDTH &&
+        event->y >= 80 && event->y < 132) {
+        mosdesk_settings_t previous = preferences;
+        int32_t speed = (int32_t)preferences.mouse_speed +
+                        (event->wheel > 0 ? 10 : -10);
+        if (speed < 50) speed = 50;
+        if (speed > 200) speed = 200;
+        preferences.mouse_speed = (uint32_t)speed;
+        save_preferences(&previous);
+        return;
+    }
     if (event->x < (int32_t)NAV_WIDTH) {
         nav_scroll += step;
         if (nav_scroll < 0) nav_scroll = 0;
         if (nav_scroll > nav_max_scroll()) nav_scroll = nav_max_scroll();
+    } else if (category == PAGE_TIME) {
+        if (!time_page_wheel(event->x, event->y, event->wheel))
+            scroll_page_by(step);
     } else if (category == PAGE_APPEARANCE) {
-        appearance_scroll += step;
-        if (appearance_scroll < 0) appearance_scroll = 0;
-        if (appearance_scroll > appearance_max_scroll())
-            appearance_scroll = appearance_max_scroll();
+        scroll_page_by(step);
     }
 }
 
@@ -1004,8 +1398,13 @@ static void handle_mouse(const syscall_window_event_t* event) {
     mosdesk_settings_t previous = preferences;
     int32_t x = event->x;
     int32_t y = event->y;
-    if (category == PAGE_APPEARANCE && appearance_scroll_drag(x, y, pressed))
+    if ((category == PAGE_APPEARANCE || category == PAGE_TIME) &&
+        page_scroll_drag(x, y, pressed))
         return;
+    if (category == PAGE_TIME) {
+        time_page_mouse(x, y, pressed);
+        if (x >= (int32_t)NAV_WIDTH) return;
+    }
     /* Only the pointer-speed slider follows a held button; everything else
      * acts once per click. */
     if (!pressed && !(category == 1u && x >= (int32_t)NAV_WIDTH)) return;
@@ -1092,11 +1491,14 @@ static bool mouse_changed_window(const syscall_window_event_t* event) {
     char message_before[sizeof(settings_message)];
     memcpy(message_before, settings_message, sizeof(message_before));
     uint32_t hover_before = nav_hover, page_before = category;
-    int32_t scroll_before = appearance_scroll;
+    int32_t scroll_before = appearance_scroll, time_scroll_before = time_scroll;
+    uint32_t time_ui_before = time_ui_generation;
     bool dragging_before = scroll_dragging, editing_before = password_editing;
     handle_mouse(event);
     return hover_before != nav_hover || page_before != category ||
            scroll_before != appearance_scroll ||
+           time_scroll_before != time_scroll ||
+           time_ui_before != time_ui_generation ||
            dragging_before != scroll_dragging ||
            editing_before != password_editing ||
            memcmp(message_before, settings_message, sizeof(message_before)) ||
@@ -1104,6 +1506,10 @@ static bool mouse_changed_window(const syscall_window_event_t* event) {
 }
 
 static void handle_key(const syscall_window_event_t* event) {
+    if (category == PAGE_TIME) {
+        time_page_key(event);
+        return;
+    }
     if (category != 3u || !password_editing || !event->buttons) return;
     if (event->key == 40u) {
         save_login_password();
@@ -1176,6 +1582,9 @@ int main(int argc, char** argv) {
              * clamps this once the surface exists. */
             category = PAGE_APPEARANCE;
             appearance_scroll = wallpaper_themes_y() - 45 - CONTENT_TOP;
+        } else if (argv[i] && !strcmp(argv[i], "time")) {
+            /* Right-clicking the panel clock opens this page. */
+            category = PAGE_TIME;
         }
 
     window_id = mos_window_create(0, 72, 56, SETTINGS_WIDTH, SETTINGS_HEIGHT,
@@ -1226,6 +1635,12 @@ int main(int argc, char** argv) {
         }
         if (surface.width != info.width || surface.height != info.height) {
             resize_surface(info.width, info.height);
+            needs_redraw = true;
+        }
+        /* The clock and the internet time status change while the Time
+         * page is open. */
+        if (category == PAGE_TIME && ++time_status_frames >= 60u) {
+            time_status_frames = 0;
             needs_redraw = true;
         }
         /* Drawing and presenting only when something changed keeps the
