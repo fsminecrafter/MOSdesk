@@ -1,0 +1,83 @@
+# Mxplorer
+
+Mxplorer is a native browser for Minimal-OS. It is intentionally not built on
+EasyUI: the browser shell, HTTP transport, HTML parser, CSS parser, and page
+renderer are separate modules.
+
+## Current support
+
+- Multiple closable, reorderable tabs; back, forward, refresh, home, and URL
+  search controls; the HTML-rendered `mos://home` page; and the
+  `mos://settings` page.
+- `Resources/homepage.html` is the built-in HTML landing page. General settings
+  let you choose Google, the Mxplorer alternative, or a custom web address;
+  that choice is saved in `0:/data/mxplorer-homepage.txt`.
+- A toggleable developer panel (`Ctrl+Q`) with session console messages,
+  request status, and a lightweight HTML source element outline. The startup
+  page and Home button follow the selected homepage preference.
+  JavaScript execution/console and a live DOM inspector are not implemented.
+- HTML documents up to 96 KiB, with semantic block elements, headings,
+  paragraphs, lists, line breaks, horizontal rules, links as text, and image
+  alt-text placeholders. Scripts are ignored and never executed.
+- Click-to-position address-bar caret, insertion/deletion, and arrow/Home/End
+  navigation while editing.
+- Embedded CSS with element, class, ID, and universal selectors; colors,
+  backgrounds, font size/weight, text alignment, margins, padding, and
+  `display: none`. The renderer wraps text, scrolls pages, and redraws only
+  dirty browser chrome or page regions.
+- MOSdesk accent/window-style colors.
+
+HTML/CSS support is a deliberately small subset of the HTML Living Standard
+and CSS; this is not a standards-complete browser. External stylesheets,
+images, interactive links/forms, JavaScript, and advanced layout are not yet
+implemented. HTTP pages can be fetched. HTTPS remains the default for bare
+hostnames, but HTTPS attempts are disabled by default. The Privacy settings
+page has an opt-in for the SDK's unsafe TLS-shaped transport. This is not real
+TLS: it has no certificates and exposes session keys, so it provides no
+trustworthy encryption or server identity. Never use it for credentials or
+private data. The opt-in lasts only for the current browser session. HTTP is
+also unencrypted and should only be used for non-sensitive pages.
+
+## Modules
+
+- `main.c` - browser state, window loop, tabs, and navigation
+- `http.c` - bounded HTTP/1.x retrieval
+- `html.c` - bounded HTML parsing, layout, scrolling, and drawing
+- `css.c` - supported CSS selectors and declarations
+- `ui.c` - native browser chrome, settings, and dirty-region presentation
+- `Resources/homepage.html` - editable source for the Mxplorer alternative page
+- `examples/Mxplorer-Studio.c` - flattened single-file Run Studio / `.run`
+  preview source. Refresh this snapshot when the modular sources change.
+
+## Build
+
+From the MOSdesk directory:
+
+```sh
+./Minimal-OS-SDK/build.sh --output Mxplorer.run Mxplorer
+```
+
+Initialize the `Minimal-OS-SDK` submodule first if it is not present. This
+creates `Mxplorer.run` in the MOSdesk directory.
+
+To build the standalone single-file version instead:
+
+```sh
+./Minimal-OS-SDK/build.sh --output /tmp/Mxplorer-Studio.run \
+  Mxplorer/examples/Mxplorer-Studio.c
+```
+
+The standalone source keeps the same SDK window, font, and networking calls
+as the modular application and can be opened as one source file in Run Studio.
+
+## Host tests
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror \
+  -I Mxplorer/tests/host_stubs -I Mxplorer/include \
+  Mxplorer/tests/html_test.c Mxplorer/html.c Mxplorer/css.c \
+  -o /tmp/mxplorer-html-test
+/tmp/mxplorer-html-test
+```
+
+JavaScript and advanced CSS/layout remain future work.
