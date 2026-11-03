@@ -3286,12 +3286,6 @@ static int reload_theme(void) {
 }
 
 int main(void) {
-    int regular_font_loaded =
-        font_load("0:/programs/Mxplorer/Resources/fonts/Inter-Regular.otf", 0);
-    int medium_font_loaded =
-        font_load("0:/programs/Mxplorer/Resources/fonts/Inter-Medium.otf", 1);
-    if (!regular_font_loaded || !medium_font_loaded)
-        printf("Mxplorer: bundled Inter fonts unavailable; using fallback text\n");
     set_default_theme();
     read_os_theme();
     load_homepage_setting();

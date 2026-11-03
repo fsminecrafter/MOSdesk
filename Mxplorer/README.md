@@ -78,8 +78,9 @@ To build the standalone single-file version instead:
   Mxplorer/examples/Mxplorer-Studio.c
 ```
 
-The standalone source keeps the same SDK window, font, and networking calls
-as the modular application and can be opened as one source file in Run Studio.
+The standalone source uses the SDK window, text drawing, and networking APIs
+and can be opened as one source file in Run Studio, including its bitmap-font
+compatibility environment.
 
 ## Host tests
 
