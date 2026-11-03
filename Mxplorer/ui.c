@@ -1,6 +1,6 @@
 #include "mxplorer/html.h"
 #include "mxplorer/ui.h"
-#include "font.h"
+#include "mxplorer/text.h"
 #include "string.h"
 #include "window.h"
 
@@ -55,7 +55,14 @@ static void draw_line(const mx_ui_state_t* state, int x0, int y0, int x1, int y1
 
 static void draw_label(const mx_ui_state_t* state, int x, int y, const char* text,
                        uint32_t color, int size) {
-    draw_text(state->pixels, state->width, state->height, x, y, text, color, size);
+    mx_text_draw(state->pixels, state->width, state->height, x, y, text, color,
+                 size);
+}
+
+static void draw_centered_label(const mx_ui_state_t* state, int center_x, int y,
+                                const char* text, uint32_t color, int size) {
+    draw_label(state, center_x - mx_text_width(text, size) / 2, y, text, color,
+               size);
 }
 
 static void draw_truncated(const mx_ui_state_t* state, int x, int y, int max_width,
@@ -65,7 +72,7 @@ static void draw_truncated(const mx_ui_state_t* state, int x, int y, int max_wid
     while (text && text[length] && length + 1 < sizeof(clipped)) {
         clipped[length] = text[length];
         clipped[length + 1] = '\0';
-        if (text_width(clipped, 1) > max_width) {
+        if (mx_text_width(clipped, 1) > max_width) {
             clipped[length] = '\0';
             break;
         }
@@ -80,7 +87,7 @@ static void draw_button(const mx_ui_state_t* state, int x, int y, int width,
     const mx_browser_theme_t* theme = state->theme;
     fill_rect(state, x, y, width, height, theme->button);
     stroke_rect(state, x, y, width, height, theme->border);
-    int label_width = text_width(label, 1);
+    int label_width = mx_text_width(label, 1);
     draw_label(state, x + (width - label_width) / 2, y + (height - 13) / 2,
                label, theme->text, 1);
 }
@@ -107,9 +114,11 @@ static void draw_tabs(const mx_ui_state_t* state) {
                   selected ? theme->surface : theme->background);
         stroke_rect(state, x, 5, MX_BROWSER_TAB_WIDTH - 4, 34,
                     selected ? theme->border : theme->background);
-        if (selected) fill_rect(state, x + 1, 5, MX_BROWSER_TAB_WIDTH - 6, 2,
+        if (selected) fill_rect(state, x + 1, 5, MX_BROWSER_TAB_WIDTH - 6, 3,
                                 theme->accent);
-        draw_truncated(state, x + 14, 16, MX_BROWSER_TAB_WIDTH - 62,
+        fill_rect(state, x + 12, 17, 8, 8,
+                  selected ? theme->accent : theme->muted);
+        draw_truncated(state, x + 30, 16, MX_BROWSER_TAB_WIDTH - 78,
                        state->tabs[i].title,
                        selected ? theme->text : theme->muted);
         draw_label(state, x + MX_BROWSER_TAB_WIDTH - 28, 15, "x",
@@ -192,7 +201,7 @@ static void draw_toolbar(const mx_ui_state_t* state) {
         draw_truncated(state, text_x, MX_BROWSER_TOOLBAR_Y + 14,
                        text_width_available, visible_address, theme->text);
     if (state->address_focused && state->address_select_all) {
-        int selection_width = text_width(visible_address, 1);
+        int selection_width = mx_text_width(visible_address, 1);
         if (selection_width > text_width_available)
             selection_width = text_width_available;
         fill_rect(state, text_x - 2, MX_BROWSER_TOOLBAR_Y + 12,
@@ -207,14 +216,14 @@ static void draw_toolbar(const mx_ui_state_t* state) {
         if (count >= (int)sizeof(caret_prefix)) count = sizeof(caret_prefix) - 1;
         memcpy(caret_prefix, visible_address, (size_t)count);
         caret_prefix[count] = '\0';
-        int caret_x = text_x + text_width(caret_prefix, 1);
+        int caret_x = text_x + mx_text_width(caret_prefix, 1);
         if (caret_x <= text_x + text_width_available)
             fill_rect(state, caret_x, MX_BROWSER_TOOLBAR_Y + 12, 1, 18,
                       theme->accent);
     }
     draw_button(state, settings_x, MX_BROWSER_TOOLBAR_Y, 74,
                 MX_BROWSER_TOOLBAR_HEIGHT, "Settings");
-    fill_rect(state, 0, 100, (int)state->width, 2, theme->border);
+    fill_rect(state, 0, 100, (int)state->width, 1, theme->border);
 }
 
 void mx_ui_draw_chrome(const mx_ui_state_t* state) {
@@ -232,6 +241,40 @@ static int ui_is_settings_page(const mx_ui_state_t* state) {
     return strcmp(state->tabs[state->active_tab].url, "mos://settings") == 0;
 }
 
+static void draw_circle_outline(const mx_ui_state_t* state, int center_x,
+                                int center_y, int radius, uint32_t color) {
+    int x = radius;
+    int y = 0;
+    int error = 1 - radius;
+    while (x >= y) {
+        fill_rect(state, center_x + x, center_y + y, 1, 1, color);
+        fill_rect(state, center_x + y, center_y + x, 1, 1, color);
+        fill_rect(state, center_x - y, center_y + x, 1, 1, color);
+        fill_rect(state, center_x - x, center_y + y, 1, 1, color);
+        fill_rect(state, center_x - x, center_y - y, 1, 1, color);
+        fill_rect(state, center_x - y, center_y - x, 1, 1, color);
+        fill_rect(state, center_x + y, center_y - x, 1, 1, color);
+        fill_rect(state, center_x + x, center_y - y, 1, 1, color);
+        y++;
+        if (error < 0) error += 2 * y + 1;
+        else {
+            x--;
+            error += 2 * (y - x + 1);
+        }
+    }
+}
+
+static void draw_globe(const mx_ui_state_t* state, int center_x, int center_y) {
+    const uint32_t accent = state->theme->accent;
+    draw_circle_outline(state, center_x, center_y, 18, accent);
+    draw_line(state, center_x - 17, center_y, center_x + 17, center_y, accent);
+    draw_line(state, center_x, center_y - 17, center_x, center_y + 17, accent);
+    draw_line(state, center_x - 13, center_y - 10, center_x + 13, center_y - 10,
+              accent);
+    draw_line(state, center_x - 13, center_y + 10, center_x + 13, center_y + 10,
+              accent);
+}
+
 static void draw_external_page(const mx_ui_state_t* state) {
     const mx_browser_theme_t* theme = state->theme;
     int top = MX_BROWSER_PAGE_Y;
@@ -244,21 +287,28 @@ static void draw_external_page(const mx_ui_state_t* state) {
     }
     int center_x = (int)state->width / 2;
     int center_y = top + ((int)state->height - top) / 2;
-    draw_label(state, center_x - 84, center_y - 72,
-               "Mxplorer", theme->accent, 4);
-    draw_label(state, center_x - 170, center_y - 22,
-               "Your browser framework is ready.", theme->text, 2);
-    draw_label(state, center_x - 214, center_y + 16,
-               "HTTPS requires the unsafe transport setting in Privacy.",
-               theme->muted, 1);
-    draw_label(state, center_x - 118, center_y + 42,
-               "Current page: ", theme->muted, 1);
-    draw_truncated(state, center_x - 32, center_y + 42, 280,
-                   state->tabs[state->active_tab].url, theme->text);
-    fill_rect(state, center_x - 214, center_y + 78, 428, 1,
+    int card_width = (int)state->width - 48;
+    if (card_width > 600) card_width = 600;
+    int card_x = center_x - card_width / 2;
+    int card_y = center_y - 116;
+    fill_rect(state, card_x, card_y, card_width, 232, theme->surface);
+    stroke_rect(state, card_x, card_y, card_width, 232, theme->border);
+    fill_rect(state, card_x + 1, card_y + 1, card_width - 2, 3,
+              theme->accent);
+    draw_globe(state, center_x, card_y + 45);
+    draw_centered_label(state, center_x, card_y + 78, "Page not loaded",
+                        theme->text, 2);
+    draw_centered_label(state, center_x, card_y + 108,
+                        "Enter an address or search from the bar above.",
+                        theme->muted, 1);
+    fill_rect(state, card_x + 28, card_y + 140, card_width - 56, 1,
               theme->border);
-    draw_label(state, center_x - 214, center_y + 94,
-               state->status_message, theme->muted, 1);
+    draw_label(state, card_x + 28, card_y + 154, "CURRENT ADDRESS",
+               theme->muted, 1);
+    draw_truncated(state, card_x + 28, card_y + 174, card_width - 56,
+                   state->tabs[state->active_tab].url, theme->text);
+    draw_truncated(state, card_x + 28, card_y + 202, card_width - 56,
+                   state->status_message, theme->muted);
 }
 
 static void draw_homepage_option(const mx_ui_state_t* state, int x, int y,

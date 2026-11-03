@@ -1,4 +1,5 @@
 #include "mxplorer/html.h"
+#include "mxplorer/text.h"
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -11,12 +12,12 @@ static int notice_seen;
 static int hidden_seen;
 static int script_seen;
 
-int text_width(const char* text, int size) {
+int mx_text_width(const char* text, int size) {
     return (int)strlen(text) * 8 * size;
 }
 
-void draw_text(uint32_t* pixels, uint32_t width, uint32_t height,
-               int x, int y, const char* text, uint32_t color, int size) {
+void mx_text_draw(uint32_t* pixels, uint32_t width, uint32_t height,
+                  int x, int y, const char* text, uint32_t color, int size) {
     (void)size;
     if (strstr(text, "Styled") && color == 0xFF123456u) notice_seen = 1;
     if (strstr(text, "secret")) hidden_seen = 1;
@@ -77,10 +78,20 @@ int main(void) {
     drawn_length = 0;
     assert(mx_html_parse(homepage_source, homepage_length, WIDTH) == MX_HTML_OK);
     mx_html_draw(pixels, WIDTH, HEIGHT, 0);
-    assert(strstr(drawn_text, "fresh"));
-    assert(strstr(drawn_text, "start."));
+    assert(strstr(drawn_text, "Mxplorer"));
+    assert(strstr(drawn_text, "Quick guide"));
     assert(strstr(homepage_source, "Google"));
-    assert(strstr(homepage_source, "own homepage"));
+    assert(strstr(homepage_source, "custom homepage"));
+    assert(strstr(homepage_source, "Search and browse"));
+    assert(strstr(homepage_source, "HTTPS attempts are disabled"));
+    assert(strstr(homepage_source, "Never use it for passwords"));
+    FILE* regular_font =
+        fopen("Mxplorer/Resources/fonts/Inter-Regular.otf", "rb");
+    FILE* medium_font =
+        fopen("Mxplorer/Resources/fonts/Inter-Medium.otf", "rb");
+    assert(regular_font && medium_font);
+    assert(fclose(regular_font) == 0);
+    assert(fclose(medium_font) == 0);
 
     puts("Mxplorer HTML/CSS renderer tests passed");
     return 0;

@@ -1,6 +1,6 @@
 #include "mxplorer/html.h"
 #include "mxplorer/css.h"
-#include "font.h"
+#include "mxplorer/text.h"
 #include "string.h"
 
 #define MX_HTML_ITEM_MAX 1024
@@ -180,9 +180,9 @@ static void html_emit_word(const char* word, size_t length,
         size_t count = length - offset;
         if (count >= sizeof(part)) count = sizeof(part) - 1;
         html_copy(part, sizeof(part), word + offset, count);
-        int width = text_width(part, font_size);
+        int width = mx_text_width(part, font_size);
         int space_width = pending_space && layout_x > layout_left
-                              ? text_width(" ", font_size) : 0;
+                              ? mx_text_width(" ", font_size) : 0;
         int current_x = layout_x + (line_has_style ? line_width : 0);
         if (current_x > layout_left &&
             current_x + space_width + width > layout_right) {
@@ -191,7 +191,7 @@ static void html_emit_word(const char* word, size_t length,
         }
         if (pending_space && line_has_style && layout_x == layout_left &&
             line_text[0])
-            space_width = text_width(" ", font_size);
+            space_width = mx_text_width(" ", font_size);
         if (line_has_style &&
             (line_style.color != style->color ||
              line_style.background != style->background ||
@@ -685,12 +685,12 @@ void mx_html_draw(uint32_t* pixels, uint32_t surface_width,
                            item->width, item->height, item->color,
                            0, top, (int)surface_width, height);
         } else {
-            draw_text(pixels, surface_width, surface_height,
-                      item->x, y, item->text, item->color, item->font_size);
+            mx_text_draw(pixels, surface_width, surface_height, item->x, y,
+                         item->text, item->color, item->font_size);
             if (item->bold)
-                draw_text(pixels, surface_width, surface_height,
-                          item->x + 1, y, item->text, item->color,
-                          item->font_size);
+                mx_text_draw(pixels, surface_width, surface_height,
+                             item->x + 1, y, item->text, item->color,
+                             item->font_size);
         }
     }
 }

@@ -1714,6 +1714,12 @@ static void draw_label(const mx_ui_state_t* state, int x, int y, const char* tex
     draw_text(state->pixels, state->width, state->height, x, y, text, color, size);
 }
 
+static void draw_centered_label(const mx_ui_state_t* state, int center_x, int y,
+                                const char* text, uint32_t color, int size) {
+    draw_label(state, center_x - text_width(text, size) / 2, y, text, color,
+               size);
+}
+
 static void draw_truncated(const mx_ui_state_t* state, int x, int y, int max_width,
                            const char* text, uint32_t color) {
     char clipped[80];
@@ -1763,9 +1769,11 @@ static void draw_tabs(const mx_ui_state_t* state) {
                   selected ? theme->surface : theme->background);
         stroke_rect(state, x, 5, MX_BROWSER_TAB_WIDTH - 4, 34,
                     selected ? theme->border : theme->background);
-        if (selected) fill_rect(state, x + 1, 5, MX_BROWSER_TAB_WIDTH - 6, 2,
+        if (selected) fill_rect(state, x + 1, 5, MX_BROWSER_TAB_WIDTH - 6, 3,
                                 theme->accent);
-        draw_truncated(state, x + 14, 16, MX_BROWSER_TAB_WIDTH - 62,
+        fill_rect(state, x + 12, 17, 8, 8,
+                  selected ? theme->accent : theme->muted);
+        draw_truncated(state, x + 30, 16, MX_BROWSER_TAB_WIDTH - 78,
                        state->tabs[i].title,
                        selected ? theme->text : theme->muted);
         draw_label(state, x + MX_BROWSER_TAB_WIDTH - 28, 15, "x",
@@ -1888,6 +1896,40 @@ static int ui_is_settings_page(const mx_ui_state_t* state) {
     return strcmp(state->tabs[state->active_tab].url, "mos://settings") == 0;
 }
 
+static void draw_circle_outline(const mx_ui_state_t* state, int center_x,
+                                int center_y, int radius, uint32_t color) {
+    int x = radius;
+    int y = 0;
+    int error = 1 - radius;
+    while (x >= y) {
+        fill_rect(state, center_x + x, center_y + y, 1, 1, color);
+        fill_rect(state, center_x + y, center_y + x, 1, 1, color);
+        fill_rect(state, center_x - y, center_y + x, 1, 1, color);
+        fill_rect(state, center_x - x, center_y + y, 1, 1, color);
+        fill_rect(state, center_x - x, center_y - y, 1, 1, color);
+        fill_rect(state, center_x - y, center_y - x, 1, 1, color);
+        fill_rect(state, center_x + y, center_y - x, 1, 1, color);
+        fill_rect(state, center_x + x, center_y - y, 1, 1, color);
+        y++;
+        if (error < 0) error += 2 * y + 1;
+        else {
+            x--;
+            error += 2 * (y - x + 1);
+        }
+    }
+}
+
+static void draw_globe(const mx_ui_state_t* state, int center_x, int center_y) {
+    const uint32_t accent = state->theme->accent;
+    draw_circle_outline(state, center_x, center_y, 18, accent);
+    draw_line(state, center_x - 17, center_y, center_x + 17, center_y, accent);
+    draw_line(state, center_x, center_y - 17, center_x, center_y + 17, accent);
+    draw_line(state, center_x - 13, center_y - 10, center_x + 13, center_y - 10,
+              accent);
+    draw_line(state, center_x - 13, center_y + 10, center_x + 13, center_y + 10,
+              accent);
+}
+
 static void draw_external_page(const mx_ui_state_t* state) {
     const mx_browser_theme_t* theme = state->theme;
     int top = MX_BROWSER_PAGE_Y;
@@ -1900,21 +1942,28 @@ static void draw_external_page(const mx_ui_state_t* state) {
     }
     int center_x = (int)state->width / 2;
     int center_y = top + ((int)state->height - top) / 2;
-    draw_label(state, center_x - 84, center_y - 72,
-               "Mxplorer", theme->accent, 4);
-    draw_label(state, center_x - 170, center_y - 22,
-               "Your browser framework is ready.", theme->text, 2);
-    draw_label(state, center_x - 214, center_y + 16,
-               "HTTPS requires the unsafe transport setting in Privacy.",
-               theme->muted, 1);
-    draw_label(state, center_x - 118, center_y + 42,
-               "Current page: ", theme->muted, 1);
-    draw_truncated(state, center_x - 32, center_y + 42, 280,
-                   state->tabs[state->active_tab].url, theme->text);
-    fill_rect(state, center_x - 214, center_y + 78, 428, 1,
+    int card_width = (int)state->width - 48;
+    if (card_width > 600) card_width = 600;
+    int card_x = center_x - card_width / 2;
+    int card_y = center_y - 116;
+    fill_rect(state, card_x, card_y, card_width, 232, theme->surface);
+    stroke_rect(state, card_x, card_y, card_width, 232, theme->border);
+    fill_rect(state, card_x + 1, card_y + 1, card_width - 2, 3,
+              theme->accent);
+    draw_globe(state, center_x, card_y + 45);
+    draw_centered_label(state, center_x, card_y + 78, "Page not loaded",
+                        theme->text, 2);
+    draw_centered_label(state, center_x, card_y + 108,
+                        "Enter an address or search from the bar above.",
+                        theme->muted, 1);
+    fill_rect(state, card_x + 28, card_y + 140, card_width - 56, 1,
               theme->border);
-    draw_label(state, center_x - 214, center_y + 94,
-               state->status_message, theme->muted, 1);
+    draw_label(state, card_x + 28, card_y + 154, "CURRENT ADDRESS",
+               theme->muted, 1);
+    draw_truncated(state, card_x + 28, card_y + 174, card_width - 56,
+                   state->tabs[state->active_tab].url, theme->text);
+    draw_truncated(state, card_x + 28, card_y + 202, card_width - 56,
+                   state->status_message, theme->muted);
 }
 
 static void draw_homepage_option(const mx_ui_state_t* state, int x, int y,
@@ -2243,29 +2292,28 @@ static int page_dirty = 1;
 
 static const char home_page_fallback[] =
     "<!doctype html><html><head><style>"
-    "body{background-color:#edf3fa;color:#1c2d42;padding:28px}"
-    ".eyebrow{color:#2579c5;font-size:12px;font-weight:bold;margin-bottom:8px}"
-    ".hero{background-color:#dcecff;padding:24px;margin-bottom:20px}"
-    "h1{color:#173b62;font-size:32px;margin-bottom:10px}"
-    ".lead{color:#45617d;font-size:16px;margin-bottom:18px}"
-    ".hint{color:#ffffff;background-color:#287fc2;padding:12px;margin-bottom:18px}"
-    "h2{color:#173b62;font-size:20px;margin-top:12px;margin-bottom:8px}"
-    ".card{background-color:#ffffff;color:#263b50;padding:14px;margin-bottom:10px}"
-    ".tag{color:#287fc2;font-weight:bold}"
-    ".foot{color:#71849a;font-size:12px;margin-top:18px}"
+    "body{background-color:#f5f8fc;color:#23364a}"
+    ".eyebrow{color:#3478d4;font-size:12px;font-weight:bold;text-align:center;margin-top:24px;margin-bottom:8px}"
+    "h1{color:#3478d4;font-size:44px;text-align:center;margin-bottom:8px}"
+    ".lead{color:#60758b;font-size:16px;text-align:center;margin-bottom:18px}"
+    ".search-prompt{background-color:#ffffff;color:#60758b;text-align:center;padding:14px;margin-bottom:20px}"
+    "h2{color:#203d5c;font-size:20px;margin-top:12px;margin-bottom:10px}"
+    ".card{background-color:#ffffff;color:#465d74;padding:12px;margin-bottom:8px}"
+    ".tag{color:#3478d4;font-weight:bold;margin-bottom:4px}"
+    ".note{color:#73869a;font-size:12px;margin-top:14px}"
     "</style></head><body>"
-    "<div class='hero'><p class='eyebrow'>MXPLORER  /  YOUR SPACE ON THE WEB</p>"
-    "<h1>A fresh start.</h1>"
-    "<p class='lead'>A lightweight browser, ready for wherever curiosity takes you.</p>"
-    "<p class='hint'>Type a website or search in the address bar above to get going.</p>"
-    "</div><h2>Made for exploring</h2>"
-    "<div class='card'><p class='tag'>01  /  Focus</p>"
-    "<p>A calm, clean space that keeps the page at the center.</p></div>"
-    "<div class='card'><p class='tag'>02  /  Your way</p>"
-    "<p>Use tabs for separate trails, and the navigation arrows to retrace yours.</p></div>"
-    "<div class='card'><p class='tag'>03  /  Built in</p>"
-    "<p>Choose Google, this page, or a custom homepage in Settings.</p></div>"
-    "<p class='foot'>Mxplorer for Minimal-OS  -  HTML and CSS rendering preview</p>"
+    "<p class='eyebrow'>A SIMPLE BROWSER FOR MINIMAL-OS</p>"
+    "<h1>Mxplorer</h1>"
+    "<p class='lead'>A little space to find what you need.</p>"
+    "<p class='search-prompt'>Search or enter a website in the address bar above.</p>"
+    "<h2>Quick guide</h2>"
+    "<div class='card'><p class='tag'>Search and browse</p>"
+    "<p>Type a search or web address above. Use Back, Forward, and + to move between pages and tabs.</p></div>"
+    "<div class='card'><p class='tag'>Make it yours</p>"
+    "<p>Choose Google, this start page, or a custom homepage in Settings.</p></div>"
+    "<div class='card'><p class='tag'>Know what to expect</p>"
+    "<p>Mxplorer renders basic HTML and CSS. Scripts are off, and HTTPS attempts are disabled by default.</p></div>"
+    "<p class='note'>Unsafe HTTPS in Privacy is not secure. Never use it for passwords or private data.</p>"
     "</body></html>";
 
 static void copy_text(char* destination, const char* source, size_t capacity) {
@@ -2407,14 +2455,14 @@ static void load_homepage_asset(void) {
 }
 
 static void set_default_theme(void) {
-    theme.background = 0xFFF3F5F6u;
+    theme.background = 0xFFF4F7FAu;
     theme.surface = 0xFFFFFFFFu;
-    theme.border = 0xFFBCC6CDu;
-    theme.text = 0xFF273640u;
-    theme.muted = 0xFF667680u;
-    theme.button = 0xFFDCE2E6u;
-    theme.button_hover = 0xFFD0D8DDu;
-    theme.accent = 0xFF3DAEE9u;
+    theme.border = 0xFFD7E0E9u;
+    theme.text = 0xFF1F3042u;
+    theme.muted = 0xFF687B8Fu;
+    theme.button = 0xFFE9EFF5u;
+    theme.button_hover = 0xFFDCE7F2u;
+    theme.accent = 0xFF3478D4u;
     theme.accent_text = 0xFFFFFFFFu;
 }
 
@@ -3238,6 +3286,12 @@ static int reload_theme(void) {
 }
 
 int main(void) {
+    int regular_font_loaded =
+        font_load("0:/programs/Mxplorer/Resources/fonts/Inter-Regular.otf", 0);
+    int medium_font_loaded =
+        font_load("0:/programs/Mxplorer/Resources/fonts/Inter-Medium.otf", 1);
+    if (!regular_font_loaded || !medium_font_loaded)
+        printf("Mxplorer: bundled Inter fonts unavailable; using fallback text\n");
     set_default_theme();
     read_os_theme();
     load_homepage_setting();
@@ -3331,4 +3385,3 @@ int main(void) {
     mos_window_close(window_id);
     return 0;
 }
-

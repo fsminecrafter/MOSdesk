@@ -1,12 +1,12 @@
 #include "mxplorer/browser.h"
 #include "mxplorer/html.h"
 #include "mxplorer/http.h"
+#include "mxplorer/text.h"
 #include "mxplorer/ui.h"
 #include "stdlib.h"
 #include "stdio.h"
 #include "string.h"
 #include "window.h"
-#include "font.h"
 #include "x86_64/user_usb.h"
 
 #define WIN_W 1080u
@@ -68,29 +68,28 @@ static int page_dirty = 1;
 
 static const char home_page_fallback[] =
     "<!doctype html><html><head><style>"
-    "body{background-color:#edf3fa;color:#1c2d42;padding:28px}"
-    ".eyebrow{color:#2579c5;font-size:12px;font-weight:bold;margin-bottom:8px}"
-    ".hero{background-color:#dcecff;padding:24px;margin-bottom:20px}"
-    "h1{color:#173b62;font-size:32px;margin-bottom:10px}"
-    ".lead{color:#45617d;font-size:16px;margin-bottom:18px}"
-    ".hint{color:#ffffff;background-color:#287fc2;padding:12px;margin-bottom:18px}"
-    "h2{color:#173b62;font-size:20px;margin-top:12px;margin-bottom:8px}"
-    ".card{background-color:#ffffff;color:#263b50;padding:14px;margin-bottom:10px}"
-    ".tag{color:#287fc2;font-weight:bold}"
-    ".foot{color:#71849a;font-size:12px;margin-top:18px}"
+    "body{background-color:#f5f8fc;color:#23364a}"
+    ".eyebrow{color:#3478d4;font-size:12px;font-weight:bold;text-align:center;margin-top:24px;margin-bottom:8px}"
+    "h1{color:#3478d4;font-size:44px;text-align:center;margin-bottom:8px}"
+    ".lead{color:#60758b;font-size:16px;text-align:center;margin-bottom:18px}"
+    ".search-prompt{background-color:#ffffff;color:#60758b;text-align:center;padding:14px;margin-bottom:20px}"
+    "h2{color:#203d5c;font-size:20px;margin-top:12px;margin-bottom:10px}"
+    ".card{background-color:#ffffff;color:#465d74;padding:12px;margin-bottom:8px}"
+    ".tag{color:#3478d4;font-weight:bold;margin-bottom:4px}"
+    ".note{color:#73869a;font-size:12px;margin-top:14px}"
     "</style></head><body>"
-    "<div class='hero'><p class='eyebrow'>MXPLORER  /  YOUR SPACE ON THE WEB</p>"
-    "<h1>A fresh start.</h1>"
-    "<p class='lead'>A lightweight browser, ready for wherever curiosity takes you.</p>"
-    "<p class='hint'>Type a website or search in the address bar above to get going.</p>"
-    "</div><h2>Made for exploring</h2>"
-    "<div class='card'><p class='tag'>01  /  Focus</p>"
-    "<p>A calm, clean space that keeps the page at the center.</p></div>"
-    "<div class='card'><p class='tag'>02  /  Your way</p>"
-    "<p>Use tabs for separate trails, and the navigation arrows to retrace yours.</p></div>"
-    "<div class='card'><p class='tag'>03  /  Built in</p>"
-    "<p>Choose Google, this page, or a custom homepage in Settings.</p></div>"
-    "<p class='foot'>Mxplorer for Minimal-OS  -  HTML and CSS rendering preview</p>"
+    "<p class='eyebrow'>A SIMPLE BROWSER FOR MINIMAL-OS</p>"
+    "<h1>Mxplorer</h1>"
+    "<p class='lead'>A little space to find what you need.</p>"
+    "<p class='search-prompt'>Search or enter a website in the address bar above.</p>"
+    "<h2>Quick guide</h2>"
+    "<div class='card'><p class='tag'>Search and browse</p>"
+    "<p>Type a search or web address above. Use Back, Forward, and + to move between pages and tabs.</p></div>"
+    "<div class='card'><p class='tag'>Make it yours</p>"
+    "<p>Choose Google, this start page, or a custom homepage in Settings.</p></div>"
+    "<div class='card'><p class='tag'>Know what to expect</p>"
+    "<p>Mxplorer renders basic HTML and CSS. Scripts are off, and HTTPS attempts are disabled by default.</p></div>"
+    "<p class='note'>Unsafe HTTPS in Privacy is not secure. Never use it for passwords or private data.</p>"
     "</body></html>";
 
 static void copy_text(char* destination, const char* source, size_t capacity) {
@@ -232,14 +231,14 @@ static void load_homepage_asset(void) {
 }
 
 static void set_default_theme(void) {
-    theme.background = 0xFFF3F5F6u;
+    theme.background = 0xFFF4F7FAu;
     theme.surface = 0xFFFFFFFFu;
-    theme.border = 0xFFBCC6CDu;
-    theme.text = 0xFF273640u;
-    theme.muted = 0xFF667680u;
-    theme.button = 0xFFDCE2E6u;
-    theme.button_hover = 0xFFD0D8DDu;
-    theme.accent = 0xFF3DAEE9u;
+    theme.border = 0xFFD7E0E9u;
+    theme.text = 0xFF1F3042u;
+    theme.muted = 0xFF687B8F;
+    theme.button = 0xFFE9EFF5u;
+    theme.button_hover = 0xFFDCE7F2u;
+    theme.accent = 0xFF3478D4u;
     theme.accent_text = 0xFFFFFFFFu;
 }
 
@@ -738,7 +737,7 @@ static int address_cursor_at_x(int x) {
         size_t visible_length = i - (size_t)address_scroll + 1;
         memcpy(prefix, address_text + address_scroll, visible_length);
         prefix[visible_length] = '\0';
-        int width = text_width(prefix, 1);
+        int width = mx_text_width(prefix, 1);
         if (x - text_x < previous_width + (width - previous_width) / 2)
             return (int)i;
         cursor = (int)i + 1;
@@ -760,7 +759,7 @@ static void update_address_scroll(void) {
         int count = address_cursor - address_scroll;
         memcpy(visible_prefix, address_text + address_scroll, (size_t)count);
         visible_prefix[count] = '\0';
-        if (text_width(visible_prefix, 1) <= available) break;
+        if (mx_text_width(visible_prefix, 1) <= available) break;
         address_scroll++;
     }
 }
@@ -1063,6 +1062,8 @@ static int reload_theme(void) {
 }
 
 int main(void) {
+    if (!mx_text_load_fonts())
+        printf("Mxplorer: bundled Inter fonts unavailable; using fallback text\n");
     set_default_theme();
     read_os_theme();
     load_homepage_setting();

@@ -12,6 +12,11 @@ renderer are separate modules.
 - `Resources/homepage.html` is the built-in HTML landing page. General settings
   let you choose Google, the Mxplorer alternative, or a custom web address;
   that choice is saved in `0:/data/mxplorer-homepage.txt`.
+- `Resources/fonts/` bundles Inter Regular and Medium for anti-aliased browser
+  chrome and page text. Install the `Resources` directory at
+  `0:/programs/Mxplorer/Resources` alongside the browser so Mxplorer can load
+  the bundled homepage and fonts. If the font files are unavailable, the
+  renderer falls back to the system font and then its bitmap font.
 - A toggleable developer panel (`Ctrl+Q`) with session console messages,
   request status, and a lightweight HTML source element outline. The startup
   page and Home button follow the selected homepage preference.
@@ -45,7 +50,9 @@ also unencrypted and should only be used for non-sensitive pages.
 - `html.c` - bounded HTML parsing, layout, scrolling, and drawing
 - `css.c` - supported CSS selectors and declarations
 - `ui.c` - native browser chrome, settings, and dirty-region presentation
+- `text.c` - shared smooth-text loading, width measurement, and drawing
 - `Resources/homepage.html` - editable source for the Mxplorer alternative page
+- `Resources/fonts/` - bundled Inter fonts and their license
 - `examples/Mxplorer-Studio.c` - flattened single-file Run Studio / `.run`
   preview source. Refresh this snapshot when the modular sources change.
 
@@ -59,6 +66,10 @@ From the MOSdesk directory:
 
 Initialize the `Minimal-OS-SDK` submodule first if it is not present. This
 creates `Mxplorer.run` in the MOSdesk directory.
+
+The `.run` bundle contains source-directory resources, but the current runtime
+does not expose files embedded in a `.run` archive to the program. Keep the
+`Resources` directory installed at the path above when deploying the app.
 
 To build the standalone single-file version instead:
 
