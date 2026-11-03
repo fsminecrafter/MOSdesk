@@ -421,10 +421,10 @@ static void draw_settings_page(const mx_ui_state_t* state) {
                        : "Off by default. Click this row to permit HTTPS attempts.",
                    theme->muted, 1);
         draw_label(state, content_x, content_y + 181,
-                   "SDK TLS has no certificates and exposes session keys.",
+                   "HTTPS uses TLS 1.3; server certificates are not verified.",
                    theme->accent, 1);
         draw_label(state, content_x, content_y + 207,
-                   "It provides no reliable encryption or server identity.",
+                   "The server identity cannot be trusted; avoid private data.",
                    theme->accent, 1);
         draw_label(state, content_x, content_y + 250,
                    "Scripts are disabled; remote images and stylesheets are not loaded.",
@@ -499,7 +499,7 @@ static void draw_debug_panel(const mx_ui_state_t* state) {
                        state->status_message, panel_text);
         y += 23;
         draw_label(state, 16, y,
-                   "Redirects, external assets, and certificate validation are not implemented.",
+                   "Up to 5 redirects; no external assets or certificate checks.",
                    panel_muted, 1);
         y += 22;
         draw_label(state, 16, y,

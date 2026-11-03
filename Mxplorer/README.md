@@ -35,13 +35,12 @@ renderer are separate modules.
 HTML/CSS support is a deliberately small subset of the HTML Living Standard
 and CSS; this is not a standards-complete browser. External stylesheets,
 images, interactive links/forms, JavaScript, and advanced layout are not yet
-implemented. HTTP pages can be fetched. HTTPS remains the default for bare
-hostnames, but HTTPS attempts are disabled by default. The Privacy settings
-page has an opt-in for the SDK's unsafe TLS-shaped transport. This is not real
-TLS: it has no certificates and exposes session keys, so it provides no
-trustworthy encryption or server identity. Never use it for credentials or
-private data. The opt-in lasts only for the current browser session. HTTP is
-also unencrypted and should only be used for non-sensitive pages.
+implemented. HTTP pages can be fetched, and common HTTP redirects are followed
+for up to five hops with a two-second budget per followed request. HTTPS uses
+the kernel's TLS 1.3 client and is disabled by default. Certificate chains are
+not authenticated, so the server identity cannot be trusted; enable HTTPS only
+for non-sensitive browsing. The opt-in lasts only for the current browser
+session. HTTP is unencrypted and should only be used for non-sensitive pages.
 
 ## Modules
 

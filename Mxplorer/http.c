@@ -7,6 +7,10 @@
 #define HTTP_RESPONSE_MAX (MX_HTTP_BODY_MAX + HTTP_HEADER_MAX)
 #define HTTP_IDLE_TIMEOUT_MS 5000
 #define HTTP_TOTAL_TIMEOUT_MS 20000
+#define HTTP_MAX_REDIRECTS 5u
+#define HTTP_REDIRECT_TIMEOUT_MS 2000u
+#define HTTP_URL_MAX 1024u
+#define HTTP_REDIRECT_RESULT 2
 
 static char response[HTTP_RESPONSE_MAX];
 
@@ -136,19 +140,19 @@ static int parse_url(const char* url, char* host, size_t host_capacity,
 
 static long transport_send(int use_tls, long connection, const void* data,
                            uint32_t length) {
-    return use_tls ? mos_tls_send(connection, data, length)
+    return use_tls ? mos_tls13_send(connection, data, length)
                    : mos_tcp_send(connection, data, length);
 }
 
 static long transport_recv(int use_tls, long connection, void* data,
-                           uint32_t length) {
-    return use_tls ? mos_tls_recv(connection, data, length)
+                           uint32_t length, uint32_t timeout_ms) {
+    return use_tls ? mos_tls13_recv(connection, data, length, timeout_ms)
                    : mos_tcp_recv(connection, data, length);
 }
 
 static void transport_close(int use_tls, long connection) {
     if (use_tls)
-        mos_tls_close(connection);
+        mos_tls13_close(connection);
     else
         mos_tcp_close(connection);
 }
@@ -174,9 +178,16 @@ static char* find_header_end(char* data, size_t length) {
     return NULL;
 }
 
-static int parse_status(const char* response_data) {
-    const char* space = strchr(response_data, ' ');
-    if (!space || space[1] < '0' || space[1] > '9' ||
+static int parse_status(const char* response_data, size_t length) {
+    const char* line_end = response_data + length;
+    const char* space = NULL;
+    for (const char* p = response_data; p < line_end && *p != '\r' && *p != '\n'; p++) {
+        if (*p == ' ') {
+            space = p;
+            break;
+        }
+    }
+    if (!space || line_end - space < 4 || space[1] < '0' || space[1] > '9' ||
         space[2] < '0' || space[2] > '9' ||
         space[3] < '0' || space[3] > '9')
         return 0;
@@ -245,6 +256,119 @@ static void parse_headers(char* headers, size_t length, size_t* content_length,
     }
 }
 
+static int is_redirect_status(int status) {
+    return status == 301 || status == 302 || status == 303 ||
+           status == 307 || status == 308;
+}
+
+static int parse_location(const char* headers, size_t length,
+                          char* location, size_t capacity) {
+    size_t pos = 0;
+    while (pos + 1 < length &&
+           !(headers[pos] == '\r' && headers[pos + 1] == '\n'))
+        pos++;
+    pos += 2;
+    while (pos + 1 < length) {
+        size_t end = pos;
+        while (end + 1 < length &&
+               !(headers[end] == '\r' && headers[end + 1] == '\n'))
+            end++;
+        if (end == pos) break;
+        const char* line = headers + pos;
+        size_t line_length = end - pos;
+        const char* colon = NULL;
+        for (size_t i = 0; i < line_length; i++) {
+            if (line[i] == ':') {
+                colon = line + i;
+                break;
+            }
+        }
+        if (colon && (size_t)(colon - line) == 8 &&
+            equal_nocase(line, "location", 8)) {
+            const char* value = colon + 1;
+            const char* value_end = line + line_length;
+            while (value < value_end && (*value == ' ' || *value == '\t')) value++;
+            while (value_end > value &&
+                   (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                value_end--;
+            size_t value_length = (size_t)(value_end - value);
+            if (!value_length || value_length >= capacity) return 0;
+            memcpy(location, value, value_length);
+            location[value_length] = '\0';
+            return 1;
+        }
+        pos = end + 2;
+    }
+    return 0;
+}
+
+static int append_slice(char* destination, size_t capacity, size_t* used,
+                        const char* text, size_t length) {
+    if (*used >= capacity || length >= capacity - *used) return 0;
+    memcpy(destination + *used, text, length);
+    *used += length;
+    destination[*used] = '\0';
+    return 1;
+}
+
+static int resolve_location(const char* base_url, const char* location,
+                            char* resolved, size_t capacity) {
+    static const char http_prefix[] = "http://";
+    static const char https_prefix[] = "https://";
+    const char* fragment = strchr(location, '#');
+    size_t location_length = fragment ? (size_t)(fragment - location)
+                                     : strlen(location);
+    if (!location_length) return 0;
+
+    if (!strncmp(location, http_prefix, sizeof(http_prefix) - 1) ||
+        !strncmp(location, https_prefix, sizeof(https_prefix) - 1))
+        return append_slice(resolved, capacity, &(size_t){0}, location,
+                            location_length);
+
+    int base_is_tls = !strncmp(base_url, https_prefix, sizeof(https_prefix) - 1);
+    const char* scheme = base_is_tls ? "https://" : "http://";
+    size_t used = 0;
+    if (location[0] == '/' && location_length > 1 && location[1] == '/') {
+        return append_text(resolved, capacity, &used, base_is_tls ? "https:" : "http:") &&
+               append_slice(resolved, capacity, &used, location, location_length);
+    }
+
+    char host[128];
+    char path[512];
+    char ignored_error[1];
+    uint16_t port;
+    int use_tls;
+    if (!parse_url(base_url, host, sizeof(host), path, sizeof(path), &port,
+                   &use_tls, ignored_error, sizeof(ignored_error)))
+        return 0;
+    if (!append_text(resolved, capacity, &used, scheme) ||
+        !append_text(resolved, capacity, &used, host))
+        return 0;
+    if ((use_tls && port != 443) || (!use_tls && port != 80)) {
+        if (!append_port(resolved, capacity, &used, port)) return 0;
+    }
+
+    if (location[0] == '/')
+        return append_slice(resolved, capacity, &used, location, location_length);
+
+    size_t base_path_length = strlen(path);
+    for (size_t i = 0; i < base_path_length; i++) {
+        if (path[i] == '?' || path[i] == '#') {
+            base_path_length = i;
+            break;
+        }
+    }
+    if (location[0] == '?') {
+        return append_slice(resolved, capacity, &used, path, base_path_length) &&
+               append_slice(resolved, capacity, &used, location, location_length);
+    }
+
+    size_t directory_length = base_path_length;
+    while (directory_length && path[directory_length - 1] != '/') directory_length--;
+    return append_slice(resolved, capacity, &used, path, directory_length) &&
+           append_slice(resolved, capacity, &used, location, location_length);
+}
+
 static int decode_chunked(const char* source, size_t length,
                           char* body, size_t capacity, size_t* out_length) {
     size_t pos = 0;
@@ -286,9 +410,21 @@ static int decode_chunked(const char* source, size_t length,
     return 0;
 }
 
-int mx_http_get(const char* url, char* body, size_t body_capacity,
-                size_t* body_length, int allow_insecure_tls,
-                char* error, size_t error_capacity) {
+static uint32_t request_time_left(long start, uint32_t timeout_ms) {
+    long elapsed = mos_uptime() - start;
+    if (elapsed < 0 || (uint32_t)elapsed >= timeout_ms) return 0;
+    return timeout_ms - (uint32_t)elapsed;
+}
+
+static uint32_t capped_timeout(uint32_t remaining, uint32_t cap) {
+    return remaining < cap ? remaining : cap;
+}
+
+static int http_get_once(const char* url, char* body, size_t body_capacity,
+                         size_t* body_length, int allow_insecure_tls,
+                         uint32_t timeout_ms, char* redirect,
+                         size_t redirect_capacity, char* error,
+                         size_t error_capacity) {
     char host[128];
     char path[512];
     char request[1024];
@@ -314,25 +450,26 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
         return 0;
     }
 
-    uint32_t ip = mos_net_lookup(host, 5000);
+    long request_start = mos_uptime();
+    uint32_t remaining = request_time_left(request_start, timeout_ms);
+    uint32_t ip = remaining ? mos_net_lookup(host,
+        capped_timeout(remaining, 5000u)) : 0;
     if (!ip) {
         set_error(error, error_capacity, "DNS lookup failed for this host.");
         return 0;
     }
-    long connection = use_tls ? mos_tls_connect(ip, port, 5000)
-                              : mos_tcp_connect(ip, port, 5000);
+    remaining = request_time_left(request_start, timeout_ms);
+    uint32_t connect_timeout = capped_timeout(remaining,
+                                               use_tls ? 15000u : 5000u);
+    long connection = !connect_timeout ? 0 :
+        use_tls ? mos_tls13_connect(ip, port, host, connect_timeout)
+                : mos_tcp_connect(ip, port, connect_timeout);
     if (connection <= 0) {
         set_error(error, error_capacity,
-                  use_tls ? "Could not start the unsafe TLS transport."
+                  use_tls ? "HTTPS TLS 1.3 handshake failed."
                           : "Could not connect to the HTTP server.");
         return 0;
     }
-    if (use_tls && !mos_tls_wait_established(connection, 10000)) {
-        transport_close(use_tls, connection);
-        set_error(error, error_capacity, "Unsafe TLS handshake failed.");
-        return 0;
-    }
-
     size_t request_length = 0;
     int request_ok =
         append_text(request, sizeof(request), &request_length, "GET ") &&
@@ -352,13 +489,15 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
         return 0;
     }
 
-    long start = mos_uptime();
-    long last_data = start;
+    long last_data = mos_uptime();
     int receive_failed = 0;
     while (response_length < sizeof(response)) {
+        remaining = request_time_left(request_start, timeout_ms);
+        if (!remaining) break;
         long count = transport_recv(use_tls, connection,
             response + response_length,
-            (uint32_t)(sizeof(response) - response_length));
+            (uint32_t)(sizeof(response) - response_length),
+            capped_timeout(remaining, HTTP_IDLE_TIMEOUT_MS));
         if (count < 0) {
             if (count == (long)SYS_ERR_NOTFOUND) break;
             receive_failed = 1;
@@ -367,7 +506,7 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
         if (count == 0) {
             long now = mos_uptime();
             if (now - last_data > HTTP_IDLE_TIMEOUT_MS ||
-                now - start > HTTP_TOTAL_TIMEOUT_MS)
+                !request_time_left(request_start, timeout_ms))
                 break;
             mos_sleep(5);
             continue;
@@ -381,6 +520,8 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
         }
         char* header_end = find_header_end(response, response_length);
         if (header_end) {
+            if (is_redirect_status(parse_status(response, response_length)))
+                break;
             size_t header_length = (size_t)(header_end - response);
             size_t content_length = 0;
             int has_content_length = 0;
@@ -405,12 +546,20 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
         return 0;
     }
     size_t header_length = (size_t)(header_end - response);
-    int status = parse_status(response);
+    int status = parse_status(response, response_length);
+    if (is_redirect_status(status)) {
+        if (!redirect || !parse_location(response, header_length, redirect,
+                                         redirect_capacity)) {
+            set_error(error, error_capacity,
+                      "Redirect response has no valid Location header.");
+            return 0;
+        }
+        if (error_capacity) error[0] = '\0';
+        return HTTP_REDIRECT_RESULT;
+    }
     if (status < 200 || status >= 300) {
         set_error(error, error_capacity,
-                  status >= 300 && status < 400
-                      ? "Redirects are not supported yet."
-                      : "HTTP server returned an error status.");
+                  "HTTP server returned an error status.");
         return 0;
     }
     size_t declared_length = 0;
@@ -448,4 +597,40 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
     }
     if (error_capacity) error[0] = '\0';
     return 1;
+}
+
+int mx_http_get(const char* url, char* body, size_t body_capacity,
+                size_t* body_length, int allow_insecure_tls,
+                char* error, size_t error_capacity) {
+    char current_url[HTTP_URL_MAX];
+    if (!url || strlen(url) >= sizeof(current_url)) {
+        if (body_length) *body_length = 0;
+        set_error(error, error_capacity, "HTTP address is too long.");
+        return 0;
+    }
+    strlcpy_safe(current_url, url, sizeof(current_url));
+
+    unsigned redirects = 0;
+    for (;;) {
+        char location[HTTP_URL_MAX];
+        int result = http_get_once(current_url, body, body_capacity,
+                                   body_length, allow_insecure_tls,
+                                   redirects ? HTTP_REDIRECT_TIMEOUT_MS
+                                             : HTTP_TOTAL_TIMEOUT_MS,
+                                   location, sizeof(location), error,
+                                   error_capacity);
+        if (result != HTTP_REDIRECT_RESULT) return result;
+        if (redirects >= HTTP_MAX_REDIRECTS) {
+            set_error(error, error_capacity, "Too many HTTP redirects (maximum 5).");
+            return 0;
+        }
+        char resolved[HTTP_URL_MAX];
+        if (!resolve_location(current_url, location, resolved,
+                              sizeof(resolved))) {
+            set_error(error, error_capacity, "HTTP redirect URL is invalid or too long.");
+            return 0;
+        }
+        strlcpy_safe(current_url, resolved, sizeof(current_url));
+        redirects++;
+    }
 }
