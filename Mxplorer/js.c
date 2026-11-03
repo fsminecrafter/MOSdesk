@@ -2882,6 +2882,11 @@ static js_val lookup_identifier(js_env* env, js_str* name, int typeof_check) {
         int found = js_has_property(js_obj_val(g), name);
         if (found) return js_get(js_obj_val(g), name);
     }
+    /* named access: elements with an id are window properties */
+    if (js_doc && js_doc->root) {
+        mx_node_t* element = mx_dom_by_id(js_doc->root, name->data);
+        if (element) return js_wrap_node(element);
+    }
     if (typeof_check) return js_undef();
     return throw_reference(name, 0);
 }

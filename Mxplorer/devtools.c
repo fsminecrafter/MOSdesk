@@ -535,7 +535,7 @@ static void elements_draw(const mx_canvas_t* c, int x, int y, int w, int h) {
             char part[64];
             describe_node(chain[i], part, sizeof(part));
             mx_append(path, sizeof(path), part);
-            if (i) mx_append(path, sizeof(path), "  \xE2\x80\xBA  ");
+            if (i) mx_append(path, sizeof(path), "  /  ");
         }
         mx_canvas_t clip = mx_canvas_clip(c, x + 44, y, w - 54, 34);
         mx_text_ellipsis(&clip, x + 44, y + 10, w - 54, path, T->muted, 12, 0);

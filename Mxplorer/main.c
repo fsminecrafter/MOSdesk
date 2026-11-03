@@ -13,8 +13,8 @@
 #include "window.h"
 #include "x86_64/user_usb.h"
 
-#define WIN_W 1120u
-#define WIN_H 760u
+#define WIN_W 980u
+#define WIN_H 650u
 #define MIN_WIN_W 640u
 #define MIN_WIN_H 420u
 #define MAX_TABS MX_BROWSER_MAX_TABS
@@ -867,6 +867,16 @@ static void save_custom_homepage(void) {
     if (save_homepage_setting()) set_status("Home page saved.");
 }
 
+/* Window events use SYSCALL_INPUT_MOD_* flags; the kernel's translation
+ * expects USB HID modifier bits (LCTRL 0x01, LSHIFT 0x02, RALT 0x40). */
+static char key_char(const syscall_window_event_t* event) {
+    uint8_t hid = 0;
+    if (event->mods & SYSCALL_INPUT_MOD_CTRL) hid |= 0x01;
+    if (event->mods & SYSCALL_INPUT_MOD_SHIFT) hid |= 0x02;
+    if (event->mods & SYSCALL_INPUT_MOD_ALT) hid |= 0x40;   /* as AltGr, for @ { [ */
+    return mos_usb_key_to_ascii((uint8_t)event->key, hid);
+}
+
 /* ====================================================================== */
 /* Address bar editing                                                    */
 /* ====================================================================== */
@@ -952,7 +962,7 @@ static void address_key(const syscall_window_event_t* event) {
         address_scroll = 0;
         return;
     }
-    char c = mos_usb_key_to_ascii((uint8_t)event->key, (uint8_t)event->mods);
+    char c = key_char(event);
     if (c < 32 || c >= 127) return;
     if (address_select_all) {
         address_text[0] = '\0';
@@ -1233,7 +1243,7 @@ static void handle_key(const syscall_window_event_t* event) {
         return;
     }
     if (devtools_open && mx_devtools_focused()) {
-        char c = mos_usb_key_to_ascii((uint8_t)event->key, (uint8_t)event->mods);
+        char c = key_char(event);
         if (mx_devtools_key(key, c, event->mods)) {
             page_dirty = 1;
             return;
@@ -1244,7 +1254,7 @@ static void handle_key(const syscall_window_event_t* event) {
         return;
     }
     if (page_loaded && !is_settings_page(&tabs[active_tab])) {
-        char c = mos_usb_key_to_ascii((uint8_t)event->key, (uint8_t)event->mods);
+        char c = key_char(event);
         char target[URL_LENGTH];
         target[0] = '\0';
         int focused = mx_html_has_focus();
@@ -1374,7 +1384,7 @@ int main(void) {
     tab_count = 1;
     reset_address();
 
-    window_id = mos_window_create(0, 64, 40, WIN_W, WIN_H, "Mxplorer");
+    window_id = mos_window_create(0, 22, 16, WIN_W, WIN_H, "Mxplorer");
     if (!window_id) {
         printf("Mxplorer: unable to create browser window\n");
         return 1;

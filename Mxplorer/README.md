@@ -1,59 +1,68 @@
 # Mxplorer
 
-Mxplorer is a native browser for Minimal-OS. It is intentionally not built on
-EasyUI: the browser shell, HTTP transport, HTML parser, CSS parser, and page
-renderer are separate modules.
+Mxplorer is the native web browser for Minimal-OS. It draws its own UI and
+pages (it is not built on EasyUI) and has its own HTML parser, CSS engine,
+layout engine and JavaScript interpreter.
 
-## Current support
+## Features
 
-- Multiple closable, reorderable tabs; back, forward, refresh, home, and URL
-  search controls; the HTML-rendered `mos://home` page; and the
-  `mos://settings` page.
-- `Resources/homepage.html` is the built-in HTML landing page. General settings
-  let you choose Google, the Mxplorer alternative, or a custom web address;
-  that choice is saved in `0:/data/mxplorer-homepage.txt`.
-- `Resources/fonts/` bundles Inter Regular and Medium for anti-aliased browser
-  chrome and page text. Install the `Resources` directory at
-  `0:/programs/Mxplorer/Resources` alongside the browser so Mxplorer can load
-  the bundled homepage and fonts. If the font files are unavailable, the
-  renderer falls back to the system font and then its bitmap font.
-- A toggleable developer panel (`Ctrl+Q`) with session console messages,
-  request status, and a lightweight HTML source element outline. The startup
-  page and Home button follow the selected homepage preference.
-  JavaScript execution/console and a live DOM inspector are not implemented.
-- HTML documents up to 96 KiB, with semantic block elements, headings,
-  paragraphs, lists, line breaks, horizontal rules, links as text, and image
-  alt-text placeholders. Scripts are ignored and never executed.
-- Click-to-position address-bar caret, insertion/deletion, and arrow/Home/End
-  navigation while editing.
-- Embedded CSS with element, class, ID, and universal selectors; colors,
-  backgrounds, font size/weight, text alignment, margins, padding, and
-  `display: none`. The renderer wraps text, scrolls pages, and redraws only
-  dirty browser chrome or page regions.
-- MOSdesk accent/window-style colors.
+- **Browser:** tabs (reorder by dragging, Ctrl+T/Ctrl+W/Ctrl+Tab), history
+  (Alt+Left/Right), address bar with search, "Not secure"/lock indicator,
+  link previews, page scrollbar, loading progress, error pages.
+- **Look:** Material Symbols icons by Google, light and dark themes (toolbar
+  button or Settings > Appearance; dark mode also darkens the window title
+  bar and lets sites use their `prefers-color-scheme: dark` style). The accent
+  colour follows MOSdesk Settings.
+- **HTML:** HTML5-style tree building (implicit tags, raw text elements,
+  character references), forms (text inputs, checkboxes, radios, selects,
+  textareas, buttons, GET submission), links and in-page anchors, lists,
+  tables, `<details>`, `<pre>`, presentational attributes. Pages up to 2 MiB.
+- **CSS:** `<style>` and external stylesheets, full selectors (combinators,
+  attributes, `:nth-child`, `:not`, `:is`, ...), specificity and
+  `!important`, `@media`/`@supports`/`@layer`, custom properties, `calc()`,
+  `min()`/`max()`/`clamp()`, all colour syntaxes including `light-dark()`,
+  box model, borders and radii, flexbox, grid, absolute/fixed/relative
+  positioning, floats (approximate), overflow clipping, opacity, text styles.
+- **JavaScript:** a tree-walking ES2020 interpreter: classes, closures,
+  destructuring, spread, template literals, optional chaining, generators,
+  async/await and Promises, RegExp, JSON, Date, Map/Set, ES modules with import
+  maps and `import()`. Browser APIs: DOM, events (capture/bubble, inline
+  handlers), timers, `requestAnimationFrame`, `fetch`, `XMLHttpRequest`,
+  `localStorage`, cookies, `location`, `history`, observers. Scripts run on
+  their own 1 MiB stack with a 48 MiB heap per page and a time limit.
+- **Developer tools (F12, Ctrl+Shift+I, Ctrl+Shift+J):** Console with a
+  JavaScript prompt, filters and history; Elements with a live DOM tree,
+  element picker, box model, computed style and matched rules (`$0` in the
+  console); Network with status, type, size, timing and a waterfall; Sources
+  with line numbers and highlighting; Performance timings and memory.
 
-HTML/CSS support is a deliberately small subset of the HTML Living Standard
-and CSS; this is not a standards-complete browser. External stylesheets,
-images, interactive links/forms, JavaScript, and advanced layout are not yet
-implemented. HTTP pages can be fetched, and common HTTP redirects are followed
-for up to five hops with a two-second budget per followed request. HTTPS uses
-the kernel's TLS 1.3 client and is disabled by default. Certificate chains are
-not authenticated, so the server identity cannot be trusted; enable HTTPS only
-for non-sensitive browsing. The opt-in lasts only for the current browser
-session. HTTP is unencrypted and should only be used for non-sensitive pages.
+Settings live in `0:/data/mxplorer-settings.txt` and
+`0:/data/mxplorer-homepage.txt`. Unsafe HTTPS stays off by default and lasts
+only for the session: the kernel's TLS 1.3 client does not verify
+certificates, so never use it for private data.
+
+Not supported yet: images, video, canvas, web fonts, WebSockets, POST
+requests (forms are sent as GET), certificate checks. Switching tabs reloads
+the page from its cache, so script state is not kept.
 
 ## Modules
 
-- `main.c` - browser state, window loop, tabs, and navigation
-- `http.c` - bounded HTTP/1.x retrieval
-- `html.c` - bounded HTML parsing, layout, scrolling, and drawing
-- `css.c` - supported CSS selectors and declarations
-- `ui.c` - native browser chrome, settings, and dirty-region presentation
-- `text.c` - shared smooth-text loading, width measurement, and drawing
-- `Resources/homepage.html` - editable source for the Mxplorer alternative page
-- `Resources/fonts/` - bundled Inter fonts and their license
-- `examples/Mxplorer-Studio.c` - flattened single-file Run Studio / `.run`
-  preview source. Refresh this snapshot when the modular sources change.
+- `main.c` - window, tabs, navigation, settings, input
+- `ui.c` - browser chrome, settings and error pages, theme palettes
+- `devtools.c` - developer tools panel
+- `html.c` - page loading, layout, painting, hit testing, forms
+- `dom.c` - DOM tree and HTML parser
+- `css.c` - stylesheet parser, selector matching, cascade
+- `js.c`, `js_runtime.c`, `js_dom.c` - JavaScript language, built-ins and
+  browser objects
+- `http.c` - HTTP/1.x with redirects (HTTPS through the kernel TLS client)
+- `text.c`, `gfx.c` - text and anti-aliased drawing; `icons_data.c` is
+  generated by `tools/gen_icons.py` from Material Symbols Rounded
+- `devlog.c` - console and network logs
+- `Resources/` - start page, Inter, Inter Bold and Roboto Mono fonts, licences
+
+`examples/Mxplorer-Studio.c` is the old 0.2 single-file snapshot and does not
+include the new engine.
 
 ## Build
 
@@ -63,32 +72,18 @@ From the MOSdesk directory:
 ./Minimal-OS-SDK/build.sh --output Mxplorer.run Mxplorer
 ```
 
-Initialize the `Minimal-OS-SDK` submodule first if it is not present. This
-creates `Mxplorer.run` in the MOSdesk directory.
+Install the `Resources` directory at `0:/programs/Mxplorer/Resources` next to
+the browser (the Minimal-OS Makefile does this).
 
-The `.run` bundle contains source-directory resources, but the current runtime
-does not expose files embedded in a `.run` archive to the program. Keep the
-`Resources` directory installed at the path above when deploying the app.
-
-To build the standalone single-file version instead:
+## Host tests (from the Mxplorer directory)
 
 ```sh
-./Minimal-OS-SDK/build.sh --output /tmp/Mxplorer-Studio.run \
-  Mxplorer/examples/Mxplorer-Studio.c
+SDK=../../Minimal-OS-SDK/include
+gcc -std=gnu11 -DMX_HOST -I include -idirafter $SDK tests/html_test.c html.c \
+  css.c dom.c util.c text.c gfx.c icons_data.c devlog.c tests/host/js_stub.c \
+  -o /tmp/html-test -lm && /tmp/html-test
 ```
 
-The standalone source uses the SDK window, text drawing, and networking APIs
-and can be opened as one source file in Run Studio, including its bitmap-font
-compatibility environment.
-
-## Host tests
-
-```sh
-gcc -std=c11 -Wall -Wextra -Werror \
-  -I Mxplorer/tests/host_stubs -I Mxplorer/include \
-  Mxplorer/tests/html_test.c Mxplorer/html.c Mxplorer/css.c \
-  -o /tmp/mxplorer-html-test
-/tmp/mxplorer-html-test
-```
-
-JavaScript and advanced CSS/layout remain future work.
+`tests/host/build.sh [js]` builds a renderer that draws any URL or file to a
+PPM image, `tests/host/jsrun.c` runs a script and prints its console, and
+`tests/host/ui_preview.c` renders every browser UI state in both themes.

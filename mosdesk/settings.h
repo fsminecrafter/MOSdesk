@@ -46,6 +46,7 @@
 /* Window and panel style, Settings > Appearance. */
 #define MOSDESK_UI_STYLE_MODERN 0u
 #define MOSDESK_UI_STYLE_AERO 1u
+#define MOSDESK_UI_STYLE_LIQUID 2u
 #define MOSDESK_USERNAME_SIZE 32u
 #define MOSDESK_WALLPAPER_FILL 0u
 #define MOSDESK_WALLPAPER_CROP 1u
@@ -540,7 +541,7 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         settings.onboarding_complete > 1u ||
         settings.login_enabled > 1u ||
         settings.click_once_open > 1u ||
-        settings.ui_style > MOSDESK_UI_STYLE_AERO ||
+        settings.ui_style > MOSDESK_UI_STYLE_LIQUID ||
         settings.username[MOSDESK_USERNAME_SIZE - 1u] != '\0')
         return mosdesk_settings_default();
     if (settings.clock_24h > 1u ||

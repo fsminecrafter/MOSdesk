@@ -1799,7 +1799,8 @@ static int line_height_value(const char* value, int font_size, int* out) {
     const char* p = skip_ws(value);
     int used = parse_number(p, &n);
     if (used && (!p[used] || mx_is_space(p[used]))) {
-        *out = (int)(n * font_size + 0.5);
+        /* unitless: inherited as a factor, stored as -(factor * 100) */
+        *out = n > 0 ? -(int)(n * 100 + 0.5) : 0;
         return 1;
     }
     mx_len_t length;

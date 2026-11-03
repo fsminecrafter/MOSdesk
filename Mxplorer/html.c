@@ -232,6 +232,7 @@ static int normal_line_height(const mx_style_t* s) {
 }
 
 static int line_height_of(const mx_style_t* s) {
+    if (s->line_height < 0) return font_px(s) * -s->line_height / 100;
     return s->line_height > 0 ? s->line_height : normal_line_height(s);
 }
 
@@ -2306,6 +2307,11 @@ mx_html_result_t mx_html_load(const char* source, size_t length,
     stats.parse_ms = mx_now_ms() - t0;
 
     mx_css_reset();
+    {
+        /* media queries are evaluated while parsing */
+        mx_css_env_t env = {viewport_w, viewport_h, prefers_dark};
+        mx_css_set_env(&env);
+    }
     mx_css_add_stylesheet(mx_css_user_agent, mx_css_user_agent_length, 0);
     if (!scripts_enabled) {
         static const char noscript[] = "noscript{display:block}";

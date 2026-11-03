@@ -1,98 +1,81 @@
+/* Host test for the HTML/CSS engine (run from the Mxplorer directory):
+ *   gcc -std=gnu11 -DMX_HOST -I include -idirafter ../../Minimal-OS-SDK/include \
+ *       tests/html_test.c html.c css.c dom.c util.c text.c gfx.c icons_data.c \
+ *       devlog.c tests/host/js_stub.c -o /tmp/mxplorer-html-test -lm */
+#include "mxplorer/css.h"
 #include "mxplorer/html.h"
 #include "mxplorer/text.h"
 #include <assert.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-static char drawn_text[4096];
-static size_t drawn_length;
-static int notice_seen;
-static int hidden_seen;
-static int script_seen;
+enum { WIDTH = 480, HEIGHT = 640 };
+static uint32_t pixels[WIDTH * HEIGHT];
 
-int mx_text_width(const char* text, int size) {
-    return (int)strlen(text) * 8 * size;
-}
-
-void mx_text_draw(uint32_t* pixels, uint32_t width, uint32_t height,
-                  int x, int y, const char* text, uint32_t color, int size) {
-    (void)size;
-    if (strstr(text, "Styled") && color == 0xFF123456u) notice_seen = 1;
-    if (strstr(text, "secret")) hidden_seen = 1;
-    if (strstr(text, "scripted")) script_seen = 1;
-    size_t length = strlen(text);
-    if (length < sizeof(drawn_text) - drawn_length - 1) {
-        memcpy(drawn_text + drawn_length, text, length);
-        drawn_length += length;
-        drawn_text[drawn_length] = '\0';
-    }
-    if (x >= 0 && y >= 0 && (uint32_t)x < width && (uint32_t)y < height)
-        pixels[(size_t)y * width + (uint32_t)x] = color;
+static mx_html_options_t options(int dark) {
+    mx_html_options_t o;
+    memset(&o, 0, sizeof(o));
+    o.url = "http://test.local/page.html";
+    o.viewport_width = WIDTH;
+    o.viewport_height = HEIGHT;
+    o.dark = dark;
+    return o;
 }
 
 int main(void) {
+    mx_text_load_fonts();
     static const char html[] =
-        "<!doctype html><html><head><style>"
-        "body { background-color: #f8f8f8; color: #222222; }"
-        "h1 { color: #cc0000; }"
-        ".notice { color: #123456; background-color: #eeeeee; font-size: 24px; }"
-        "#hidden { display: none; }"
+        "<!doctype html><html><head><title>  Test &amp; page </title><style>"
+        "body { background-color: #f8f8f8; color: #222; margin: 0 }"
+        "#hidden { display: none }"
+        ".box { width: 100px; padding: 10px; border: 2px solid red; margin: 0 auto }"
+        "@media (prefers-color-scheme: dark) { body { background: #101010 } }"
         "</style></head><body><h1>Title</h1>"
-        "<p class='notice'>Styled &amp; text</p>"
-        "<p id='hidden'>secret text</p>"
-        "<script>document.write('scripted')</script>"
-        "<hr></body></html>";
-    enum { WIDTH = 320, HEIGHT = 480 };
-    uint32_t pixels[WIDTH * HEIGHT] = {0};
+        "<div class=box id=box>Boxed</div>"
+        "<p id=hidden>secret</p>"
+        "<p><a href='/next?x=1'>link</a></p>"
+        "<script>document.write('scripted')</script></body></html>";
+    mx_html_options_t o = options(0);
+    assert(mx_html_load(html, sizeof(html) - 1, &o) == MX_HTML_OK);
+    assert(!strcmp(mx_html_title(), "Test & page"));
+    assert(mx_html_background() == 0xFFF8F8F8u);
+    mx_document_t* doc = mx_html_document();
+    mx_node_t* box = mx_dom_by_id(doc->root, "box");
+    assert(box && box->box_w == 100 + 20 + 4);
+    assert(box->box_x == (WIDTH - box->box_w) / 2);          /* margin: auto */
+    assert(mx_dom_by_id(doc->root, "hidden")->style->display == MX_DISPLAY_NONE);
+    assert(mx_css_matches(box, "body > div.box#box") == 1);
+    mx_canvas_t c = mx_canvas(pixels, WIDTH, HEIGHT);
+    mx_html_draw(&c, 0, HEIGHT, 0);
+    assert(pixels[0] == 0xFFF8F8F8u);
 
-    assert(mx_html_parse(html, sizeof(html) - 1, WIDTH) == MX_HTML_OK);
-    assert(mx_html_content_height() > 0);
-    mx_html_draw(pixels, WIDTH, HEIGHT, 0);
-    assert(pixels[MX_HTML_VIEW_TOP * WIDTH] == 0xFFF8F8F8u);
-    assert(notice_seen);
-    assert(!hidden_seen);
-    assert(!script_seen);
-    assert(strstr(drawn_text, "Title"));
-    assert(strstr(drawn_text, "Styled"));
-    assert(!strstr(drawn_text, "secret"));
-    assert(!strstr(drawn_text, "scripted"));
+    /* the link resolves against the page */
+    int found = 0;
+    for (int y = 0; y < mx_html_content_height() && !found; y += 2)
+        for (int x = 0; x < WIDTH && !found; x += 4) {
+            const char* link = mx_html_link_at(x, y);
+            if (link) {
+                assert(!strcmp(link, "http://test.local/next?x=1"));
+                found = 1;
+            }
+        }
+    assert(found);
 
-    mx_html_scroll(10000, HEIGHT - MX_HTML_VIEW_TOP);
-    int maximum_scroll = mx_html_content_height() - (HEIGHT - MX_HTML_VIEW_TOP);
-    if (maximum_scroll < 0) maximum_scroll = 0;
-    assert(mx_html_scroll_y() == maximum_scroll);
-    assert(mx_html_parse(html, MX_HTML_SOURCE_MAX + 1, WIDTH) ==
-           MX_HTML_TOO_LARGE);
+    /* dark mode switches the media query */
+    o = options(1);
+    assert(mx_html_load(html, sizeof(html) - 1, &o) == MX_HTML_OK);
+    assert(mx_html_background() == 0xFF101010u);
 
-    FILE* homepage = fopen("Mxplorer/Resources/homepage.html", "rb");
-    assert(homepage);
-    char homepage_source[8192];
-    size_t homepage_length =
-        fread(homepage_source, 1, sizeof(homepage_source) - 1, homepage);
-    assert(!ferror(homepage));
-    assert(fclose(homepage) == 0);
-    homepage_source[homepage_length] = '\0';
-    drawn_text[0] = '\0';
-    drawn_length = 0;
-    assert(mx_html_parse(homepage_source, homepage_length, WIDTH) == MX_HTML_OK);
-    mx_html_draw(pixels, WIDTH, HEIGHT, 0);
-    assert(strstr(drawn_text, "Mxplorer"));
-    assert(strstr(drawn_text, "Quick guide"));
-    assert(strstr(homepage_source, "Google"));
-    assert(strstr(homepage_source, "custom homepage"));
-    assert(strstr(homepage_source, "Search and browse"));
-    assert(strstr(homepage_source, "HTTPS attempts are disabled"));
-    assert(strstr(homepage_source, "Never use it for passwords"));
-    FILE* regular_font =
-        fopen("Mxplorer/Resources/fonts/Inter-Regular.otf", "rb");
-    FILE* medium_font =
-        fopen("Mxplorer/Resources/fonts/Inter-Medium.otf", "rb");
-    assert(regular_font && medium_font);
-    assert(fclose(regular_font) == 0);
-    assert(fclose(medium_font) == 0);
-
-    puts("Mxplorer HTML/CSS renderer tests passed");
+    /* the bundled start page parses */
+    FILE* f = fopen("Resources/homepage.html", "rb");
+    assert(f);
+    static char home[65536];
+    size_t n = fread(home, 1, sizeof(home) - 1, f);
+    fclose(f);
+    o = options(0);
+    assert(mx_html_load(home, n, &o) == MX_HTML_OK);
+    assert(mx_html_content_height() > 300);
+    puts("Mxplorer HTML/CSS engine tests passed");
     return 0;
 }

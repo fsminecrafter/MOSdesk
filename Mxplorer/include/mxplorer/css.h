@@ -56,7 +56,7 @@ typedef struct mx_style {
     uint32_t background;          /* alpha 0: transparent */
     int font_size;                /* px */
     int font_weight;              /* 100..900 */
-    int line_height;              /* px; 0: normal */
+    int line_height;              /* px; 0: normal; <0: -(factor*100) */
     int letter_spacing;
     int text_indent;
     uint8_t italic;

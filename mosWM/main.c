@@ -7,6 +7,8 @@
 #include "window.h"
 #include "file_icons.h"
 #include "wm_text.h"
+#include "wm_panel_icons.h"
+#include "net.h"
 #define MOSDESK_SYSCALL mos_syscall3
 #include "../mosdesk/settings.h"
 #include "../mosdesk/password_hash.h"
@@ -258,6 +260,7 @@ static uint32_t mouse_speed = 100u;
 static uint32_t accent_color = 0xFF3DAEE9u;
 /* MOSDESK_UI_STYLE_MODERN, or MOSDESK_UI_STYLE_AERO for the glass look. */
 static uint32_t ui_style;
+static bool liquid_style(void) { return ui_style == MOSDESK_UI_STYLE_LIQUID; }
 static uint32_t wallpaper_style;
 static uint32_t wallpaper_mode;
 static uint32_t wallpaper_rotation;
@@ -2628,7 +2631,7 @@ static int32_t rounded_inset(int32_t row, int32_t height, int32_t r) {
 
 /* Keeps glass_source a blurred copy of the current wallpaper. */
 static void ensure_glass(void) {
-    if (ui_style != MOSDESK_UI_STYLE_AERO || !wallpaper ||
+    if (ui_style == MOSDESK_UI_STYLE_MODERN || !wallpaper ||
         glass_generation == wallpaper_generation)
         return;
     size_t pixels = (size_t)display.width * display.height;
@@ -2792,6 +2795,94 @@ static void stroke_rounded_rect(int32_t x, int32_t y, int32_t width,
         fill_rect(x + inset, y + row, reach, 1, color);
         fill_rect(x + width - inset - reach, y + row, reach, 1, color);
     }
+}
+
+/* Liquid Glass: whatever is already on the canvas behind the rounded
+ * rectangle, blurred and tinted, lit from the top, with a bright rim. The
+ * blur reads only inside the area being repainted. */
+static uint32_t* liquid_scratch;
+static size_t liquid_scratch_pixels;
+
+static uint32_t liquid_cover(int32_t px, int32_t py, int32_t w, int32_t h,
+                             int32_t r) {
+    int32_t cx = px < r ? r : px >= w - r ? w - r - 1 : px;
+    int32_t cy = py < r ? r : py >= h - r ? h - r - 1 : py;
+    if (cx == px || cy == py) return 255u;
+    /* 1/16 pixel units, measured from the pixel centre. */
+    int64_t dx = (int64_t)(px - cx) * 16, dy = (int64_t)(py - cy) * 16;
+    if (px < r) dx += 8; else dx -= 8;
+    if (py < r) dy += 8; else dy -= 8;
+    int64_t d = isqrt_u64((uint64_t)(dx * dx + dy * dy));
+    int64_t edge = (int64_t)r * 16 - d;
+    if (edge <= -8) return 0u;
+    if (edge >= 8) return 255u;
+    return (uint32_t)((edge + 8) * 255 / 16);
+}
+
+static void liquid_glass(int32_t x, int32_t y, int32_t width, int32_t height,
+                         int32_t radius, uint32_t tint, uint32_t tint_alpha) {
+    if (width <= 0 || height <= 0) return;
+    if (radius * 2 > width) radius = width / 2;
+    if (radius * 2 > height) radius = height / 2;
+    rect_t b = draw_bounds();
+    int32_t left = x > b.left ? x : b.left;
+    int32_t top = y > b.top ? y : b.top;
+    int32_t right = x + width < b.right ? x + width : b.right;
+    int32_t bottom = y + height < b.bottom ? y + height : b.bottom;
+    if (right <= left || bottom <= top) return;
+    uint32_t rw = (uint32_t)(right - left), rh = (uint32_t)(bottom - top);
+    size_t need = (size_t)rw * rh * 2u;
+    if (need > liquid_scratch_pixels) {
+        if (liquid_scratch) wm_free(liquid_scratch);
+        liquid_scratch = (uint32_t*)wm_malloc(need * sizeof(uint32_t));
+        liquid_scratch_pixels = liquid_scratch ? need : 0;
+    }
+    uint32_t* blur = liquid_scratch;
+    if (blur) {
+        uint32_t* other = blur + (size_t)rw * rh;
+        for (uint32_t row = 0; row < rh; row++)
+            copy_pixels(blur + (size_t)row * rw,
+                        canvas + (size_t)(top + (int32_t)row) * display.width +
+                            left, rw);
+        for (int pass = 0; pass < 2; pass++) {
+            box_blur_pass(other, blur, rh, rw, rw, 1u, 6u);
+            box_blur_pass(blur, other, rw, rh, 1u, rw, 6u);
+        }
+    }
+    int32_t lit_rows = height < 36 ? height / 2 : 18;
+    for (int32_t py = top; py < bottom; py++) {
+        int32_t ry = py - y;
+        uint32_t shine = ry < lit_rows
+            ? 8u + 44u * (uint32_t)(lit_rows - ry) / (uint32_t)lit_rows : 8u;
+        if (ry >= height - 3) shine += 16u;   /* light caught by the lower edge */
+        uint32_t* row = canvas + (size_t)py * display.width;
+        const uint32_t* src = blur ? blur + (size_t)(py - top) * rw : NULL;
+        for (int32_t px = left; px < right; px++) {
+            uint32_t cover = liquid_cover(px - x, ry, width, height, radius);
+            if (!cover) continue;
+            uint32_t color = src ? src[px - left] : row[px];
+            color = mix_color(color, tint, tint_alpha);
+            color = mix_color(color, 0xFFFFFFFFu, shine);
+            row[px] = cover < 255u ? mix_color(row[px], color, cover) : color;
+        }
+    }
+    /* Rim: brighter along the top, a soft dark line outside it. */
+    stroke_rounded_rect(x - 1, y - 1, width + 2, height + 2, (uint32_t)radius + 1u,
+                        0x30000000u);
+    stroke_rounded_rect(x, y, width, height, (uint32_t)radius, 0x50FFFFFFu);
+    fill_rect(x + radius, y, width - 2 * radius, 1, 0x60FFFFFFu);
+    stroke_rounded_rect(x + 1, y + 1, width - 2, height - 2,
+                        radius > 1 ? (uint32_t)radius - 1u : 0u, 0x14FFFFFFu);
+}
+
+/* A Liquid Glass panel for menus: a soft shadow, then dark glass. */
+static void liquid_menu(int32_t x, int32_t y, int32_t width, int32_t height,
+                        int32_t radius) {
+    fill_rounded_rect(x - 6, y - 2, width + 12, height + 12,
+                      (uint32_t)radius + 6u, 0x26000000u);
+    fill_rounded_rect(x - 2, y + 1, width + 4, height + 4,
+                      (uint32_t)radius + 2u, 0x30000000u);
+    liquid_glass(x, y, width, height, radius, 0xFF161A1Fu, 0xA8u);
 }
 
 /* An Aero push button: grey glass, or pale blue when hovered or default. */
@@ -3530,6 +3621,40 @@ static void composite_window(const syscall_window_info_t* info,
                     (int32_t)info->height + 4, 0x58FFFFFFu);
         stroke_rect(x, y + (int32_t)TITLE_HEIGHT, outer_width,
                     (int32_t)info->height + 2, 0xA0243447u);
+    } else if (liquid_style()) {
+        /* Liquid Glass: a dark glass frame with large corners and a lit
+         * rim; the title bar is part of the glass. */
+        const int32_t glass_hole[4] = {
+            x + 1, y + (int32_t)TITLE_HEIGHT + 1,
+            x + 1 + (int32_t)info->width,
+            y + (int32_t)TITLE_HEIGHT + 1 + (int32_t)info->height -
+                (int32_t)CORNER_RADIUS};
+        fill_rounded_rect_around(x - 6, y - 2, outer_width + 12,
+                                 outer_height + 14, 18u, 0x18000000u,
+                                 glass_hole);
+        fill_rounded_rect_around(x - 3, y + 1, outer_width + 6,
+                                 outer_height + 6, 15u,
+                                 window_focused ? 0x40000000u : 0x24000000u,
+                                 glass_hole);
+        glass_rounded(x - 2, y - 2, outer_width + 4, outer_height + 4, 14u,
+                      0xFF161A1Fu, window_focused ? 0x90u : 0x70u,
+                      window_focused ? 0x20u : 0x10u,
+                      (int32_t)TITLE_HEIGHT / 2, glass_hole);
+        fill_gradient_rounded(x - 1, y - 1, outer_width + 2, 14, 13u,
+                              window_focused ? 0x2CFFFFFFu : 0x18FFFFFFu,
+                              0x00FFFFFFu);
+        stroke_rounded_rect(x - 3, y - 3, outer_width + 6, outer_height + 6,
+                            15u, 0x38000000u);
+        stroke_rounded_rect(x - 2, y - 2, outer_width + 4, outer_height + 4,
+                            14u, window_focused ? 0x70FFFFFFu : 0x40FFFFFFu);
+        fill_rect(x + 12, y - 2, outer_width - 24, 1,
+                  window_focused ? 0x90FFFFFFu : 0x50FFFFFFu);
+        if (!filled)
+            fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT + 1,
+                      (int32_t)info->width, (int32_t)info->height,
+                      0xFF000000u | info->style.content_background);
+        fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT, outer_width - 2, 1,
+                  0x28FFFFFFu);
     } else {
     fill_rounded_rect_around(x - 4, y - 1, outer_width + 8,
                              outer_height + 10, CORNER_RADIUS + 4u,
@@ -3690,6 +3815,46 @@ static void draw_chrome_aero(const syscall_window_info_t* info,
     draw_wallpaper_line(cx + 5, gy, cx - 3, gy + 8, glyph);
 }
 
+/* Liquid Glass title: centred light text and round glass buttons that
+ * light up under the pointer (close turns red). */
+static void draw_chrome_liquid(const syscall_window_info_t* info,
+                               const cached_window_t* entry) {
+    int32_t x = (int32_t)info->x;
+    int32_t y = (int32_t)info->y;
+    int32_t right = x + (int32_t)info->width + 1;
+    int32_t by = y + 5;
+    int32_t close_x = right - 24, max_x = right - 48, min_x = right - 72;
+    bool focused = info->id == focused_id;
+    char title[SYSCALL_WINDOW_MAX_TITLE];
+    int32_t title_left = x + (entry && entry->has_icon ? 32 : 12);
+    int32_t room = min_x - 10 - title_left;
+    fit_text_px(title, sizeof(title), info->title, room, 2);
+    int32_t text_width = (int32_t)moswm_text_width(title, 2);
+    if (entry && entry->has_icon)
+        draw_custom_icon(entry->icon_pixels, x + 7, y + 4, 20u);
+    wm_text(title_left + (room - text_width) / 2,
+            y + ((int32_t)TITLE_HEIGHT - 16) / 2, title,
+            focused ? 0xFFF4F7FAu : 0xA0E4EAEFu, focused ? 0x50000000u : 0u, 2);
+    uint32_t hover = caption_hover_window == info->id
+        ? caption_hover_button : 0u;
+    const int32_t xs[3] = {min_x, max_x, close_x};
+    for (uint32_t i = 0; i < 3u; i++) {
+        bool lit = hover == i + 1u;
+        uint32_t fill = lit ? (i == 2u ? 0xFFE5484Du : 0x58FFFFFFu)
+                            : (focused ? 0x26FFFFFFu : 0x16FFFFFFu);
+        fill_rounded_rect(xs[i], by, 18, 18, 9, fill);
+        stroke_rounded_rect(xs[i], by, 18, 18, 9u,
+                            lit ? 0x60FFFFFFu : 0x30FFFFFFu);
+    }
+    uint32_t glyph = focused ? 0xFFF4F7FAu : 0xB0E4EAEFu;
+    fill_rect(min_x + 5, by + 9, 8, 2, glyph);
+    stroke_rect(max_x + 5, by + 5, 8, 8, glyph);
+    draw_wallpaper_line(close_x + 6, by + 6, close_x + 11, by + 11, glyph);
+    draw_wallpaper_line(close_x + 7, by + 6, close_x + 12, by + 11, glyph);
+    draw_wallpaper_line(close_x + 11, by + 6, close_x + 6, by + 11, glyph);
+    draw_wallpaper_line(close_x + 12, by + 6, close_x + 7, by + 11, glyph);
+}
+
 static void draw_chrome_text(const syscall_window_info_t* info,
                              const cached_window_t* entry) {
     int32_t x = (int32_t)info->x;
@@ -3703,6 +3868,10 @@ static void draw_chrome_text(const syscall_window_info_t* info,
     bool focused = info->id == focused_id;
     if (ui_style == MOSDESK_UI_STYLE_AERO) {
         draw_chrome_aero(info, entry);
+        return;
+    }
+    if (liquid_style()) {
+        draw_chrome_liquid(info, entry);
         return;
     }
 
@@ -4241,53 +4410,28 @@ static void sound_track(int32_t* x0, int32_t* x1, int32_t* cy) {
     *cy = y + 66;
 }
 
-/* A speaker in a 20x20 box at (x, y), anti-aliased (4x4 samples per
- * pixel): body, cone, then `waves` sound arcs, or a cross when muted. */
-static float sound_seg_dist(float px, float py, float ax, float ay, float bx,
-                            float by) {
-    float dx = bx - ax, dy = by - ay;
-    float t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    float ex = ax + t * dx - px, ey = ay + t * dy - py;
-    return ex * ex + ey * ey;
+/* A Material Symbols icon (wm_panel_icons.h) tinted with `color`. */
+static void draw_panel_icon(uint32_t id, uint32_t size, int32_t x, int32_t y,
+                            uint32_t color) {
+    if (id >= WM_ICON_COUNT) return;
+    const uint8_t* mask = size >= 24u ? wm_icons_24[id] : wm_icons_20[id];
+    uint32_t n = size >= 24u ? 24u : 20u;
+    uint32_t a = color >> 24, rgb = color & 0x00FFFFFFu;
+    for (uint32_t py = 0; py < n; py++)
+        for (uint32_t px = 0; px < n; px++) {
+            uint32_t c = mask[py * n + px];
+            if (c) put_pixel(x + (int32_t)px, y + (int32_t)py,
+                             ((a * c / 255u) << 24) | rgb);
+        }
 }
 
-static bool sound_icon_inside(float px, float py, uint32_t waves, bool muted) {
-    if (px >= 1.5f && px <= 6.0f && py >= 7.0f && py <= 13.0f) return true;
-    if (px >= 6.0f && px <= 11.0f) {
-        float half = 3.0f + (px - 6.0f);
-        if (py >= 10.0f - half && py <= 10.0f + half) return true;
-    }
-    if (muted) {
-        return sound_seg_dist(px, py, 13.5f, 7.0f, 19.0f, 13.0f) < 0.8f ||
-               sound_seg_dist(px, py, 13.5f, 13.0f, 19.0f, 7.0f) < 0.8f;
-    }
-    float dx = px - 9.0f, dy = py - 10.0f;
-    if (dx <= 0.0f || dy > dx * 1.15f || -dy > dx * 1.15f) return false;
-    float r2 = dx * dx + dy * dy;
-    for (uint32_t k = 1; k <= waves; k++) {
-        float r = 3.6f + 3.2f * (float)k;
-        if (r2 >= (r - 0.85f) * (r - 0.85f) && r2 <= (r + 0.85f) * (r + 0.85f))
-            return true;
-    }
-    return false;
-}
-
+/* The speaker in a 20x20 box at (x, y): muted, or by how loud it is. */
 static void draw_speaker(int32_t x, int32_t y, uint32_t color, uint32_t waves,
                          bool muted) {
-    for (int32_t py = 0; py < 20; py++)
-        for (int32_t px = 0; px < 20; px++) {
-            uint32_t hits = 0;
-            for (int32_t sy = 0; sy < 4; sy++)
-                for (int32_t sx = 0; sx < 4; sx++)
-                    hits += sound_icon_inside((float)px + (sx + 0.5f) / 4.0f,
-                                              (float)py + (sy + 0.5f) / 4.0f,
-                                              waves, muted);
-            if (!hits) continue;
-            uint32_t alpha = ((color >> 24) * hits) / 16u;
-            put_pixel(x + px, y + py, (alpha << 24) | (color & 0x00FFFFFFu));
-        }
+    uint32_t id = muted ? WM_ICON_VOLUME_OFF
+                : waves == 0u ? WM_ICON_VOLUME_MUTE
+                : waves == 1u ? WM_ICON_VOLUME_DOWN : WM_ICON_VOLUME_UP;
+    draw_panel_icon(id, 20u, x, y, color);
 }
 
 static uint32_t sound_waves(void) {
@@ -4300,13 +4444,32 @@ static void draw_sound_icon(bool aero) {
     sound_icon_rect(&x, &y);
     bool lit = sound_menu_open || hover_taskbar == SOUND_TASKBAR_HOVER;
     if (lit)
-        fill_rounded_rect(x, y, SOUND_ICON_WIDTH, 40, 8,
+        fill_rounded_rect(x, y + (liquid_style() ? 3 : 0), SOUND_ICON_WIDTH,
+                          liquid_style() ? 34 : 40, liquid_style() ? 17 : 8,
                           aero ? 0x40FFFFFFu : 0x26FFFFFFu);
     bool muted = !sound_state_valid || sound_state.muted ||
                  !sound_state.output_count;
     draw_speaker(x + 10, y + 10, sound_state_valid && sound_state.output_count
                                      ? 0xFFEAF2F8u : 0x90EAF2F8u,
                  sound_waves(), muted);
+}
+
+/* The frame of a tray menu (sound, network) in the current style. */
+static void draw_tray_frame(int32_t x, int32_t y, int32_t w, int32_t h,
+                            bool aero) {
+    uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
+    if (aero) {
+        fill_rounded_rect(x - 5, y - 3, w + 10, h + 10, 12, 0x2E000000u);
+        glass_rounded(x, y, w, h, 8u, accent, 0x80u, 0x50u, 30, NULL);
+        fill_rounded_rect(x + 8, y + 8, w - 16, h - 16, 5, 0xF4FFFFFFu);
+        stroke_rounded_rect(x, y, w, h, 8u, 0xC0102030u);
+    } else if (liquid_style()) {
+        liquid_menu(x, y, w, h, 20);
+    } else {
+        fill_rounded_rect(x - 4, y - 2, w + 8, h + 8, 12, 0x40000000u);
+        fill_rounded_rect(x, y, w, h, 10, 0xF41F2327u);
+        stroke_rounded_rect(x, y, w, h, 10u, 0x30FFFFFFu);
+    }
 }
 
 static void draw_sound_menu(bool aero) {
@@ -4316,16 +4479,7 @@ static void draw_sound_menu(bool aero) {
     uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
     uint32_t text = aero ? 0xFF1E2A33u : 0xFFF2F6F9u;
     uint32_t dim = aero ? 0xFF5C6B76u : 0xFF9BAFBCu;
-    if (aero) {
-        fill_rounded_rect(x - 5, y - 3, w + 10, h + 10, 12, 0x2E000000u);
-        glass_rounded(x, y, w, h, 8u, accent, 0x80u, 0x50u, 30, NULL);
-        fill_rounded_rect(x + 8, y + 8, w - 16, h - 16, 5, 0xF4FFFFFFu);
-        stroke_rounded_rect(x, y, w, h, 8u, 0xC0102030u);
-    } else {
-        fill_rounded_rect(x - 4, y - 2, w + 8, h + 8, 12, 0x40000000u);
-        fill_rounded_rect(x, y, w, h, 10, 0xF41F2327u);
-        stroke_rounded_rect(x, y, w, h, 10u, 0x30FFFFFFu);
-    }
+    draw_tray_frame(x, y, w, h, aero);
     wm_text(x + 20, y + 18, "Sound", text, 0, 2);
     if (sound_state_valid && sound_state.driver[0]) {
         uint32_t tw = moswm_text_width(sound_state.driver, 1);
@@ -4464,6 +4618,383 @@ static uint64_t sound_signature(void) {
     return hash;
 }
 
+/*
+ * Network
+ *
+ * A button left of the speaker. Its menu (like Plasma's) shows Wi-Fi and
+ * each wired adapter: its link, speed and the network it is on (address,
+ * gateway, DNS). Read with SYS_NET_STATUS and SYS_NET_ADAPTERS.
+ */
+
+#define NET_ICON_WIDTH 40
+#define NET_MENU_WIDTH 360
+#define NET_TASKBAR_HOVER 1001u          /* hover_taskbar: the network button */
+#define NET_SECTION_LABEL 24
+#define NET_CARD 54
+#define NET_DETAIL_ROW 21
+
+#ifndef SYSCALL_NET_MAX_ADAPTERS
+/* Built against an SDK without SYS_NET_ADAPTERS: only SYS_NET_STATUS. */
+#define SYSCALL_NET_MAX_ADAPTERS 4
+#define SYSCALL_NET_ADAPTER_ETHERNET 0
+#define SYSCALL_NET_ADAPTER_WIFI 1
+#define SYSCALL_NET_LINK_UNKNOWN 0
+#define SYSCALL_NET_LINK_DOWN 1
+#define SYSCALL_NET_LINK_UP 2
+typedef struct {
+    char name[24];
+    uint8_t kind, active, link, full_duplex;
+    uint8_t mac[6];
+    uint16_t reserved;
+    uint32_t speed_mbps;
+} syscall_net_adapter_t;
+typedef struct {
+    uint32_t count, reserved;
+    syscall_net_adapter_t adapters[SYSCALL_NET_MAX_ADAPTERS];
+} syscall_net_adapters_t;
+#define NET_HAVE_ADAPTERS_OP 0
+#else
+#define NET_HAVE_ADAPTERS_OP 1
+#endif
+
+static bool net_menu_open;
+static syscall_net_status_t net_status;
+static syscall_net_adapters_t net_adapters;
+static uint32_t net_poll_frames = UINT32_MAX / 2u; /* read on the first tick */
+
+static void net_refresh(void) {
+    memset(&net_status, 0, sizeof(net_status));
+    if (mos_net_status(&net_status) != (long)SYS_SUCCESS)
+        memset(&net_status, 0, sizeof(net_status));
+    memset(&net_adapters, 0, sizeof(net_adapters));
+    long result = -1;
+#if NET_HAVE_ADAPTERS_OP
+    syscall_net_request_t request;
+    memset(&request, 0, sizeof(request));
+    request.op = SYS_NET_ADAPTERS;
+    request.buf = &net_adapters;
+    request.len = sizeof(net_adapters);
+    result = mos_net_call(&request);
+#endif
+    if (result != (long)SYS_SUCCESS) {
+        /* An older kernel: one wired adapter if a driver runs. */
+        memset(&net_adapters, 0, sizeof(net_adapters));
+        if (net_status.has_driver) {
+            syscall_net_adapter_t* a = &net_adapters.adapters[0];
+            strcpy(a->name, "Ethernet");
+            a->active = 1;
+            memcpy(a->mac, net_status.mac, 6);
+            net_adapters.count = 1;
+        }
+    }
+    if (net_adapters.count > SYSCALL_NET_MAX_ADAPTERS)
+        net_adapters.count = SYSCALL_NET_MAX_ADAPTERS;
+}
+
+static uint32_t net_count_kind(uint8_t kind) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < net_adapters.count; i++)
+        n += net_adapters.adapters[i].kind == kind;
+    return n;
+}
+
+static bool net_adapter_connected(const syscall_net_adapter_t* a) {
+    return a->link != SYSCALL_NET_LINK_DOWN && a->active &&
+           net_status.configured;
+}
+
+/* Details shown under an adapter: the network it is on. */
+static bool net_adapter_details(const syscall_net_adapter_t* a) {
+    return a->active && net_status.configured &&
+           a->link != SYSCALL_NET_LINK_DOWN;
+}
+
+static void net_icon_rect(int32_t* x, int32_t* y) {
+    int32_t sx, sy;
+    sound_icon_rect(&sx, &sy);
+    *x = sx - NET_ICON_WIDTH - 2;
+    *y = sy;
+}
+
+static bool net_icon_hit(int32_t px, int32_t py) {
+    int32_t x, y;
+    net_icon_rect(&x, &y);
+    return px >= x && px < x + NET_ICON_WIDTH && py >= y && py < y + 40;
+}
+
+static int32_t net_wired_height(void) {
+    uint32_t wired = net_count_kind(SYSCALL_NET_ADAPTER_ETHERNET);
+    if (!wired) return NET_CARD;
+    int32_t h = 0;
+    for (uint32_t i = 0; i < net_adapters.count; i++) {
+        const syscall_net_adapter_t* a = &net_adapters.adapters[i];
+        if (a->kind != SYSCALL_NET_ADAPTER_ETHERNET) continue;
+        h += NET_CARD + 6;
+        if (net_adapter_details(a)) h += 5 * NET_DETAIL_ROW + 8;
+    }
+    return h - 6;
+}
+
+static void net_menu_bounds(int32_t* x, int32_t* y, int32_t* width,
+                            int32_t* height) {
+    *width = NET_MENU_WIDTH;
+    *height = 52 + NET_SECTION_LABEL + NET_CARD + 12 + NET_SECTION_LABEL +
+              net_wired_height() + 16;
+    *x = (int32_t)display.width - *width - 8;
+    *y = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT - *height - 8;
+}
+
+static bool net_menu_hit(int32_t px, int32_t py) {
+    if (!net_menu_open) return false;
+    int32_t x, y, w, h;
+    net_menu_bounds(&x, &y, &w, &h);
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+/* Small text builders (there is no snprintf in the SDK). */
+static void net_append(char* dst, size_t size, const char* src) {
+    size_t at = strlen(dst);
+    while (*src && at + 1 < size) dst[at++] = *src++;
+    dst[at] = '\0';
+}
+
+static void net_append_uint(char* dst, size_t size, uint32_t value) {
+    char digits[12];
+    uint32_t n = 0;
+    do {
+        digits[n++] = (char)('0' + value % 10u);
+        value /= 10u;
+    } while (value && n < sizeof(digits));
+    char text[12];
+    for (uint32_t i = 0; i < n; i++) text[i] = digits[n - 1 - i];
+    text[n] = '\0';
+    net_append(dst, size, text);
+}
+
+static void net_append_ip(char* dst, size_t size, uint32_t ip) {
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        net_append_uint(dst, size, (ip >> shift) & 0xFFu);
+        if (shift) net_append(dst, size, ".");
+    }
+}
+
+static uint32_t net_prefix(uint32_t mask) {
+    uint32_t n = 0;
+    while (n < 32u && (mask & (0x80000000u >> n))) n++;
+    return n;
+}
+
+static void net_format_mac(char* dst, size_t size, const uint8_t mac[6]) {
+    static const char hex[] = "0123456789ABCDEF";
+    dst[0] = '\0';
+    for (int i = 0; i < 6; i++) {
+        char part[4] = {hex[mac[i] >> 4], hex[mac[i] & 15u],
+                        i < 5 ? ':' : '\0', '\0'};
+        net_append(dst, size, part);
+    }
+}
+
+static void net_format_speed(char* dst, size_t size,
+                             const syscall_net_adapter_t* a) {
+    dst[0] = '\0';
+    if (!a->speed_mbps) return;
+    if (a->speed_mbps >= 1000u && a->speed_mbps % 1000u == 0) {
+        net_append_uint(dst, size, a->speed_mbps / 1000u);
+        net_append(dst, size, " Gbit/s");
+    } else {
+        net_append_uint(dst, size, a->speed_mbps);
+        net_append(dst, size, " Mbit/s");
+    }
+    net_append(dst, size, a->full_duplex ? ", full duplex" : ", half duplex");
+}
+
+/* Colours shared by the tray menus. */
+typedef struct {
+    uint32_t text, dim, line, hover, accent, good;
+} tray_palette_t;
+
+static tray_palette_t tray_palette(bool aero) {
+    tray_palette_t p;
+    p.accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
+    p.text = aero ? 0xFF1E2A33u : 0xFFF2F6F9u;
+    p.dim = aero ? 0xFF5C6B76u : 0xFF9BAFBCu;
+    p.line = aero ? 0x20000000u : 0x20FFFFFFu;
+    p.hover = aero ? 0x14000000u : 0x14FFFFFFu;
+    p.good = aero ? 0xFF1E8A4Cu : 0xFF5FD38Du;
+    return p;
+}
+
+static void draw_net_icon(bool aero) {
+    (void)aero;
+    int32_t x, y;
+    net_icon_rect(&x, &y);
+    bool lit = net_menu_open || hover_taskbar == NET_TASKBAR_HOVER;
+    if (lit)
+        fill_rounded_rect(x, y + (liquid_style() ? 3 : 0), NET_ICON_WIDTH,
+                          liquid_style() ? 34 : 40, liquid_style() ? 17 : 8,
+                          aero ? 0x40FFFFFFu : 0x26FFFFFFu);
+    bool connected = false, any = net_adapters.count != 0, wifi_only = true;
+    for (uint32_t i = 0; i < net_adapters.count; i++) {
+        connected |= net_adapter_connected(&net_adapters.adapters[i]);
+        wifi_only &= net_adapters.adapters[i].kind == SYSCALL_NET_ADAPTER_WIFI;
+    }
+    uint32_t id = !any ? WM_ICON_SIGNAL_WIFI_OFF
+                : wifi_only ? (connected ? WM_ICON_WIFI : WM_ICON_WIFI_OFF)
+                : WM_ICON_LAN;
+    draw_panel_icon(id, 20u, x + 10, y + 10,
+                    connected ? 0xFFEAF2F8u : 0x90EAF2F8u);
+    if (any && !connected && !wifi_only) {
+        /* A small "not connected" mark on the wired icon. */
+        fill_rounded_rect(x + 24, y + 22, 10, 10, 5, 0xFF1B1E20u);
+        fill_rect(x + 26, y + 26, 6, 2, 0xFFE0A040u);
+    }
+}
+
+/* One adapter card: icon, title, status and the adapter on the right. */
+static void draw_net_card(int32_t x, int32_t y, int32_t w, uint32_t icon,
+                          bool lit, const char* title, const char* status,
+                          uint32_t status_color, const char* right,
+                          const tray_palette_t* p, bool aero) {
+    fill_rounded_rect(x, y, w, NET_CARD, 10,
+                      lit ? ((p->accent & 0x00FFFFFFu) | 0x30000000u)
+                          : (aero ? 0x10000000u : 0x10FFFFFFu));
+    fill_rounded_rect(x + 10, y + 9, 36, 36, 18,
+                      lit ? p->accent : (aero ? 0x18000000u : 0x1CFFFFFFu));
+    draw_panel_icon(icon, 20u, x + 18, y + 17,
+                    lit ? 0xFFFFFFFFu : p->dim);
+    int32_t text_w = w - 66;
+    if (right && right[0]) {
+        uint32_t rw = moswm_text_width(right, 1);
+        wm_text(x + w - 12 - (int32_t)rw, y + 11, right, p->dim, 0, 1);
+        text_w -= (int32_t)rw + 10;
+    }
+    char line[64];
+    fit_text_px(line, sizeof(line), title, (uint32_t)(text_w > 40 ? text_w : 40), 2u);
+    wm_text(x + 56, y + 8, line, p->text, 0, 2);
+    fit_text_px(line, sizeof(line), status, (uint32_t)(w - 68), 1u);
+    wm_text(x + 56, y + 32, line, status_color, 0, 1);
+}
+
+static void draw_net_menu(bool aero) {
+    if (!net_menu_open) return;
+    int32_t x, y, w, h;
+    net_menu_bounds(&x, &y, &w, &h);
+    tray_palette_t p = tray_palette(aero);
+    draw_tray_frame(x, y, w, h, aero);
+    bool connected = false;
+    for (uint32_t i = 0; i < net_adapters.count; i++)
+        connected |= net_adapter_connected(&net_adapters.adapters[i]);
+    wm_text(x + 20, y + 18, "Network", p.text, 0, 2);
+    const char* summary = connected ? "Connected" : "Not connected";
+    uint32_t sw = moswm_text_width(summary, 1);
+    wm_text(x + w - 20 - (int32_t)sw, y + 22, summary,
+            connected ? p.good : p.dim, 0, 1);
+
+    int32_t cx = x + 14, cw = w - 28;
+    int32_t at = y + 52;
+
+    /* Wi-Fi. */
+    wm_text(x + 20, at + 4, "Wi-Fi", p.dim, 0, 1);
+    at += NET_SECTION_LABEL;
+    uint32_t wifi = net_count_kind(SYSCALL_NET_ADAPTER_WIFI);
+    if (!wifi) {
+        draw_net_card(cx, at, cw, WM_ICON_WIFI_OFF, false, "Wi-Fi",
+                      "No supported wireless adapter", p.dim, "Unavailable",
+                      &p, aero);
+    } else {
+        draw_net_card(cx, at, cw, WM_ICON_WIFI, false, "Wi-Fi",
+                      "Scanning for networks is not supported yet", p.dim,
+                      "", &p, aero);
+    }
+    at += NET_CARD + 12;
+
+    /* Wired adapters. */
+    fill_rect(x + 18, at - 6, w - 36, 1, p.line);
+    wm_text(x + 20, at + 4, "Ethernet", p.dim, 0, 1);
+    at += NET_SECTION_LABEL;
+    if (!net_count_kind(SYSCALL_NET_ADAPTER_ETHERNET)) {
+        draw_net_card(cx, at, cw, WM_ICON_SETTINGS_ETHERNET, false,
+                      "No wired adapter",
+                      "No supported network card was found", p.dim, "", &p,
+                      aero);
+        return;
+    }
+    uint32_t port = 0;
+    for (uint32_t i = 0; i < net_adapters.count; i++) {
+        const syscall_net_adapter_t* a = &net_adapters.adapters[i];
+        if (a->kind != SYSCALL_NET_ADAPTER_ETHERNET) continue;
+        port++;
+        bool up = net_adapter_connected(a);
+        char title[40] = "Wired connection";
+        if (net_count_kind(SYSCALL_NET_ADAPTER_ETHERNET) > 1) {
+            net_append(title, sizeof(title), " ");
+            net_append_uint(title, sizeof(title), port);
+        }
+        char status[64] = "";
+        uint32_t color = p.dim;
+        if (a->link == SYSCALL_NET_LINK_DOWN) {
+            strcpy(status, "Cable unplugged");
+        } else if (!a->active) {
+            strcpy(status, "Not in use");
+        } else if (!net_status.configured) {
+            strcpy(status, a->link == SYSCALL_NET_LINK_UP
+                               ? "Cable connected, no address yet"
+                               : "Not connected");
+        } else {
+            strcpy(status, "Connected");
+            color = p.good;
+            char speed[40];
+            net_format_speed(speed, sizeof(speed), a);
+            if (speed[0]) {
+                net_append(status, sizeof(status), " - ");
+                net_append(status, sizeof(status), speed);
+            }
+        }
+        draw_net_card(cx, at, cw, WM_ICON_LAN, up, title, status, color,
+                      a->name, &p, aero);
+        at += NET_CARD;
+        if (net_adapter_details(a)) {
+            static const char* labels[5] = {"Network", "Address", "Gateway",
+                                            "DNS", "MAC"};
+            char values[5][40];
+            for (int r = 0; r < 5; r++) values[r][0] = '\0';
+            uint32_t prefix = net_prefix(net_status.netmask);
+            net_append_ip(values[0], 40, net_status.local_ip & net_status.netmask);
+            net_append(values[0], 40, "/");
+            net_append_uint(values[0], 40, prefix);
+            net_append_ip(values[1], 40, net_status.local_ip);
+            if (net_status.gateway) net_append_ip(values[2], 40, net_status.gateway);
+            else strcpy(values[2], "None");
+            if (net_status.dns) net_append_ip(values[3], 40, net_status.dns);
+            else strcpy(values[3], "None");
+            net_format_mac(values[4], 40, a->mac);
+            int32_t row = at + 6;
+            for (int r = 0; r < 5; r++) {
+                wm_text(cx + 56, row + 3, labels[r], p.dim, 0, 1);
+                wm_text(cx + 134, row, values[r], r == 4 ? p.dim : p.text, 0, 2);
+                row += NET_DETAIL_ROW;
+            }
+            at += 5 * NET_DETAIL_ROW + 8;
+        }
+        at += 6;
+    }
+}
+
+static void net_tick(void) {
+    if (++net_poll_frames >= (net_menu_open ? 30u : 150u)) {
+        net_poll_frames = 0;
+        net_refresh();
+    }
+}
+
+static uint64_t net_signature(void) {
+    uint64_t hash = 0xCBF29CE484222325ull;
+    hash = hash_u64(hash, net_menu_open);
+    hash = hash_bytes(hash, &net_status, sizeof(net_status));
+    hash = hash_bytes(hash, &net_adapters, sizeof(net_adapters));
+    return hash;
+}
+
 static void draw_taskbar(const syscall_window_info_t* windows,
                          uint64_t count) {
     int32_t top = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT;
@@ -4496,6 +5027,18 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         stroke_rounded_rect(5, top + 5, 38, 38, 19u, 0xC0FFFFFFu);
         stroke_rounded_rect(4, top + 4, 40, 40, 20u, 0x90001020u);
         draw_mini_logo(12, top + 12, 0xFFFFFFFFu);
+    } else if (liquid_style()) {
+        /* A floating glass capsule; the start button is a lit bubble. */
+        fill_rounded_rect(4, top + 4, width - 8, (int32_t)TASKBAR_HEIGHT - 4,
+                          22u, 0x30000000u);
+        liquid_glass(6, top + 3, width - 12, (int32_t)TASKBAR_HEIGHT - 6, 21,
+                     0xFF14181Cu, 0x88u);
+        bool lit = start_menu_open || hover_taskbar == 0u;
+        fill_rounded_rect(9, top + 6, 36, 36, 18u,
+                          lit ? (0xC0000000u | (accent & 0xFFFFFFu))
+                              : 0x22FFFFFFu);
+        stroke_rounded_rect(9, top + 6, 36, 36, 18u, 0x40FFFFFFu);
+        draw_mini_logo(15, top + 12, 0xFFF4F7FAu);
     } else {
     /* Panel: dark, slightly translucent, with a faint highlight edge. */
     fill_rect(0, top, width, (int32_t)TASKBAR_HEIGHT, 0xEC1B1E20u);
@@ -4512,7 +5055,7 @@ static void draw_taskbar(const syscall_window_info_t* windows,
 
     /* Task manager: one rounded entry per window, Plasma-style indicator. */
     int32_t x = 60;
-    for (uint64_t i = 0; i < count && (uint32_t)x + 184u < display.width - 176u;
+    for (uint64_t i = 0; i < count && (uint32_t)x + 184u < display.width - 220u;
          i++) {
         const syscall_window_info_t* info = &windows[i];
         bool focused = info->id == focused_id;
@@ -4534,6 +5077,17 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                 stroke_rounded_rect(x + 1, top + 5, 174, 38, 2u,
                                     focused ? 0x90FFFFFFu : 0x50FFFFFFu);
             }
+        } else if (liquid_style()) {
+            bool hovered = hover_taskbar == i + 1u;
+            if (focused || hovered) {
+                fill_rounded_rect(x, top + 7, 176, 34, 17u,
+                                  focused ? 0x30FFFFFFu : 0x1CFFFFFFu);
+                stroke_rounded_rect(x, top + 7, 176, 34, 17u,
+                                    focused ? 0x48FFFFFFu : 0x24FFFFFFu);
+            }
+            if (!minimized)
+                fill_rounded_rect(x + 84, top + 40, 8, 3, 1u,
+                                  focused ? accent : 0x90FFFFFFu);
         } else {
         if (focused)
             fill_rounded_rect(x, top + 5, 176, 38, 6, 0x38FFFFFFu);
@@ -4586,7 +5140,9 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                 aero ? 0xA0000000u : 0u, 1);
     }
 
+    draw_net_icon(aero);
     draw_sound_icon(aero);
+    draw_net_menu(aero);
     draw_sound_menu(aero);
 
     if (start_menu_open) {
@@ -4616,9 +5172,13 @@ static void draw_taskbar(const syscall_window_info_t* windows,
             row_text = 0xFF1E2A36u;
             label_color = 0xFF1E5AA0u;
         } else {
+        if (liquid_style()) {
+            liquid_menu(mx, my, mw, mh, 18);
+        } else {
         fill_rounded_rect(mx - 5, my - 3, mw + 10, mh + 10, 12, 0x2E000000u);
         fill_rounded_rect(mx, my, mw, mh, 8, 0xFF3A4249u);
         fill_rounded_rect(mx + 1, my + 1, mw - 2, mh - 2, 7, 0xFF1D2125u);
+        }
         fill_rounded_rect(mx + 12, my + 12, 30, 30, 15, accent);
         wm_text(mx + 20, my + 19, "M", 0xFFFFFFFFu, 0, 2);
         wm_text(mx + 52, my + 10, "MOSdesk", 0xFFF2F6F9u, 0, 2);
@@ -4835,6 +5395,8 @@ static void draw_context_menu(void) {
         fill_rect(menu_x + 2, menu_y + 2, 30, height - 4, 0xFFF1F1F1u);
         fill_rect(menu_x + 32, menu_y + 2, 1, height - 4, 0xFFE2E3E3u);
         fill_rect(menu_x + 33, menu_y + 2, 1, height - 4, 0xFFFFFFFFu);
+    } else if (liquid_style()) {
+        liquid_menu(menu_x, menu_y, MENU_WIDTH, height, 12);
     } else {
     fill_rounded_rect(menu_x - 4, menu_y - 2, MENU_WIDTH + 8, height + 8, 11,
                       0x30000000u);
@@ -6156,6 +6718,7 @@ typedef enum {
     REGION_PANEL,
     REGION_START_MENU,
     REGION_SOUND_MENU,
+    REGION_NET_MENU,
     REGION_CONTEXT_MENU,
     REGION_OVERLAY,
     REGION_COUNT
@@ -6213,6 +6776,7 @@ static void scene_regions(region_state_t* regions) {
                           ((uint64_t)desktop_settings.date_format << 32) |
                           (uint32_t)desktop_settings.utc_offset_minutes);
     hash = hash_u64(hash, sound_signature());
+    hash = hash_u64(hash, net_signature());
     regions[REGION_PANEL].signature =
         hash_bytes(hash, &clock_time, sizeof(clock_time));
     regions[REGION_SOUND_MENU].signature = sound_signature();
@@ -6221,6 +6785,14 @@ static void scene_regions(region_state_t* regions) {
         int32_t x, y, width, height;
         sound_menu_bounds(&x, &y, &width, &height);
         regions[REGION_SOUND_MENU].area =
+            (rect_t){x - 5, y - 3, x + width + 5, y + height + 7};
+    }
+    regions[REGION_NET_MENU].signature = net_signature();
+    regions[REGION_NET_MENU].area = (rect_t){0};
+    if (net_menu_open) {
+        int32_t x, y, width, height;
+        net_menu_bounds(&x, &y, &width, &height);
+        regions[REGION_NET_MENU].area =
             (rect_t){x - 5, y - 3, x + width + 5, y + height + 7};
     }
     regions[REGION_PANEL].area = (rect_t){
@@ -6559,10 +7131,25 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         last_click_valid = false;
         sound_menu_open = !sound_menu_open;
         start_menu_open = false;
+        net_menu_open = false;
         if (sound_menu_open) sound_call(SYS_AUDIO_MIXER_GET, 0);
         return;
     }
+    /* The network button and its menu (the menu only shows state). */
+    if (net_menu_open && net_menu_hit(cursor_x, cursor_y)) {
+        last_click_valid = false;
+        return;
+    }
+    if (net_icon_hit(cursor_x, cursor_y)) {
+        last_click_valid = false;
+        net_menu_open = !net_menu_open;
+        start_menu_open = false;
+        sound_menu_open = false;
+        if (net_menu_open) net_refresh();
+        return;
+    }
     sound_menu_open = false;
+    net_menu_open = false;
     if (start_menu_open && cursor_x >= menu_left &&
         cursor_x < menu_left + menu_width && cursor_y >= menu_top &&
         cursor_y < menu_top + menu_tall) {
@@ -6716,6 +7303,7 @@ static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
 /* Works out what the pointer is resting on, for hover highlights. */
 static void update_hover(syscall_window_info_t* windows, uint64_t count) {
     sound_tick();
+    net_tick();
     if (launcher_dragging) {
         if (start_menu_open) launcher_drag_to(cursor_y);
         else launcher_dragging = false;
@@ -6751,6 +7339,8 @@ static void update_hover(syscall_window_info_t* windows, uint64_t count) {
             hover_taskbar = 0u;
         } else if (sound_icon_hit(cursor_x, cursor_y)) {
             hover_taskbar = SOUND_TASKBAR_HOVER;
+        } else if (net_icon_hit(cursor_x, cursor_y)) {
+            hover_taskbar = NET_TASKBAR_HOVER;
         } else if (cursor_x >= 60 && (uint32_t)(cursor_x - 60) % 180u < 176u) {
             uint32_t index = (uint32_t)(cursor_x - 60) / 180u;
             if (index < count) hover_taskbar = index + 1u;
@@ -6763,7 +7353,7 @@ static void update_hover(syscall_window_info_t* windows, uint64_t count) {
         hover_desktop_icon = desktop_icon_at(cursor_x, cursor_y);
         return;
     }
-    if (ui_style == MOSDESK_UI_STYLE_AERO) {
+    if (ui_style == MOSDESK_UI_STYLE_AERO || liquid_style()) {
         caption_hover_button = caption_button_at(
             cursor_x - (int32_t)info->x, cursor_y - (int32_t)info->y,
             (int32_t)info->width + 1);
@@ -6954,7 +7544,8 @@ static void route_input(const syscall_input_event_t* input,
         start_menu_bounds(&lx, &ly, &lw, &lh);
         bool on_launcher = (start_menu_open && cursor_x >= lx &&
             cursor_x < lx + lw && cursor_y >= ly && cursor_y < ly + lh) ||
-            sound_menu_hit(cursor_x, cursor_y);
+            sound_menu_hit(cursor_x, cursor_y) ||
+            net_menu_hit(cursor_x, cursor_y);
         syscall_window_info_t* under = on_launcher ? NULL :
             window_at(windows, count, cursor_x, cursor_y);
         if (under) {
@@ -6979,6 +7570,11 @@ static void route_input(const syscall_input_event_t* input,
                (sound_menu_hit(cursor_x, cursor_y) ||
                 sound_icon_hit(cursor_x, cursor_y))) {
         sound_wheel(input->wheel);
+    } else if (input->type == SYSCALL_INPUT_MOUSE_WHEEL &&
+               dialog_kind == DIALOG_NONE && !menu_open &&
+               (net_menu_hit(cursor_x, cursor_y) ||
+                net_icon_hit(cursor_x, cursor_y))) {
+        /* The network menu has nothing to scroll. */
     } else if (input->type == SYSCALL_INPUT_MOUSE_WHEEL) {
         if (dialog_kind == DIALOG_PICK_FOLDER) {
             picker_wheel(input->wheel);

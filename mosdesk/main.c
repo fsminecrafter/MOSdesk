@@ -369,6 +369,18 @@ static void draw_style_tile(int32_t x, int32_t y, uint32_t style) {
         fill_rect(wx + ww - 19, wy + 1, 15, 8, 0xFFC9452Eu);
         stroke_rect(wx + ww - 19, wy + 1, 15, 8, 1, 0xFF4A1A12u);
         fill_rect(wx + ww - 13, wy + 4, 3, 3, 0xFFFFFFFFu);
+    } else if (style == MOSDESK_UI_STYLE_LIQUID) {
+        /* Dark rounded glass with a lit rim and a bright top edge. */
+        uint32_t behind = mix_rgb(0xFF1C4F7Au, 0xFF5FA3C9u, 90u);
+        fill_round(wx - 1, wy - 1, ww + 2, wh + 2, 9,
+                   mix_rgb(behind, 0xFFFFFFFFu, 120u));
+        fill_round(wx, wy, ww, wh, 8, mix_rgb(behind, 0xFF161A1Fu, 150u));
+        fill_rect(wx + 8, wy, ww - 16, 1, mix_rgb(behind, 0xFFFFFFFFu, 200u));
+        fill_round(wx + 3, wy + 13, ww - 6, wh - 16, 5, 0xFFF3F5F6u);
+        fill_rect(wx + 24, wy + 5, 24, 3, 0xFFF4F7F8u);
+        for (int32_t i = 0; i < 3; i++)
+            fill_round(wx + ww - 11 - i * 8, wy + 4, 6, 6, 3,
+                       mix_rgb(behind, 0xFFFFFFFFu, i ? 110u : 170u));
     } else {
         fill_rect(wx, wy, ww, wh, 0xFF536773u);
         fill_rect(wx + 1, wy + 1, ww - 2, 12, 0xFF263945u);
@@ -389,6 +401,13 @@ static void draw_style_tile(int32_t x, int32_t y, uint32_t style) {
                   0xFFC6DCEBu);
         fill_rect(x + 2, y + (int32_t)THUMB_HEIGHT - 6, 6, 6,
                   mix_rgb(accent, 0xFFFFFFFFu, 70u));
+    } else if (style == MOSDESK_UI_STYLE_LIQUID) {
+        /* The floating capsule panel. */
+        fill_round(x + 6, y + (int32_t)THUMB_HEIGHT - 9,
+                   (int32_t)THUMB_WIDTH - 12, 7, 3, 0xFF2B3A46u);
+        fill_rect(x + 9, y + (int32_t)THUMB_HEIGHT - 9,
+                  (int32_t)THUMB_WIDTH - 18, 1, 0xFFB9D2E3u);
+        fill_round(x + 8, y + (int32_t)THUMB_HEIGHT - 8, 5, 5, 2, accent);
     } else {
         fill_rect(x, y + (int32_t)THUMB_HEIGHT - 6, (int32_t)THUMB_WIDTH, 6,
                   0xFF1B1E20u);
@@ -525,10 +544,11 @@ static void draw_appearance_page(void) {
     uint32_t columns = tile_columns();
     bool using_photo = preferences.wallpaper_path[0] != '\0';
 
-    static const char* const style_names[2] = {"Modern", "2000s Aero"};
+    static const char* const style_names[3] = {"Modern", "2000s Aero",
+                                               "Liquid Glass"};
     draw_text(left, style_y() - 33 - scroll, "Window style", 0xFF34434Cu,
               true);
-    for (uint32_t i = 0; i < 2u; i++) {
+    for (uint32_t i = 0; i < 3u; i++) {
         int32_t x = left + (int32_t)i * TILE_PITCH_X;
         int32_t y = style_y() - scroll;
         draw_style_tile(x, y, i);
@@ -614,7 +634,7 @@ static bool appearance_page_click(int32_t x, int32_t y) {
     if (y < CONTENT_TOP || x < left) return false;
     if (page_y >= style_y() && page_y < style_y() + (int32_t)THUMB_HEIGHT + 20) {
         int32_t index = (x - left) / TILE_PITCH_X;
-        if (index >= 2 || x - left - index * TILE_PITCH_X >= (int32_t)THUMB_WIDTH)
+        if (index >= 3 || x - left - index * TILE_PITCH_X >= (int32_t)THUMB_WIDTH)
             return false;
         preferences.ui_style = (uint32_t)index;
         return true;
