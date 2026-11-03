@@ -420,11 +420,31 @@ static uint32_t capped_timeout(uint32_t remaining, uint32_t cap) {
     return remaining < cap ? remaining : cap;
 }
 
+static void header_value(const char* headers, size_t length, const char* name,
+                         char* out, size_t capacity) {
+    size_t n = strlen(name);
+    if (capacity) out[0] = '\0';
+    for (size_t i = 0; i + n + 1 < length; i++) {
+        if ((i == 0 || headers[i - 1] == '\n') && equal_nocase(headers + i, name, n) &&
+            headers[i + n] == ':') {
+            size_t start = i + n + 1;
+            while (start < length && (headers[start] == ' ' || headers[start] == '\t')) start++;
+            size_t end = start;
+            while (end < length && headers[end] != '\r' && headers[end] != '\n') end++;
+            size_t count = end - start;
+            if (count >= capacity) count = capacity - 1;
+            memcpy(out, headers + start, count);
+            out[count] = '\0';
+            return;
+        }
+    }
+}
+
 static int http_get_once(const char* url, char* body, size_t body_capacity,
                          size_t* body_length, int allow_insecure_tls,
                          uint32_t timeout_ms, char* redirect,
                          size_t redirect_capacity, char* error,
-                         size_t error_capacity) {
+                         size_t error_capacity, mx_http_info_t* info) {
     char host[128];
     char path[512];
     char request[1024];
@@ -479,8 +499,9 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
         ((use_tls && port == 443) || (!use_tls && port == 80) ||
          append_port(request, sizeof(request), &request_length, port)) &&
         append_text(request, sizeof(request), &request_length,
-            "\r\nUser-Agent: Mxplorer/0.1\r\n"
-            "Accept: text/html,text/plain;q=0.8\r\n"
+            "\r\nUser-Agent: Mozilla/5.0 (Minimal-OS; x86_64) Mxplorer/0.3\r\n"
+            "Accept: text/html,application/xhtml+xml,text/css,*/*;q=0.8\r\n"
+            "Accept-Language: en-US,en;q=0.8\r\n"
             "Connection: close\r\n\r\n");
     if (!request_ok ||
         !transport_send_all(use_tls, connection, request, request_length)) {
@@ -547,6 +568,12 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     }
     size_t header_length = (size_t)(header_end - response);
     int status = parse_status(response, response_length);
+    if (info) {
+        info->status = status;
+        info->header_bytes = header_length + 4;
+        header_value(response, header_length, "content-type", info->content_type,
+                     sizeof(info->content_type));
+    }
     if (is_redirect_status(status)) {
         if (!redirect || !parse_location(response, header_length, redirect,
                                          redirect_capacity)) {
@@ -557,9 +584,9 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
         if (error_capacity) error[0] = '\0';
         return HTTP_REDIRECT_RESULT;
     }
-    if (status < 200 || status >= 300) {
+    if (status < 200) {
         set_error(error, error_capacity,
-                  "HTTP server returned an error status.");
+                  "HTTP server returned an unexpected status.");
         return 0;
     }
     size_t declared_length = 0;
@@ -571,7 +598,7 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     const char* response_body = header_end + 4;
     if (has_content_length && !chunked) {
         if (declared_length > body_capacity - 1) {
-            set_error(error, error_capacity, "HTTP page exceeds the 96 KiB limit.");
+            set_error(error, error_capacity, "This page is larger than 2 MiB.");
             return 0;
         }
         if (available < declared_length) {
@@ -588,7 +615,7 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
         }
     } else {
         if (available >= body_capacity) {
-            set_error(error, error_capacity, "HTTP page exceeds the 96 KiB limit.");
+            set_error(error, error_capacity, "This page is larger than 2 MiB.");
             return 0;
         }
         memcpy(body, response_body, available);
@@ -601,8 +628,10 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
 
 int mx_http_get(const char* url, char* body, size_t body_capacity,
                 size_t* body_length, int allow_insecure_tls,
-                char* error, size_t error_capacity) {
+                char* error, size_t error_capacity, mx_http_info_t* info) {
     char current_url[HTTP_URL_MAX];
+    long started = mos_uptime();
+    if (info) memset(info, 0, sizeof(*info));
     if (!url || strlen(url) >= sizeof(current_url)) {
         if (body_length) *body_length = 0;
         set_error(error, error_capacity, "HTTP address is too long.");
@@ -618,8 +647,15 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
                                    redirects ? HTTP_REDIRECT_TIMEOUT_MS
                                              : HTTP_TOTAL_TIMEOUT_MS,
                                    location, sizeof(location), error,
-                                   error_capacity);
-        if (result != HTTP_REDIRECT_RESULT) return result;
+                                   error_capacity, info);
+        if (result != HTTP_REDIRECT_RESULT) {
+            if (info) {
+                strlcpy_safe(info->final_url, current_url, sizeof(info->final_url));
+                info->redirects = (int)redirects;
+                info->elapsed_ms = mos_uptime() - started;
+            }
+            return result;
+        }
         if (redirects >= HTTP_MAX_REDIRECTS) {
             set_error(error, error_capacity, "Too many HTTP redirects (maximum 5).");
             return 0;

@@ -1,81 +1,177 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
+  <meta charset="utf-8">
+  <meta name="color-scheme" content="light dark">
+  <title>New Tab</title>
   <style>
+    :root {
+      --bg: #f5f7fa;
+      --card: #ffffff;
+      --text: #1f2328;
+      --muted: #5e6a78;
+      --line: #e1e6ec;
+      --accent: #2f6fde;
+      --field: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1f2023;
+        --card: #2c2d32;
+        --text: #e8eaed;
+        --muted: #a4aab2;
+        --line: #3d3f45;
+        --accent: #8ab4f8;
+        --field: #2c2d32;
+      }
+    }
     body {
-      background-color: #f5f8fc;
-      color: #23364a;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, sans-serif;
     }
-    .eyebrow {
-      color: #3478d4;
-      font-size: 12px;
-      font-weight: bold;
-      text-align: center;
-      margin-top: 24px;
-      margin-bottom: 8px;
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 72px 24px 40px;
     }
-    h1 {
-      color: #3478d4;
-      font-size: 44px;
+    .brand {
       text-align: center;
-      margin-bottom: 8px;
+      font-size: 52px;
+      font-weight: 700;
+      color: var(--accent);
+      margin: 0;
+      letter-spacing: -1px;
     }
-    .lead {
-      color: #60758b;
-      font-size: 16px;
+    .tagline {
       text-align: center;
-      margin-bottom: 18px;
+      color: var(--muted);
+      margin: 6px 0 28px;
     }
-    .search-prompt {
-      background-color: #ffffff;
-      color: #60758b;
-      text-align: center;
-      padding: 14px;
-      margin-bottom: 20px;
+    form {
+      display: flex;
+      gap: 8px;
+      margin: 0 auto 36px;
+      max-width: 560px;
+    }
+    input[type=search] {
+      flex: 1;
+      font-size: 15px;
+      padding: 11px 20px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--field);
+      color: var(--text);
+    }
+    button {
+      font-size: 14px;
+      font-weight: 600;
+      padding: 11px 22px;
+      border: 0;
+      border-radius: 24px;
+      background: var(--accent);
+      color: #ffffff;
     }
     h2 {
-      color: #203d5c;
-      font-size: 20px;
-      margin-top: 12px;
-      margin-bottom: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 12px 4px;
     }
+    .tiles {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 12px;
+      margin-bottom: 32px;
+    }
+    .tile {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .badge {
+      display: inline-block;
+      width: 32px;
+      height: 32px;
+      line-height: 32px;
+      border-radius: 16px;
+      text-align: center;
+      font-weight: 700;
+      color: #ffffff;
+    }
+    .tile b { display: block; font-size: 14px; }
+    .tile small { color: var(--muted); font-size: 12px; }
+    .c1 { background: #2f6fde; }
+    .c2 { background: #e8710a; }
+    .c3 { background: #188038; }
+    .c4 { background: #ff6600; }
+    .c5 { background: #5f6368; }
+    .c6 { background: #de5833; }
+    .c7 { background: #9334e6; }
+    .c8 { background: #c5221f; }
     .card {
-      background-color: #ffffff;
-      color: #465d74;
-      padding: 12px;
-      margin-bottom: 8px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px 20px;
+      margin-bottom: 12px;
     }
-    .tag {
-      color: #3478d4;
-      font-weight: bold;
-      margin-bottom: 4px;
-    }
-    .note {
-      color: #73869a;
+    .card p { margin: 6px 0 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .card strong { font-size: 15px; }
+    kbd {
+      font-family: monospace;
       font-size: 12px;
-      margin-top: 14px;
+      padding: 1px 6px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
     }
+    .note { text-align: center; color: var(--muted); font-size: 12px; margin-top: 24px; }
+    a { color: var(--accent); }
   </style>
 </head>
 <body>
-  <p class="eyebrow">A SIMPLE BROWSER FOR MINIMAL-OS</p>
-  <h1>Mxplorer</h1>
-  <p class="lead">A little space to find what you need.</p>
-  <p class="search-prompt">Search or enter a website in the address bar above.</p>
+  <main>
+    <p class="brand">Mxplorer</p>
+    <p class="tagline">A little space to find what you need.</p>
+    <form action="https://www.google.com/search" method="get">
+      <input type="search" name="q" placeholder="Search Google or type a URL">
+      <button type="submit">Search</button>
+    </form>
 
-  <h2>Quick guide</h2>
-  <div class="card">
-    <p class="tag">Search and browse</p>
-    <p>Type a search or web address above. Use Back, Forward, and + to move between pages and tabs.</p>
-  </div>
-  <div class="card">
-    <p class="tag">Make it yours</p>
-    <p>Choose Google, this start page, or a custom homepage in Settings.</p>
-  </div>
-  <div class="card">
-    <p class="tag">Know what to expect</p>
-    <p>Mxplorer renders basic HTML and CSS. Scripts are off, and HTTPS attempts are disabled by default.</p>
-  </div>
-  <p class="note">Unsafe HTTPS in Privacy is not secure. Never use it for passwords or private data.</p>
+    <h2>Shortcuts</h2>
+    <div class="tiles">
+      <a class="tile" href="http://frogfind.com"><span class="badge c3">F</span><span><b>FrogFind</b><small>Search, plain HTTP</small></span></a>
+      <a class="tile" href="http://68k.news"><span class="badge c2">6</span><span><b>68k.news</b><small>Headlines, plain HTTP</small></span></a>
+      <a class="tile" href="http://info.cern.ch/hypertext/WWW/TheProject.html"><span class="badge c5">W</span><span><b>First website</b><small>CERN, 1991</small></span></a>
+      <a class="tile" href="https://en.wikipedia.org"><span class="badge c1">W</span><span><b>Wikipedia</b><small>Needs HTTPS</small></span></a>
+      <a class="tile" href="https://news.ycombinator.com"><span class="badge c4">Y</span><span><b>Hacker News</b><small>Needs HTTPS</small></span></a>
+      <a class="tile" href="https://lite.duckduckgo.com/lite/"><span class="badge c6">D</span><span><b>DuckDuckGo</b><small>Lite search</small></span></a>
+      <a class="tile" href="https://text.npr.org"><span class="badge c7">N</span><span><b>NPR Text</b><small>News, text only</small></span></a>
+      <a class="tile" href="https://lite.cnn.com"><span class="badge c8">C</span><span><b>CNN Lite</b><small>News, text only</small></span></a>
+    </div>
+
+    <h2>Good to know</h2>
+    <div class="card">
+      <strong>HTTPS sites</strong>
+      <p>Turn on Unsafe HTTPS in <a href="mos://settings">Settings</a> to open https:// pages. Certificates are not checked yet, so never type passwords or private data.</p>
+    </div>
+    <div class="card">
+      <strong>Developer tools</strong>
+      <p>Press <kbd>F12</kbd> for the console, the live element inspector, network requests, page source and timings.</p>
+    </div>
+    <div class="card">
+      <strong>Shortcuts</strong>
+      <p><kbd>Ctrl+T</kbd> new tab, <kbd>Ctrl+W</kbd> close, <kbd>Ctrl+L</kbd> address bar, <kbd>Ctrl+R</kbd> reload, <kbd>Alt+Left</kbd> back.</p>
+    </div>
+    <p class="note">Mxplorer renders HTML, CSS and JavaScript. Images and video are not supported yet.</p>
+  </main>
 </body>
 </html>
