@@ -29,7 +29,21 @@ layout engine and JavaScript interpreter.
   maps and `import()`. Browser APIs: DOM, events (capture/bubble, inline
   handlers), timers, `requestAnimationFrame`, `fetch`, `XMLHttpRequest`,
   `localStorage`, cookies, `location`, `history`, observers. Scripts run on
-  their own 1 MiB stack with a 48 MiB heap per page and a time limit.
+  their own 1 MiB stack and a heap that grows as needed (it stops while
+  less than 96 MiB of memory is free) and a time limit.
+- **Pictures and videos:** Minimal-OS `.img` pictures in `<img>` (sized
+  from the file, scaled smoothly, transparency kept) and `.vid` videos in
+  `<video>` (`src` or `<source>`, `controls`, `autoplay`, `loop`, `muted`,
+  `poster`) with their sound. Opening a `.img` or `.vid` address shows it on
+  its own page. Scripts can use `play()`, `pause()`, `currentTime`,
+  `duration`, `paused`, `ended`, `muted` and `naturalWidth`/`naturalHeight`.
+  Downloads may be up to 32 MiB; local videos are read from disk as they
+  play. Other picture formats (PNG, JPEG, ...) still show a placeholder.
+- **Local files:** type a Minimal-OS path such as
+  `0:/users/me/Videos/clip.vid` (shown as `file:///0:/...`), or start the
+  browser with one: `run Mxplorer 0:/users/me/page.html`. Local pages can
+  use local pictures, videos, stylesheets and scripts; pages from the
+  network cannot read local files.
 - **Developer tools (F12, Ctrl+Shift+I, Ctrl+Shift+J):** Console with a
   JavaScript prompt, filters and history; Elements with a live DOM tree,
   element picker, box model, computed style and matched rules (`$0` in the
@@ -41,7 +55,7 @@ Settings live in `0:/data/mxplorer-settings.txt` and
 only for the session: the kernel's TLS 1.3 client does not verify
 certificates, so never use it for private data.
 
-Not supported yet: images, video, canvas, web fonts, WebSockets, POST
+Not supported yet: PNG/JPEG/GIF pictures, `<audio>`, canvas, web fonts, WebSockets, POST
 requests (forms are sent as GET), certificate checks. Switching tabs reloads
 the page from its cache, so script state is not kept.
 
@@ -51,6 +65,8 @@ the page from its cache, so script state is not kept.
 - `ui.c` - browser chrome, settings and error pages, theme palettes
 - `devtools.c` - developer tools panel
 - `html.c` - page loading, layout, painting, hit testing, forms
+- `media.c` - `.img` pictures and `.vid` videos (decoding, scaling,
+  playback, controls)
 - `dom.c` - DOM tree and HTML parser
 - `css.c` - stylesheet parser, selector matching, cascade
 - `js.c`, `js_runtime.c`, `js_dom.c` - JavaScript language, built-ins and
@@ -80,7 +96,7 @@ the browser (the Minimal-OS Makefile does this).
 ```sh
 SDK=../../Minimal-OS-SDK/include
 gcc -std=gnu11 -DMX_HOST -I include -idirafter $SDK tests/html_test.c html.c \
-  css.c dom.c util.c text.c gfx.c icons_data.c devlog.c tests/host/js_stub.c \
+  media.c css.c dom.c util.c text.c gfx.c icons_data.c devlog.c tests/host/js_stub.c \
   -o /tmp/html-test -lm && /tmp/html-test
 ```
 

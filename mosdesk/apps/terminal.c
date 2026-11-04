@@ -766,6 +766,38 @@ static void cmd_run(int argc, char** argv) {
     start_program(path, argc - 2, argv + 2);
 }
 
+/* Opens a picture or video in its app: video <file.vid>, img <file.img>. */
+static void open_media(const char* command, const char* program, const char* ext,
+                       int argc, char** argv) {
+    if (argc < 2) {
+        char usage[64] = "usage: ";
+        str_append(usage, sizeof usage, command);
+        str_append(usage, sizeof usage, " <file");
+        str_append(usage, sizeof usage, ext);
+        str_append(usage, sizeof usage, ">");
+        error_line(command, usage);
+        return;
+    }
+    static char file[PATH_MAX_];
+    if (!resolve(argv[1], file, sizeof file)) { error_line(command, "path too long"); return; }
+    if (mos_exists(file) != 1) { error_line(command, "no such file"); return; }
+    if (mos_is_dir(file) == 1) { error_line(command, "that is a folder"); return; }
+    size_t n = strlen(file), e = strlen(ext);
+    if (n <= e || strcmp(file + n - e, ext) != 0) {
+        outc(command, color_dim);
+        outc(": this is not a ", color_dim);
+        outc(ext, color_dim);
+        outc(" file, trying anyway\n", color_dim);
+    }
+    char path[PATH_MAX_];
+    if (!find_program(program, path, sizeof path)) { error_line(command, "the app is not installed"); return; }
+    char* args[1] = {file};
+    start_program(path, 1, args);
+}
+
+static void cmd_video(int argc, char** argv) { open_media("video", "mos_video", ".vid", argc, argv); }
+static void cmd_img(int argc, char** argv) { open_media("img", "mos_photos", ".img", argc, argv); }
+
 static void cmd_programs(int argc, char** argv) {
     (void)argc; (void)argv;
     static syscall_dirent_t entries[64];
@@ -977,6 +1009,8 @@ static const command_t commands[] = {
     {"resolve", cmd_resolve, "<host>  look up an address"},
     {"wget", cmd_wget, "<http://...> [file]  fetch a page"},
     {"run", cmd_run, "<program> [args]  start a program"},
+    {"video", cmd_video, "<file.vid>  play a video"},
+    {"img", cmd_img, "<file.img>  show a picture"},
     {"root", cmd_root, "<command>  run a kernel command (asks for your password, or y/N)"},
     {"programs", cmd_programs, "installed programs"},
     {"history", cmd_history, "commands typed so far"},
@@ -990,7 +1024,8 @@ static const char* const aliases[][2] = {
     {"list", "ls"}, {"dir", "ls"}, {"read", "cat"}, {"md", "mkdir"},
     {"rd", "rmdir"}, {"del", "rm"}, {"remove", "rm"}, {"info", "sysinfo"},
     {"usage", "sysinfo"}, {"cls", "clear"}, {"systime", "date"},
-    {"time", "date"}, {"quit", "exit"},
+    {"time", "date"}, {"quit", "exit"}, {"vid", "video"},
+    {"image", "img"}, {"photo", "img"},
 };
 
 /* Kernel terminal commands that need kernel privileges. */

@@ -42,6 +42,10 @@ const char* mx_memchr(const char* text, char c, size_t length);
 /* Resolves `reference` against `base` (absolute http(s)/mos URL). */
 int mx_url_resolve(const char* base, const char* reference, char* out,
                    size_t capacity);
+/* Local file addresses: "0:/a/b", "file:///0:/a/b" (and "file:///a/b",
+ * which means drive 0) give the Minimal-OS path "0:/a/b". Returns 0 for
+ * other addresses. */
+int mx_url_local_path(const char* url, char* out, size_t capacity);
 
 /* Milliseconds since boot (host builds use a monotonic clock). */
 long mx_now_ms(void);

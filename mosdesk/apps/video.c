@@ -185,7 +185,11 @@ static void draw_picture(void) {
         if (dy < 0 || dy >= H) continue;
         const uint32_t* src = g_frame + (size_t)((uint64_t)y * vh / (uint32_t)g_view_h) * vw;
         uint32_t* dst = px + (size_t)dy * (size_t)stride + g_view_x;
-        for (int x = 0; x < g_view_w; x++) dst[x] = src[g_xmap[x]] | 0xFF000000u;
+        for (int x = 0; x < g_view_w; x++) {
+            uint32_t c = src[g_xmap[x]], a = c >> 24;
+            dst[x] = 0xFF000000u | (((c >> 16) & 255u) * a / 255u) << 16 |
+                     (((c >> 8) & 255u) * a / 255u) << 8 | ((c & 255u) * a / 255u);
+        }
     }
 }
 

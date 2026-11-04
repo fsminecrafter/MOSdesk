@@ -7,12 +7,37 @@
 #define HTTP_RESPONSE_MAX (MX_HTTP_BODY_MAX + HTTP_HEADER_MAX)
 #define HTTP_IDLE_TIMEOUT_MS 5000
 #define HTTP_TOTAL_TIMEOUT_MS 20000
+#define HTTP_MEDIA_TIMEOUT_MS 120000u
 #define HTTP_MAX_REDIRECTS 5u
 #define HTTP_REDIRECT_TIMEOUT_MS 2000u
 #define HTTP_URL_MAX 1024u
 #define HTTP_REDIRECT_RESULT 2
 
-static char response[HTTP_RESPONSE_MAX];
+/* Raw response: headers and body. Grows for large downloads (media) and
+ * shrinks back to the page size afterwards. */
+static char* response;
+static size_t response_cap;
+
+static int response_reserve(size_t body_capacity) {
+    size_t need = body_capacity + HTTP_HEADER_MAX;
+    if (response_cap >= need) return 1;
+    free(response);
+    response = (char*)malloc(need);
+    response_cap = response ? need : 0;
+    return response != NULL;
+}
+
+static void response_trim(void) {
+    if (response_cap <= HTTP_RESPONSE_MAX) return;
+    free(response);
+    response = NULL;
+    response_cap = 0;
+}
+
+static const char* too_large(size_t body_capacity) {
+    return body_capacity > MX_HTTP_BODY_MAX ? "This file is larger than the media limit."
+                                            : "This page is larger than 2 MiB.";
+}
 
 static void set_error(char* error, size_t capacity, const char* message) {
     if (capacity) strlcpy_safe(error, message, capacity);
@@ -459,6 +484,10 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     if (!parse_url(url, host, sizeof(host), path, sizeof(path), &port, &use_tls,
                    error, error_capacity))
         return 0;
+    if (!response_reserve(body_capacity)) {
+        set_error(error, error_capacity, "Not enough memory for this download.");
+        return 0;
+    }
     if (use_tls && !allow_insecure_tls) {
         set_error(error, error_capacity,
                   "Unsafe HTTPS is disabled. Enable it in Settings to continue.");
@@ -512,12 +541,12 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
 
     long last_data = mos_uptime();
     int receive_failed = 0;
-    while (response_length < sizeof(response)) {
+    while (response_length < response_cap) {
         remaining = request_time_left(request_start, timeout_ms);
         if (!remaining) break;
         long count = transport_recv(use_tls, connection,
             response + response_length,
-            (uint32_t)(sizeof(response) - response_length),
+            (uint32_t)(response_cap - response_length),
             capped_timeout(remaining, HTTP_IDLE_TIMEOUT_MS));
         if (count < 0) {
             if (count == (long)SYS_ERR_NOTFOUND) break;
@@ -598,7 +627,7 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     const char* response_body = header_end + 4;
     if (has_content_length && !chunked) {
         if (declared_length > body_capacity - 1) {
-            set_error(error, error_capacity, "This page is larger than 2 MiB.");
+            set_error(error, error_capacity, too_large(body_capacity));
             return 0;
         }
         if (available < declared_length) {
@@ -615,7 +644,7 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
         }
     } else {
         if (available >= body_capacity) {
-            set_error(error, error_capacity, "This page is larger than 2 MiB.");
+            set_error(error, error_capacity, too_large(body_capacity));
             return 0;
         }
         memcpy(body, response_body, available);
@@ -642,13 +671,16 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
     unsigned redirects = 0;
     for (;;) {
         char location[HTTP_URL_MAX];
+        /* large downloads (media) get more time */
+        uint32_t total = body_capacity > MX_HTTP_BODY_MAX ? HTTP_MEDIA_TIMEOUT_MS
+                                                          : HTTP_TOTAL_TIMEOUT_MS;
         int result = http_get_once(current_url, body, body_capacity,
                                    body_length, allow_insecure_tls,
-                                   redirects ? HTTP_REDIRECT_TIMEOUT_MS
-                                             : HTTP_TOTAL_TIMEOUT_MS,
+                                   redirects ? HTTP_REDIRECT_TIMEOUT_MS : total,
                                    location, sizeof(location), error,
                                    error_capacity, info);
         if (result != HTTP_REDIRECT_RESULT) {
+            response_trim();
             if (info) {
                 strlcpy_safe(info->final_url, current_url, sizeof(info->final_url));
                 info->redirects = (int)redirects;
@@ -658,12 +690,14 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
         }
         if (redirects >= HTTP_MAX_REDIRECTS) {
             set_error(error, error_capacity, "Too many HTTP redirects (maximum 5).");
+            response_trim();
             return 0;
         }
         char resolved[HTTP_URL_MAX];
         if (!resolve_location(current_url, location, resolved,
                               sizeof(resolved))) {
             set_error(error, error_capacity, "HTTP redirect URL is invalid or too long.");
+            response_trim();
             return 0;
         }
         strlcpy_safe(current_url, resolved, sizeof(current_url));

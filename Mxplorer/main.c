@@ -4,6 +4,7 @@
 #include "mxplorer/html.h"
 #include "mxplorer/http.h"
 #include "mxplorer/js.h"
+#include "mxplorer/media.h"
 #include "mxplorer/text.h"
 #include "mxplorer/ui.h"
 #include "mxplorer/util.h"
@@ -341,6 +342,12 @@ static void set_tab_title_from_url(browser_tab_t* tab) {
         mx_copy(tab->title, sizeof(tab->title), "New Tab");
         return;
     }
+    char local[256];
+    if (mx_url_local_path(tab->url, local, sizeof(local))) {
+        const char* name = strrchr(local, '/');
+        mx_copy(tab->title, sizeof(tab->title), name && name[1] ? name + 1 : local);
+        return;
+    }
     const char* host = strstr(tab->url, "://");
     host = host ? host + 3 : tab->url;
     size_t length = 0;
@@ -411,10 +418,41 @@ static int fetch_resource(void* user, const char* url, const char* kind, char** 
         loading = loading < 90 ? loading + 3 : 90;
         present_chrome_now();
     }
+    char local[256];
+    if (mx_url_local_path(url, local, sizeof(local))) {
+        /* only local pages may read local files */
+        char page_local[8];
+        long n = mx_url_local_path(tabs[active_tab].url, page_local, sizeof(page_local))
+                     ? read_file(local, resource_buffer, MX_HTTP_BODY_MAX) : -1;
+        entry->duration_ms = mx_now_ms() - entry->started_ms;
+        mx_copy(entry->content_type, sizeof(entry->content_type), "local file");
+        if (n < 0) {
+            entry->status = 0;
+            mx_copy(entry->error, sizeof(entry->error), "The file could not be read.");
+            return 0;
+        }
+        entry->status = 200;
+        entry->size = (size_t)n;
+        char* copy = (char*)malloc((size_t)n + 1);
+        if (!copy) return 0;
+        memcpy(copy, resource_buffer, (size_t)n + 1);
+        *body = copy;
+        *length = (size_t)n;
+        resources_loaded++;
+        return 1;
+    }
+    /* pictures and videos may be larger than pages: they get their own buffer */
+    int media = !strcmp(kind, "image") || !strcmp(kind, "video");
+    size_t capacity = media ? MX_HTTP_MEDIA_MAX : MX_HTTP_BODY_MAX;
+    char* buffer = media ? (char*)malloc(capacity) : resource_buffer;
+    if (!buffer) {
+        mx_copy(entry->error, sizeof(entry->error), "Not enough memory for this file.");
+        return 0;
+    }
     size_t received = 0;
     char error[128];
     mx_http_info_t info;
-    int ok = mx_http_get(url, resource_buffer, MX_HTTP_BODY_MAX, &received, allow_insecure_tls,
+    int ok = mx_http_get(url, buffer, capacity, &received, allow_insecure_tls,
                          error, sizeof(error), &info);
     entry->status = info.status;
     entry->duration_ms = mx_now_ms() - entry->started_ms;
@@ -430,7 +468,16 @@ static int fetch_resource(void* user, const char* url, const char* kind, char** 
         mx_append(message, sizeof(message), ": ");
         mx_append(message, sizeof(message), url);
         mx_console_add(MX_LOG_WARN, "Network", 0, message);
+        if (media) free(buffer);
         return 0;
+    }
+    if (media) {
+        /* hand over the buffer itself, trimmed to the file */
+        char* fitted = (char*)realloc(buffer, received + 1);
+        *body = fitted ? fitted : buffer;
+        *length = received;
+        resources_loaded++;
+        return 1;
     }
     char* copy = (char*)malloc(received + 1);
     if (!copy) return 0;
@@ -478,6 +525,45 @@ static int render_source(const char* source, size_t length, const char* url, int
     return 1;
 }
 
+/* A page that shows one picture or video, for addresses that are .img or
+ * .vid files themselves. */
+static char* media_document(const char* url, int kind, size_t* length) {
+    char escaped[URL_LENGTH * 6];
+    size_t used = 0;
+    for (const char* p = url; *p && used + 7 < sizeof(escaped); p++) {
+        const char* entity = *p == '&' ? "&amp;" : *p == '"' ? "&quot;" : *p == '<' ? "&lt;"
+                           : *p == '>' ? "&gt;" : NULL;
+        if (entity) {
+            mx_copy(escaped + used, sizeof(escaped) - used, entity);
+            used += strlen(entity);
+        } else {
+            escaped[used++] = *p;
+        }
+    }
+    escaped[used] = '\0';
+    const char* name = strrchr(url, '/');
+    name = name && name[1] ? name + 1 : url;
+    size_t capacity = 1024 + 2 * used + strlen(name) * 6;
+    char* page = (char*)malloc(capacity);
+    if (!page) return NULL;
+    mx_copy(page, capacity, "<!doctype html><html><head><title>");
+    for (const char* p = name; *p && *p != '?' && *p != '#'; p++) {
+        char one[2] = {*p, 0};
+        mx_append(page, capacity, *p == '<' ? "&lt;" : *p == '&' ? "&amp;" : one);
+    }
+    mx_append(page, capacity, "</title><style>"
+        "html,body{margin:0;background:#0e0e0e;color:#ddd}"
+        "body{height:100vh;display:flex;align-items:center;justify-content:center}"
+        "img,video{display:block;max-width:100%;max-height:100vh}"
+        "</style></head><body>");
+    mx_append(page, capacity, kind == MX_MEDIA_VIDEO ? "<video controls autoplay src=\"" : "<img src=\"");
+    mx_append(page, capacity, escaped);
+    mx_append(page, capacity, kind == MX_MEDIA_VIDEO ? "\"></video>" : "\" alt=\"\">");
+    mx_append(page, capacity, "</body></html>");
+    *length = strlen(page);
+    return page;
+}
+
 static void load_page(int force_reload) {
     browser_tab_t* tab = &tabs[active_tab];
     page_loaded = 0;
@@ -501,6 +587,9 @@ static void load_page(int force_reload) {
     }
     char status[160] = "Connecting to ";
     const char* host = strstr(tab->url, "://");
+    char local_status[8];
+    if (mx_url_local_path(tab->url, local_status, sizeof(local_status)))
+        mx_copy(status, sizeof(status), "Opening ");
     mx_append(status, sizeof(status), host ? host + 3 : tab->url);
     set_status(status);
     char message[300] = "Navigated to ";
@@ -516,7 +605,48 @@ static void load_page(int force_reload) {
                            (uint32_t)page_view_height());
     }
     int from_cache = !force_reload && tab->page_source && text_equal(tab->source_url, tab->url);
-    if (!from_cache) {
+    int media_kind = mx_media_kind_of_url(tab->url);
+    char local_path[256];
+    int is_local = mx_url_local_path(tab->url, local_path, sizeof(local_path));
+    if (!from_cache && (media_kind || is_local)) {
+        /* a picture or video (fetched by the page itself), or a local page */
+        char* saved = NULL;
+        size_t saved_length = 0;
+        if (media_kind) {
+            saved = media_document(tab->url, media_kind, &saved_length);
+        } else {
+            mx_network_entry_t* entry = mx_network_add(tab->url, "document");
+            long n = read_file(local_path, page_buffer, MX_HTTP_BODY_MAX);
+            mx_copy(entry->content_type, sizeof(entry->content_type), "local file");
+            entry->duration_ms = mx_now_ms() - entry->started_ms;
+            if (n < 0) {
+                const char* why = mos_exists(local_path) == 1
+                                      ? "The file could not be read (pages are at most 2 MiB)."
+                                      : "There is no file at this address.";
+                mx_copy(entry->error, sizeof(entry->error), why);
+                classify_error(tab, why);
+                tab->error = MX_PAGE_ERROR_CONTENT;
+                set_status(why);
+                loading = 0;
+                return;
+            }
+            entry->status = 200;
+            entry->size = (size_t)n;
+            saved = (char*)malloc((size_t)n + 1);
+            if (saved) memcpy(saved, page_buffer, (size_t)n + 1);
+            saved_length = (size_t)n;
+        }
+        if (!saved) {
+            classify_error(tab, "Not enough memory to keep this page.");
+            loading = 0;
+            return;
+        }
+        free(tab->page_source);
+        tab->page_source = saved;
+        tab->page_source_length = saved_length;
+        mx_copy(tab->source_url, sizeof(tab->source_url), tab->url);
+        tab->scroll_y = 0;
+    } else if (!from_cache) {
         mx_network_entry_t* entry = mx_network_add(tab->url, "document");
         char error[160];
         size_t body_length = 0;
@@ -637,6 +767,19 @@ static int normalize_address(const char* input, char* output, size_t capacity, i
     int has_space = strchr(trimmed, ' ') != NULL;
     *is_search = 0;
     if (!length) return 0;
+    if (trimmed[0] >= '0' && trimmed[0] <= '9' && trimmed[1] == ':' && trimmed[2] == '/') {
+        /* a Minimal-OS path: 0:/users/me/Videos/clip.vid */
+        mx_copy(output, capacity, "file:///");
+        mx_append(output, capacity, trimmed);
+        return strlen(output) < capacity;
+    }
+    if (mx_starts_with_nocase(trimmed, "file://")) {
+        char path[URL_LENGTH];
+        if (!mx_url_local_path(trimmed, path, sizeof(path))) return 0;
+        mx_copy(output, capacity, "file:///");
+        mx_append(output, capacity, path);
+        return strlen(output) < capacity;
+    }
     if (mx_starts_with_nocase(trimmed, "mos://") || mx_starts_with_nocase(trimmed, "http://") ||
         mx_starts_with_nocase(trimmed, "https://")) {
         if (length >= capacity) return 0;
@@ -1366,7 +1509,7 @@ static void draw_page(void) {
 /* Main                                                                   */
 /* ====================================================================== */
 
-int main(void) {
+int main(int argc, char** argv) {
     if (!mx_text_load_fonts())
         printf("Mxplorer: bundled fonts unavailable; using fallback text\n");
     page_buffer = (char*)malloc(MX_HTTP_BODY_MAX);
@@ -1382,6 +1525,16 @@ int main(void) {
     rebuild_theme();
     init_tab(&tabs[0]);
     tab_count = 1;
+    if (argc > 1 && argv[1] && argv[1][0]) {
+        /* run Mxplorer <address or 0:/path/file> */
+        char start[URL_LENGTH];
+        int is_search = 0;
+        if (normalize_address(argv[1], start, sizeof(start), &is_search)) {
+            mx_copy(tabs[0].url, sizeof(tabs[0].url), start);
+            mx_copy(tabs[0].history[0], URL_LENGTH, start);
+            set_tab_title_from_url(&tabs[0]);
+        }
+    }
     reset_address();
 
     window_id = mos_window_create(0, 22, 16, WIN_W, WIN_H, "Mxplorer");
@@ -1442,6 +1595,7 @@ int main(void) {
             }
         }
         long now = mx_now_ms();
+        if (page_loaded && mx_html_media_tick(now)) page_dirty = 1;
         if (page_loaded && javascript_enabled) {
             if (mx_html_tick(now)) page_dirty = 1;
             if (pending_navigation_set) {
