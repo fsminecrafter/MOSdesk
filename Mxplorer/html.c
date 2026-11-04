@@ -2,6 +2,7 @@
 #include "mxplorer/css.h"
 #include "mxplorer/devlog.h"
 #include "mxplorer/js.h"
+#include "mxplorer/media.h"
 #include "mxplorer/text.h"
 #include "string.h"
 #include "stdlib.h"
@@ -17,7 +18,8 @@ enum {
     IT_ICON,        /* px = icon id, w = size */
     IT_CHECKBOX,
     IT_RADIO,
-    IT_CARET
+    IT_CARET,
+    IT_MEDIA        /* picture or video of `node`, drawn by media.c */
 };
 
 typedef struct {
@@ -183,7 +185,7 @@ static int is_hidden(const mx_node_t* n) {
 
 static int is_replaced(const mx_node_t* n) {
     const char* t = n->tag;
-    return !strcmp(t, "img") || !strcmp(t, "input") || !strcmp(t, "select") ||
+    return !strcmp(t, "img") || !strcmp(t, "video") || !strcmp(t, "input") || !strcmp(t, "select") ||
            !strcmp(t, "textarea") || !strcmp(t, "progress") || !strcmp(t, "meter");
 }
 
@@ -459,18 +461,37 @@ static void replaced_size(mx_node_t* n, int container_w, int* w, int* h) {
         ch = s->height.px;
         if (s->border_box) ch -= pad_v;
     }
-    if (mx_dom_is(n, "img")) {
+    if (mx_dom_is(n, "img") || mx_dom_is(n, "video")) {
         int aw = attr_int(n, "width", -1), ah = attr_int(n, "height", -1);
+        /* the picture's or video's own size (.img / .vid) */
+        int iw = 0, ih = 0;
+        int natural = mx_media_natural_size(n, &iw, &ih) && iw > 0 && ih > 0;
+        if (!natural && mx_dom_is(n, "video")) {
+            iw = 300;   /* the HTML default */
+            ih = 150;
+            natural = 1;
+        }
         if (cw < 0) cw = aw;
         if (ch < 0) ch = ah;
-        if (cw < 0 && ch < 0) {
+        if (cw < 0 && ch < 0 && natural) {
+            cw = iw;
+            ch = ih;
+        } else if (cw < 0 && ch < 0) {
             const char* alt = mx_dom_attr(n, "alt");
             cw = alt && *alt ? mx_text_width_px(alt, (size_t)-1, fs, 0) + 26 : 20;
             ch = alt && *alt ? fs + 6 : 20;
         } else if (cw < 0) {
-            cw = ch;
+            cw = natural ? ch * iw / ih : aw > 0 && ah > 0 ? ch * aw / ah : ch;
         } else if (ch < 0) {
-            ch = aw > 0 && ah > 0 ? cw * ah / aw : (cw > 300 ? cw * 9 / 16 : cw);
+            ch = natural ? cw * ih / iw
+                         : aw > 0 && ah > 0 ? cw * ah / aw : (cw > 300 ? cw * 9 / 16 : cw);
+        }
+        if (s->max_height.kind == MX_LEN_SET && !s->max_height.pct) {
+            int max = s->max_height.px;
+            if (ch > max && max > 0) {
+                cw = cw * max / ch;
+                ch = max;
+            }
         }
         if (s->max_width.kind == MX_LEN_SET) {
             int max = mx_len_resolve(s->max_width, container_w);
@@ -537,6 +558,11 @@ static void emit_control(mx_node_t* n, int x, int y, int w, int h) {
     int pb = mx_len_resolve(s->padding[2], w) + s->border_width[2];
     int cx = x + pl, cy = y + pt, cw = w - pl - pr, ch = h - pt - pb;
     int text_y = cy + (ch - mx_text_height_px(fs, 0)) / 2;
+    int iw, ih;
+    if (mx_dom_is(n, "video") || (mx_dom_is(n, "img") && mx_media_natural_size(n, &iw, &ih))) {
+        push_item(IT_MEDIA, cx, cy, cw, ch, 0xFFFFFFFFu, n);
+        return;
+    }
     if (mx_dom_is(n, "img")) {
         uint32_t muted = mx_with_alpha(s->color, 150);
         int idx = push_item(IT_RECT, x, y, w, h, 0x10808080u, n);
@@ -547,7 +573,7 @@ static void emit_control(mx_node_t* n, int x, int y, int w, int h) {
         int iy = alt && *alt && h < 60 ? y + (h - 16) / 2 : y + (h - icon) / 2;
         int ix = alt && *alt && h < 60 ? x + 4 : x + (w - icon) / 2;
         idx = push_item(IT_ICON, ix, iy, icon, icon, muted, n);
-        if (idx >= 0) items[idx].px = MX_ICON_IMAGE;
+        if (idx >= 0) items[idx].px = mx_media_failed(n) ? MX_ICON_BROKEN_IMAGE : MX_ICON_IMAGE;
         if (alt && *alt) {
             int tx = h < 60 ? x + 24 : x + 6;
             int ty = h < 60 ? y + (h - mx_text_height_px(fs, 0)) / 2 : iy + icon + 4;
@@ -2318,6 +2344,12 @@ mx_html_result_t mx_html_load(const char* source, size_t length,
         mx_css_add_stylesheet(noscript, sizeof(noscript) - 1, 0);
     }
     add_stylesheets();
+    {
+        /* local pages may show local pictures and videos; network pages may not */
+        char local[8];
+        mx_media_begin(fetch_enabled ? fetch_callback : NULL, fetch_user,
+                       mx_url_local_path(doc.base_url, local, sizeof(local)));
+    }
 
     if (scripts_enabled) {
         mx_js_host_t host = {html_navigate, html_alert,
@@ -2341,6 +2373,7 @@ static void attach_inline_handlers(void) {
 }
 
 void mx_html_unload(void) {
+    mx_media_end();
     if (scripts_enabled) mx_js_end();
     if (doc_loaded) mx_dom_free(&doc);
     doc_loaded = 0;
@@ -2404,6 +2437,11 @@ void mx_html_ensure_layout(void) {
     if (doc_loaded && doc.mutated) layout_document();
 }
 
+int mx_html_media_tick(long now_ms) {
+    if (!doc_loaded) return 0;
+    return mx_media_tick(now_ms);
+}
+
 int mx_html_tick(long now_ms) {
     if (!doc_loaded || !scripts_enabled) return 0;
     if (mx_js_next_timer(now_ms) != 0) return 0;
@@ -2462,6 +2500,9 @@ static void draw_item(const mx_canvas_t* base, const item_t* it, int ox, int oy)
         break;
     case IT_CARET:
         mx_fill(&c, x, y, 1, it->h, it->color);
+        break;
+    case IT_MEDIA:
+        mx_media_paint(&c, it->node, x, y, it->w, it->h, it->color >> 24, accent);
         break;
     }
 }
@@ -2621,6 +2662,7 @@ int mx_html_pointer_at(int x, int y) {
     if (mx_html_link_at(x, y)) return 1;
     for (; n && n->type == MX_NODE_ELEMENT; n = n->parent) {
         if (n->style && n->style->pointer) return 1;
+        if (mx_media_pointer(n)) return 1;
         if (mx_dom_is(n, "button") || mx_dom_is(n, "select") || mx_dom_is(n, "summary") ||
             (mx_dom_is(n, "input") && !is_text_input(n)) || mx_dom_attr(n, "onclick"))
             return 1;
@@ -2885,6 +2927,17 @@ int mx_html_click(int x, int y, char* navigate, size_t capacity) {
         prevented = mx_js_dispatch(target, "click", &info);
     }
     int result = 0;
+    if (!prevented && mx_dom_is(target, "video") && target->style) {
+        /* the video's controls */
+        const mx_style_t* s = target->style;
+        int pl = mx_len_resolve(s->padding[3], target->box_w) + s->border_width[3];
+        int pt = mx_len_resolve(s->padding[0], target->box_w) + s->border_width[0];
+        int pr = mx_len_resolve(s->padding[1], target->box_w) + s->border_width[1];
+        int pb = mx_len_resolve(s->padding[2], target->box_w) + s->border_width[2];
+        if (mx_media_click(target, x, y, target->box_x + pl, target->box_y + pt,
+                           target->box_w - pl - pr, target->box_h - pt - pb))
+            prevented = 1;
+    }
     if (!prevented) result = activate(target, navigate, capacity);
     if (previous_focus != focused) doc.mutated = 1;
     mx_html_update();

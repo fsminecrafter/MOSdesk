@@ -286,3 +286,30 @@ int mx_url_resolve(const char* base, const char* ref, char* out,
     mx_copy(out, capacity, result);
     return strlen(result) < capacity;
 }
+
+int mx_url_local_path(const char* url, char* out, size_t capacity) {
+    if (!url || !capacity) return 0;
+    const char* path = url;
+    if (mx_starts_with_nocase(url, "file://")) {
+        path = url + 7;
+        while (path[0] == '/' && path[1] == '/') path++;
+        if (path[0] == '/' && path[1] >= '0' && path[1] <= '9' && path[2] == ':') path++;
+        else if (path[0] == '/') {
+            if (capacity < 3) return 0;
+            out[0] = '0';
+            out[1] = ':';
+            mx_copy(out + 2, capacity - 2, path);
+            goto cut;
+        } else if (!(path[0] >= '0' && path[0] <= '9' && path[1] == ':')) {
+            return 0;
+        }
+    } else if (!(url[0] >= '0' && url[0] <= '9' && url[1] == ':' && url[2] == '/')) {
+        return 0;
+    }
+    mx_copy(out, capacity, path);
+cut:
+    /* a #fragment or ?query is not part of the file name */
+    for (char* p = out; *p; p++)
+        if (*p == '#' || *p == '?') { *p = '\0'; break; }
+    return out[0] != '\0';
+}

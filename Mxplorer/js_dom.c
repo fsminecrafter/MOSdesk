@@ -5,6 +5,7 @@
 #include "mxplorer/css.h"
 #include "mxplorer/devlog.h"
 #include "mxplorer/html.h"
+#include "mxplorer/media.h"
 #include "string.h"
 #include "stdlib.h"
 
@@ -459,7 +460,10 @@ enum {
     G_ACTIVE_ELEMENT, G_FORMS, G_IMAGES, G_LINKS, G_SCRIPTS,
     G_VISIBILITY_STATE, G_DOC_HIDDEN, G_REFERRER, G_DOMAIN, G_CHARSET,
     G_COMPAT_MODE, G_CONTENT_EDITABLE, G_IS_CONTENT_EDITABLE, G_LABEL,
-    G_TEXT, G_COUNT
+    G_TEXT,
+    /* <video> (HTMLMediaElement); media.c plays them */
+    G_PAUSED, G_CURRENT_TIME, G_DURATION, G_ENDED, G_MUTED, G_VIDEO_WIDTH,
+    G_VIDEO_HEIGHT, G_COUNT
 };
 
 static const char* const getter_names[G_COUNT] = {
@@ -481,6 +485,8 @@ static const char* const getter_names[G_COUNT] = {
     "forms", "images", "links", "scripts", "visibilityState", "hidden",
     "referrer", "domain", "characterSet", "compatMode", "contentEditable",
     "isContentEditable", "label", "text",
+    "paused", "currentTime", "duration", "ended", "muted", "videoWidth",
+    "videoHeight",
 };
 
 static js_str* getter_keys[G_COUNT];
@@ -807,7 +813,19 @@ static js_val node_getter(mx_node_t* n, int id) {
         return js_obj_val(list);
     }
     case G_OFFSET_PARENT: return js_wrap_node(js_doc->body);
-    case G_NATURAL_WIDTH: case G_NATURAL_HEIGHT: return js_num(0);
+    case G_NATURAL_WIDTH: case G_NATURAL_HEIGHT: case G_VIDEO_WIDTH: case G_VIDEO_HEIGHT: {
+        int w = 0, h = 0;
+        if (!mx_media_natural_size(n, &w, &h)) w = h = 0;
+        return js_num(id == G_NATURAL_WIDTH || id == G_VIDEO_WIDTH ? w : h);
+    }
+    case G_PAUSED: return js_bool(mx_media_paused(n));
+    case G_ENDED: return js_bool(mx_media_ended(n));
+    case G_MUTED: return js_bool(mx_media_muted(n));
+    case G_CURRENT_TIME: return js_num(mx_media_current_time(n));
+    case G_DURATION: {
+        double d = mx_media_duration(n);
+        return d > 0 ? js_num(d) : js_num(0.0 / 0.0);   /* NaN until known */
+    }
     case G_COMPLETE: return js_bool(1);
     case G_LABEL:
         return js_str_val(js_cstr(mx_dom_attr(n, "label") ? mx_dom_attr(n, "label")
@@ -955,6 +973,11 @@ js_val js_dom_get(js_obj* obj, js_str* key, int* found) {
         }
         return js_undef();
     }
+    if (id >= G_PAUSED) {
+        if (!mx_dom_is(n, "video") && !mx_dom_is(n, "audio")) return js_undef();
+        *found = 1;
+        return node_getter(n, id);
+    }
     if (id >= G_DOCUMENT_ELEMENT && id != G_TITLE && id != G_HIDDEN && id != G_LABEL &&
         id != G_TEXT && id != G_CONTENT_EDITABLE && id != G_IS_CONTENT_EDITABLE)
         return js_undef();
@@ -1032,6 +1055,16 @@ int js_dom_set(js_obj* obj, js_str* key, js_val value) {
             return 1;
         }
         return 0;
+    }
+    if (id >= G_PAUSED) {
+        if (!mx_dom_is(n, "video") && !mx_dom_is(n, "audio")) return 0;
+        if (id == G_CURRENT_TIME) {
+            mx_media_seek(n, js_to_number(value));
+            js_dom_mutated();   /* repaint the new frame */
+        } else if (id == G_MUTED) {
+            mx_media_set_muted(n, js_truthy(value));
+        }
+        return 1;
     }
     js_str* text = js_to_string(value);
     switch (id) {
@@ -1542,7 +1575,13 @@ static js_val el_misc(js_val self, js_val* args, int argc, js_obj* callee) {
         js_dom_mutated();
         return js_undef();
     case 7:   /* media play() */
+        if (n) mx_media_play(n);
+        js_dom_mutated();
         return js_promise_resolved(js_undef(), 0);
+    case 10:   /* media pause() */
+        if (n) mx_media_pause(n);
+        js_dom_mutated();
+        return js_undef();
     case 8:   /* form submit / requestSubmit */
         if (n) {
             int prevented = mx_js_dispatch(n, "submit", NULL);
@@ -2845,7 +2884,7 @@ void js_dom_init(void) {
     method(ep, "showModal", el_misc, 5);
     method(ep, "close", el_misc, 6);
     method(ep, "play", el_misc, 7);
-    method(ep, "pause", el_misc, 1);
+    method(ep, "pause", el_misc, 10);
     method(ep, "load", el_misc, 1);
     method(ep, "submit", el_misc, 8);
     method(ep, "requestSubmit", el_misc, 8);
@@ -3086,7 +3125,7 @@ static int active;
 void mx_js_begin(mx_document_t* doc, const char* url, const mx_js_host_t* host) {
     mx_js_end();
     memset(&js_rt, 0, sizeof(js_rt));
-    js_heap.limit = 48u * 1024u * 1024u;
+    js_heap.limit = 32u * 1024u * 1024u;   /* soft: js_alloc() grows it */
     js_doc = doc;
     js_host = *host;
     mx_copy(page_url, sizeof(page_url), url ? url : "");

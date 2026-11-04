@@ -93,6 +93,8 @@ void mx_html_set_highlight(mx_node_t* node);
 void mx_html_viewport(int* width, int* height);
 /* Ensures layout is current (JS geometry queries). */
 void mx_html_ensure_layout(void);
+/* Advances playing videos. Returns 1 when the page needs a redraw. */
+int mx_html_media_tick(long now_ms);
 /* Runs due JavaScript timers. Returns 1 when the page needs a redraw. */
 int mx_html_tick(long now_ms);
 

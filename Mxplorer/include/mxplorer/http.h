@@ -4,6 +4,8 @@
 #include <stddef.h>
 
 #define MX_HTTP_BODY_MAX (2u * 1024u * 1024u)
+/* .img and .vid downloads may be larger than pages. */
+#define MX_HTTP_MEDIA_MAX (32u * 1024u * 1024u)
 
 typedef struct {
     int status;                /* HTTP status, 0 when no response */

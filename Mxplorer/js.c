@@ -7,7 +7,8 @@
  * coalescing, exceptions, labels, for-in/of and switch. Generators are not
  * supported; `await` unwraps settled promises synchronously.
  *
- * Memory comes from one arena per page. Calls to functions without nested
+ * Memory comes from one arena per page. It has no fixed size: it grows
+ * while the machine keeps a reserve of free memory (js_heap_may_grow). Calls to functions without nested
  * closures take their scopes from a LIFO stack so loops and handlers do not
  * grow the heap. */
 
@@ -41,10 +42,33 @@ js_env* js_global_env;
 static char* scope_stack;
 static size_t scope_top;
 
+/* The heap starts with a soft limit and grows in steps for as long as the
+ * machine keeps JS_HEAP_RESERVE free for the rest of the browser and the
+ * system (pages, layout, images and other programs). */
+#define JS_HEAP_STEP (8u * 1024u * 1024u)
+#define JS_HEAP_RESERVE (96ull * 1024u * 1024u)
+
+#ifdef MX_HOST
+static int js_heap_may_grow(size_t size) {
+    return js_heap.total + size < (size_t)2048u * 1024u * 1024u;
+}
+#else
+#include "user_sysinfo.h"
+static int js_heap_may_grow(size_t size) {
+    uint64_t free_bytes = mos_sysinfo_ram_free();
+    return free_bytes > JS_HEAP_RESERVE + JS_HEAP_STEP + size;
+}
+#endif
+
 void* js_alloc(size_t size) {
     void* p = mx_arena_alloc(&js_heap, size);
+    if (!p && js_heap.limit && js_heap_may_grow(size)) {
+        js_heap.limit += JS_HEAP_STEP + size;
+        js_heap.failed = 0;
+        p = mx_arena_alloc(&js_heap, size);
+    }
     if (!p) {
-        /* Over the page's budget: flag it (the interpreter stops at the next
+        /* Out of memory: flag it (the interpreter stops at the next
          * statement) and keep handing out memory from a small extension so
          * that half-finished operations stay valid. */
         js_rt.out_of_memory = 1;
