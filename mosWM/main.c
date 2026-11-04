@@ -282,6 +282,7 @@ static char auth_username[MOSDESK_USERNAME_SIZE];
 static uint32_t auth_username_length;
 static uint32_t dragging_id;
 static uint32_t drag_mode;
+static uint32_t drag_edges;     /* RESIZE_EDGE_* being dragged */
 static uint32_t drag_start_x;
 static uint32_t drag_start_y;
 static uint32_t drag_start_width;
@@ -6992,6 +6993,95 @@ static syscall_window_info_t* window_at(syscall_window_info_t* windows,
     return NULL;
 }
 
+/* Resizing: a band along every edge of a normal (not maximized) window,
+ * partly outside its frame so it is easy to hit. */
+#define RESIZE_EDGE_LEFT   1u
+#define RESIZE_EDGE_RIGHT  2u
+#define RESIZE_EDGE_TOP    4u
+#define RESIZE_EDGE_BOTTOM 8u
+#define RESIZE_OUTSIDE 6
+#define RESIZE_INSIDE  4
+#define RESIZE_CORNER  14
+#define CURSOR_RESIZE_EW   8u
+#define CURSOR_RESIZE_NESW 9u
+#define CURSOR_RESIZE_NS   10u
+#define CURSOR_RESIZE_NWSE 11u
+#define RESIZE_MIN_WIDTH  160
+#define RESIZE_MIN_HEIGHT 60
+
+static uint32_t resize_edges_of(const syscall_window_info_t* info,
+                                int32_t px, int32_t py) {
+    int32_t left = (int32_t)info->x;
+    int32_t top = (int32_t)info->y;
+    int32_t right = left + (int32_t)info->width + 2;
+    int32_t bottom = top + (int32_t)info->height + (int32_t)TITLE_HEIGHT + 2;
+    if (px < left - RESIZE_OUTSIDE || px >= right + RESIZE_OUTSIDE ||
+        py < top - RESIZE_OUTSIDE || py >= bottom + RESIZE_OUTSIDE)
+        return 0;
+    uint32_t edges = 0;
+    if (px < left + RESIZE_INSIDE) edges |= RESIZE_EDGE_LEFT;
+    else if (px >= right - RESIZE_INSIDE) edges |= RESIZE_EDGE_RIGHT;
+    /* The top band stays thin inside: the title bar is for moving. */
+    if (py < top + 2) edges |= RESIZE_EDGE_TOP;
+    else if (py >= bottom - RESIZE_INSIDE) edges |= RESIZE_EDGE_BOTTOM;
+    /* Near a corner, grab both edges. */
+    if (edges & (RESIZE_EDGE_LEFT | RESIZE_EDGE_RIGHT)) {
+        if (py < top + RESIZE_CORNER) edges |= RESIZE_EDGE_TOP;
+        else if (py >= bottom - RESIZE_CORNER) edges |= RESIZE_EDGE_BOTTOM;
+    } else if (edges & (RESIZE_EDGE_TOP | RESIZE_EDGE_BOTTOM)) {
+        if (px < left + RESIZE_CORNER) edges |= RESIZE_EDGE_LEFT;
+        else if (px >= right - RESIZE_CORNER) edges |= RESIZE_EDGE_RIGHT;
+    }
+    return edges;
+}
+
+/* The window whose resize band is under the point, honouring stacking:
+ * a window drawn above wins, whether by its band or its body. */
+static syscall_window_info_t* resize_target(syscall_window_info_t* windows,
+                                            uint64_t count, int32_t px,
+                                            int32_t py, uint32_t* edges) {
+    for (uint32_t focus_pass = 0; focus_pass < 2; focus_pass++) {
+        for (uint64_t i = count; i > 0; i--) {
+            syscall_window_info_t* info = &windows[i - 1u];
+            if (!(info->flags & SYSCALL_WINDOW_VISIBLE) ||
+                (info->flags & SYSCALL_WINDOW_MINIMIZED) ||
+                ((info->id == focused_id) != (focus_pass == 0)))
+                continue;
+            int32_t right = (int32_t)info->x + (int32_t)info->width + 2;
+            int32_t bottom = (int32_t)info->y + (int32_t)info->height +
+                             (int32_t)TITLE_HEIGHT + 2;
+            bool inside = px >= (int32_t)info->x && px < right &&
+                          py >= (int32_t)info->y && py < bottom;
+            uint32_t e = resize_edges_of(info, px, py);
+            if (e && (info->flags & SYSCALL_WINDOW_RESIZABLE) &&
+                window_mode(info) == MODE_NORMAL) {
+                if (inside && py < (int32_t)info->y + (int32_t)TITLE_HEIGHT &&
+                    caption_button_at(px - (int32_t)info->x,
+                                      py - (int32_t)info->y,
+                                      (int32_t)info->width + 1))
+                    return NULL;
+                *edges = e;
+                return info;
+            }
+            if (inside) return NULL;
+        }
+    }
+    return NULL;
+}
+
+static uint32_t resize_cursor(uint32_t edges) {
+    bool h = edges & (RESIZE_EDGE_LEFT | RESIZE_EDGE_RIGHT);
+    bool v = edges & (RESIZE_EDGE_TOP | RESIZE_EDGE_BOTTOM);
+    if (h && v) {
+        /* top-left or bottom-right: NW-SE; the other two: NE-SW */
+        bool left = (edges & RESIZE_EDGE_LEFT) != 0;
+        bool top = (edges & RESIZE_EDGE_TOP) != 0;
+        bool nwse = left == top;
+        return nwse ? CURSOR_RESIZE_NWSE : CURSOR_RESIZE_NESW;
+    }
+    return h ? CURSOR_RESIZE_EW : CURSOR_RESIZE_NS;
+}
+
 static void update_cursor_appearance(syscall_window_info_t* windows,
                                      uint64_t count) {
     syscall_window_info_t* under =
@@ -7001,9 +7091,13 @@ static void update_cursor_appearance(syscall_window_info_t* windows,
     moswm_cursor_state_t cursor_state = {0};
     uint32_t status = SYSCALL_CURSOR_ARROW;
 
+    uint32_t edges = 0;
     if (dragging_id || desktop_icon_drag_index != UINT32_MAX) {
         status = drag_mode == DRAG_RESIZE
-            ? SYSCALL_CURSOR_RESIZE_NWSE : SYSCALL_CURSOR_MOVE;
+            ? resize_cursor(drag_edges) : SYSCALL_CURSOR_MOVE;
+        app_window = NULL;
+    } else if (resize_target(windows, count, cursor_x, cursor_y, &edges)) {
+        status = resize_cursor(edges);
         app_window = NULL;
     } else if (under) {
         int32_t x = cursor_x - (int32_t)under->x;
@@ -7012,12 +7106,6 @@ static void update_cursor_appearance(syscall_window_info_t* windows,
         if (y < (int32_t)TITLE_HEIGHT) {
             if (caption_button_at(x, y, right)) status = SYSCALL_CURSOR_HAND;
             else status = SYSCALL_CURSOR_MOVE;
-            app_window = NULL;
-        } else if ((under->flags & SYSCALL_WINDOW_RESIZABLE) &&
-                   x >= right - 14 &&
-                   y >= (int32_t)under->height +
-                            (int32_t)TITLE_HEIGHT - 14) {
-            status = SYSCALL_CURSOR_RESIZE_NWSE;
             app_window = NULL;
         } else if (!app_window) {
             status = SYSCALL_CURSOR_ARROW;
@@ -7067,7 +7155,9 @@ static void minimize_window(syscall_window_info_t* info) {
     if (focused_id == info->id) focused_id = 0;
 }
 
-static void start_move(syscall_window_info_t* info, bool resize) {
+/* edges == 0 moves the window; otherwise RESIZE_EDGE_* to drag. */
+static void start_move(syscall_window_info_t* info, uint32_t edges) {
+    bool resize = edges != 0;
     if (!info || (!(info->flags & SYSCALL_WINDOW_RESIZABLE) && resize)) return;
     cached_window_t* entry = cache_for(info->id);
     syscall_window_info_t current = *info;
@@ -7079,6 +7169,7 @@ static void start_move(syscall_window_info_t* info, bool resize) {
     }
     dragging_id = info->id;
     drag_mode = resize ? DRAG_RESIZE : DRAG_MOVE;
+    drag_edges = edges;
     drag_start_x = (uint32_t)cursor_x;
     drag_start_y = (uint32_t)cursor_y;
     drag_start_width = current.width;
@@ -7139,12 +7230,39 @@ static void move_dragged_window(syscall_window_info_t* windows,
             x = (uint32_t)nx;
             y = (uint32_t)ny;
         } else {
-            int32_t nw = (int32_t)drag_start_width + dx;
-            int32_t nh = (int32_t)drag_start_height + dy;
-            if (nw < 64) nw = 64;
-            if (nh < 48) nh = 48;
+            /* Left/top edges move the window too, keeping the opposite
+             * edge where it was. */
+            int32_t nx = (int32_t)drag_start_window_x;
+            int32_t ny = (int32_t)drag_start_window_y;
+            int32_t nw = (int32_t)drag_start_width;
+            int32_t nh = (int32_t)drag_start_height;
+            if (drag_edges & RESIZE_EDGE_RIGHT) nw += dx;
+            if (drag_edges & RESIZE_EDGE_BOTTOM) nh += dy;
+            if (drag_edges & RESIZE_EDGE_LEFT) {
+                if (dx < -nx) dx = -nx;
+                if (nw - dx < RESIZE_MIN_WIDTH) dx = nw - RESIZE_MIN_WIDTH;
+                nx += dx;
+                nw -= dx;
+            }
+            if (drag_edges & RESIZE_EDGE_TOP) {
+                if (dy < -ny) dy = -ny;
+                if (nh - dy < RESIZE_MIN_HEIGHT) dy = nh - RESIZE_MIN_HEIGHT;
+                ny += dy;
+                nh -= dy;
+            }
+            if (nw < RESIZE_MIN_WIDTH) nw = RESIZE_MIN_WIDTH;
+            if (nh < RESIZE_MIN_HEIGHT) nh = RESIZE_MIN_HEIGHT;
+            if (nx < 0) nx = 0;
+            if (ny < 0) ny = 0;
+            x = (uint32_t)nx;
+            y = (uint32_t)ny;
             width = (uint32_t)nw;
             height = (uint32_t)nh;
+            /* Skip the call (and the window's buffer reallocation) when
+             * nothing changed since the last pointer move. */
+            if (x == info->x && y == info->y && width == info->width &&
+                height == info->height)
+                break;
         }
         if (mos_window_set_bounds(info->id, x, y, width, height) != SYS_SUCCESS)
             strcpy(status_message, "Window resize or move failed");
@@ -7241,6 +7359,17 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         return;
     }
 
+    uint32_t resize_edges = 0;
+    syscall_window_info_t* resizing =
+        resize_target(windows, count, cursor_x, cursor_y, &resize_edges);
+    if (resizing) {
+        focus_window(resizing);
+        start_menu_open = false;
+        last_click_valid = false;
+        start_move(resizing, resize_edges);
+        return;
+    }
+
     syscall_window_info_t* info =
         window_at(windows, count, cursor_x, cursor_y);
     if (!info) {
@@ -7297,11 +7426,8 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         } else if (button == 1u) {
             minimize_window(info);
         } else {
-            start_move(info, false);
+            start_move(info, 0);
         }
-    } else if (x >= right - 14 &&
-               y >= (int32_t)info->height + (int32_t)TITLE_HEIGHT - 14) {
-        start_move(info, true);
     }
 }
 
