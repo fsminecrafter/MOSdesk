@@ -269,7 +269,8 @@ static void load_photos(void) {
         const char* name = entries[i].name;
         size_t length = strlen(name);
         if (entries[i].type == SYSCALL_DIRENT_TYPE_DIR || length < 5u ||
-            strcmp(name + length - 4u, ".qoi") ||
+            (strcmp(name + length - 4u, ".qoi") &&
+             strcmp(name + length - 4u, ".img")) ||
             sizeof(WALLPAPER_DIRECTORY) + length + 12u >
                 MOSDESK_WALLPAPER_PATH_SIZE)
             continue;

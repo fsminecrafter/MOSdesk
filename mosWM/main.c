@@ -9,6 +9,12 @@
 #include "wm_text.h"
 #include "wm_panel_icons.h"
 #include "net.h"
+#if defined(__has_include)
+#if __has_include("mosmedia.h")
+#include "mosmedia.h"       /* .img wallpapers */
+#define MOSWM_HAS_MEDIA 1
+#endif
+#endif
 #define MOSDESK_SYSCALL mos_syscall3
 #include "../mosdesk/settings.h"
 #include "../mosdesk/password_hash.h"
@@ -32,6 +38,8 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 /* The text editor shipped with MOSdesk (mosdesk/apps/edit.c). */
 #define MOSDESK_EDITOR_PATH "0:/programs/mos_edit.run"
 #define MOSDESK_PLAYER_PATH "0:/programs/mos_player.run"
+#define MOSDESK_VIDEO_PATH "0:/programs/mos_video.run"
+#define MOSDESK_PHOTOS_PATH "0:/programs/mos_photos.run"
 
 #define SYS_HEAP_ALLOC 1u
 #define SYS_HEAP_FREE 2u
@@ -854,6 +862,37 @@ static void load_wallpaper_image(const char* path) {
 
     size_t file_size = 0;
     uint8_t* data = wm_read_file(path, WALLPAPER_MAX_FILE_SIZE, &file_size);
+#ifdef MOSWM_HAS_MEDIA
+    mimg_info_t img;
+    if (data && mimg_info(data, file_size, &img)) {
+        /* A Minimal-OS .img picture. */
+        uint32_t* pixels = NULL;
+        if (img.width <= 1600u && img.height <= 1600u &&
+            (uint64_t)img.width * img.height <= WALLPAPER_MAX_PIXELS)
+            pixels = (uint32_t*)wm_malloc((size_t)img.width * img.height * 4u);
+        bool ok = pixels && mimg_decode(data, file_size, pixels, img.width);
+        wm_free(data);
+        if (!ok) {
+            wm_free(pixels);
+            strcpy(status_message, pixels ? "Wallpaper image data is invalid"
+                                          : "Wallpaper image dimensions are invalid");
+            return;
+        }
+        /* Transparent parts fade to black. */
+        for (size_t i = 0; i < (size_t)img.width * img.height; i++) {
+            uint32_t c = pixels[i], a = c >> 24;
+            if (a != 255u)
+                c = ((((c >> 16) & 255u) * a / 255u) << 16) |
+                    ((((c >> 8) & 255u) * a / 255u) << 8) | ((c & 255u) * a / 255u);
+            pixels[i] = 0xFF000000u | c;
+        }
+        wallpaper_source = pixels;
+        wallpaper_source_width = img.width;
+        wallpaper_source_height = img.height;
+        status_message[0] = '\0';
+        return;
+    }
+#endif
     if (!data || file_size < 22u || memcmp(data, "qoif", 4u) != 0) {
         wm_free(data);
         strcpy(status_message, "Wallpaper image could not be loaded");
@@ -1831,6 +1870,7 @@ static moswm_file_icon_t icon_for_entry(uint32_t type, const char* name) {
         {".jpg", MOSWM_ICON_IMAGE}, {".ico", MOSWM_ICON_IMAGE},
         {".thm", MOSWM_ICON_IMAGE}, {".wav", MOSWM_ICON_AUDIO},
         {".mp3", MOSWM_ICON_AUDIO}, {".adi", MOSWM_ICON_AUDIO}, {".mp4", MOSWM_ICON_VIDEO},
+        {".vid", MOSWM_ICON_VIDEO}, {".img", MOSWM_ICON_IMAGE},
         {".txt", MOSWM_ICON_TEXT}, {".md", MOSWM_ICON_TEXT},
         {".log", MOSWM_ICON_TEXT}, {".otf", MOSWM_ICON_TEXT},
         {".ttf", MOSWM_ICON_TEXT}, {".font", MOSWM_ICON_TEXT},
@@ -2363,6 +2403,21 @@ static void open_file(const char* path, bool executable, bool in_files) {
         if ((int64_t)mos_syscall3(SYS_EXEC,
                 (uint64_t)(uintptr_t)path, 0, 0) < 0)
             open_note(in_files, "Unable to run this item", true);
+        return;
+    }
+    if (name_has_extension(name, ".vid") || name_has_extension(name, ".img")) {
+        bool video = name_has_extension(name, ".vid");
+        const char* app = video ? MOSDESK_VIDEO_PATH : MOSDESK_PHOTOS_PATH;
+        if (!fs_exists(app)) {
+            open_note(in_files, video ? "The video player is not installed"
+                                      : "The picture viewer is not installed", true);
+            return;
+        }
+        const char* arguments[1] = {path};
+        if ((int64_t)mos_syscall3(SYS_EXEC, (uint64_t)(uintptr_t)app,
+                (uint64_t)(uintptr_t)arguments, 1u) < 0)
+            open_note(in_files, video ? "Unable to open the video player"
+                                      : "Unable to open the picture viewer", true);
         return;
     }
     if (name_has_extension(name, ".adi")) {
