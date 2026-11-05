@@ -131,6 +131,15 @@ typedef struct {
     bool opaque;
     uint32_t icon_sum;
     uint32_t icon_pixels[SYSCALL_WINDOW_ICON_PIXELS];
+    /* The window as last listed, kept so it can still be drawn (as a
+     * closing "ghost") after its program has gone. */
+    syscall_window_info_t last_info;
+    bool last_focused;
+    /* An opening or restoring animation (ANIM_KIND_*), 0 for none. */
+    uint32_t anim_kind;
+    uint32_t anim_effect;
+    uint64_t anim_start;
+    uint32_t anim_duration;
 } cached_window_t;
 
 typedef struct {
@@ -328,6 +337,151 @@ static char cursor_cache_pack[SYSCALL_CURSOR_PACK_PATH_SIZE];
 static uint32_t hover_desktop_icon = UINT32_MAX;
 static uint32_t hover_taskbar = UINT32_MAX;
 static uint32_t hover_start_row = UINT32_MAX;
+
+/* ------------------------------------------------------------- animation
+ * Time for every animation comes from SYS_UPTIME, read once a frame. */
+#define ANIM_KIND_OPEN 1u
+#define ANIM_KIND_CLOSE 2u
+#define ANIM_KIND_MINIMIZE 3u
+#define ANIM_KIND_RESTORE 4u
+/* Progress and easing are fixed point: 0..ANIM_ONE. */
+#define ANIM_ONE 1024
+static uint64_t anim_now;
+
+static bool interface_animations(void) {
+    return desktop_settings.anim_interface != 0u;
+}
+
+/* `base_ms` at the normal speed, scaled for Settings > Animations > Speed. */
+static uint32_t anim_duration(uint32_t base_ms) {
+    if (desktop_settings.anim_speed == MOSDESK_ANIM_SPEED_SLOW)
+        return base_ms * 8u / 5u;
+    if (desktop_settings.anim_speed == MOSDESK_ANIM_SPEED_FAST)
+        return base_ms * 3u / 5u;
+    return base_ms;
+}
+
+/* 0..ANIM_ONE through an animation that started at `start`. */
+static int32_t anim_progress(uint64_t start, uint32_t duration) {
+    if (!duration || anim_now <= start) return anim_now > start ? ANIM_ONE : 0;
+    uint64_t elapsed = anim_now - start;
+    if (elapsed >= duration) return ANIM_ONE;
+    return (int32_t)(elapsed * ANIM_ONE / duration);
+}
+
+static int32_t ease_out(int32_t t) {          /* cubic */
+    int64_t u = ANIM_ONE - t;
+    return ANIM_ONE - (int32_t)(u * u * u / ((int64_t)ANIM_ONE * ANIM_ONE));
+}
+
+static int32_t ease_in(int32_t t) {           /* quadratic */
+    return (int32_t)((int64_t)t * t / ANIM_ONE);
+}
+
+static int32_t ease_in_out(int32_t t) {       /* smoothstep */
+    int64_t v = (int64_t)t * t * (3 * ANIM_ONE - 2 * t);
+    return (int32_t)(v / ((int64_t)ANIM_ONE * ANIM_ONE));
+}
+
+/* `t` mapped from [from, to] to [0, ANIM_ONE], clamped. */
+static int32_t anim_span(int32_t t, int32_t from, int32_t to) {
+    if (t <= from) return 0;
+    if (t >= to) return ANIM_ONE;
+    return (int32_t)((int64_t)(t - from) * ANIM_ONE / (to - from));
+}
+
+/* Hover highlights fade in and out instead of switching. Each frame
+ * update_hover() names what is under the pointer (hover_track) and
+ * hover_tick() moves every highlight towards its target; the drawing code
+ * asks hover_amount() how lit something is (0-255). */
+#define HOVER_SLOTS 12u
+#define HOVER_FADE_IN_MS 90u
+#define HOVER_FADE_OUT_MS 220u
+#define HOVER_KEY_TASKBAR (1ull << 60)
+#define HOVER_KEY_START_ROW (2ull << 60)
+#define HOVER_KEY_CAPTION (3ull << 60)
+#define HOVER_KEY_MENU (4ull << 60)
+typedef struct {
+    uint64_t key;               /* 0: free */
+    uint32_t level;             /* 0..ANIM_ONE */
+    bool target;
+    bool seen;                  /* named by hover_track this frame */
+    rect_t area;                /* what to repaint while it changes */
+} hover_slot_t;
+
+static hover_slot_t hover_slots[HOVER_SLOTS];
+static uint64_t hover_tick_ms;
+
+static void hover_track(uint64_t key, rect_t area) {
+    hover_slot_t* free_slot = NULL;
+    hover_slot_t* dimmest = NULL;
+    for (uint32_t i = 0; i < HOVER_SLOTS; i++) {
+        hover_slot_t* slot = &hover_slots[i];
+        if (slot->key == key) {
+            slot->seen = true;
+            slot->area = area;
+            return;
+        }
+        if (!slot->key && !free_slot) free_slot = slot;
+        if (slot->key && !slot->target &&
+            (!dimmest || slot->level < dimmest->level))
+            dimmest = slot;
+    }
+    hover_slot_t* slot = free_slot ? free_slot : dimmest;
+    if (!slot) return;
+    *slot = (hover_slot_t){.key = key, .seen = true, .area = area};
+}
+
+/* Keys carry where the item is, so an item that moves (a menu opened
+ * elsewhere, a scrolled list, a dragged window) starts a fresh highlight
+ * instead of carrying a fading one to a place that is not repainted. */
+static uint64_t caption_hover_key(const syscall_window_info_t* info,
+                                  uint32_t button) {
+    return HOVER_KEY_CAPTION | ((uint64_t)(info->id & 0x3FFFFFFu) << 34) |
+           ((uint64_t)((uint32_t)info->x & 0xFFFFu) << 18) |
+           ((uint64_t)((uint32_t)info->y & 0xFFFFu) << 2) | button;
+}
+
+static uint64_t positioned_hover_key(uint64_t kind, int32_t x, int32_t y,
+                                     uint32_t index) {
+    return kind | ((uint64_t)((uint32_t)x & 0xFFFFFu) << 36) |
+           ((uint64_t)((uint32_t)y & 0xFFFFFu) << 16) | (index & 0xFFFFu);
+}
+
+static uint32_t hover_amount(uint64_t key) {
+    for (uint32_t i = 0; i < HOVER_SLOTS; i++)
+        if (hover_slots[i].key == key)
+            return (uint32_t)(hover_slots[i].level * 255u / ANIM_ONE);
+    return 0u;
+}
+
+/* Scales the alpha of `color` by a hover amount. */
+static uint32_t hover_alpha(uint32_t color, uint32_t amount) {
+    return (((color >> 24) * amount / 255u) << 24) | (color & 0x00FFFFFFu);
+}
+
+/* Blends two colours, alpha included (amount 0-255). */
+static uint32_t hover_mix(uint32_t from, uint32_t to, uint32_t amount) {
+    uint32_t result = 0;
+    for (uint32_t shift = 0; shift < 32u; shift += 8u) {
+        uint32_t a = (from >> shift) & 255u, b = (to >> shift) & 255u;
+        result |= ((a * (255u - amount) + b * amount) / 255u) << shift;
+    }
+    return result;
+}
+
+static void start_open_animation(cached_window_t* entry);
+static bool start_close_animation(cached_window_t* entry);
+static void start_minimize_animation(const syscall_window_info_t* info,
+                                     cached_window_t* entry);
+static void start_restore_animation(cached_window_t* entry);
+#define POPUP_START 0u
+#define POPUP_SOUND 1u
+#define POPUP_NET 2u
+#define POPUP_CONTEXT 3u
+#define POPUP_COUNT 4u
+static void popup_layer_begin(uint32_t popup);
+static void popup_layer_end(uint32_t popup);
 
 /* Debug overlay (Settings > Debug): a frame-rate meter and a per-stage
  * stopwatch for the main loop. Nothing is counted or timed while both are
@@ -2594,6 +2748,14 @@ static void fill_rounded_rect_around(int32_t x, int32_t y, int32_t width,
         return;
     }
     for (int32_t row = 0; row < height; row++) {
+        /* Rows clear of the hole are drawn exactly as without one (the
+         * corners anti-aliased), so a window looks the same whether its
+         * content is opaque or not. */
+        bool in_hole = hole && y + row >= hole[1] && y + row < hole[3];
+        if (!in_hole && r <= AA_MAX_RADIUS) {
+            aa_fill_row(x, y, width, row, height, r, color);
+            continue;
+        }
         int32_t inset = 0;
         int32_t from_edge = row < r ? row : (row >= height - r ? height - 1 - row : r);
         if (from_edge < r) {
@@ -3456,6 +3618,7 @@ static cached_window_t* cache_for(uint32_t id) {
     for (uint32_t i = 0; i < MAX_WINDOWS; i++) {
         if (!cache[i].id) {
             cache[i].id = id;
+            start_open_animation(&cache[i]);
             return &cache[i];
         }
     }
@@ -3475,7 +3638,8 @@ static void remove_missing_cache(const syscall_window_info_t* windows,
             }
         }
         if (!found) {
-            wm_free(entry->pixels);
+            /* A closing animation takes over the pixels. */
+            if (!start_close_animation(entry)) wm_free(entry->pixels);
             memset(entry, 0, sizeof(*entry));
         }
     }
@@ -3570,8 +3734,12 @@ static bool set_window_mode(const syscall_window_info_t* info,
 
     if (mode != MODE_NORMAL && previous_mode == MODE_NORMAL)
         save_bounds(entry, info);
+    if (mode == MODE_MINIMIZED && previous_mode != MODE_MINIMIZED)
+        start_minimize_animation(info, entry);
     if (mos_window_set_flags(info->id, flags) != SYS_SUCCESS) return false;
     entry->last_mode = mode;
+    if (previous_mode == MODE_MINIMIZED && mode != MODE_MINIMIZED)
+        start_restore_animation(entry);
 
     if (mode == MODE_MAXIMIZED || mode == MODE_FULLSCREEN) {
         uint32_t work_height = mode == MODE_FULLSCREEN
@@ -3705,10 +3873,16 @@ static void composite_window(const syscall_window_info_t* info,
                             14u, window_focused ? 0x70FFFFFFu : 0x40FFFFFFu);
         fill_rect(x + 12, y - 2, outer_width - 24, 1,
                   window_focused ? 0x90FFFFFFu : 0x50FFFFFFu);
-        if (!filled)
-            fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT + 1,
-                      (int32_t)info->width, (int32_t)info->height,
-                      0xFF000000u | info->style.content_background);
+        if (!filled) {
+            /* A see-through window (easyui's Liquid look, say) has the
+             * glass behind its content too, not a flat colour. The rows
+             * by the rounded bottom corners are the frame's glass. */
+            int32_t top = y + (int32_t)TITLE_HEIGHT + 1;
+            int32_t rows = (int32_t)info->height - (int32_t)CORNER_RADIUS;
+            for (int32_t row = 0; row < rows; row++)
+                glass_span(x + 1, x + 1 + (int32_t)info->width, top + row,
+                           0xFF161A1Fu, window_focused ? 0x70u : 0x58u, 0u);
+        }
         fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT, outer_width - 2, 1,
                   0x28FFFFFFu);
     } else {
@@ -3894,13 +4068,14 @@ static void draw_chrome_liquid(const syscall_window_info_t* info,
     uint32_t hover = caption_hover_window == info->id
         ? caption_hover_button : 0u;
     const int32_t xs[3] = {min_x, max_x, close_x};
+    (void)hover;
     for (uint32_t i = 0; i < 3u; i++) {
-        bool lit = hover == i + 1u;
-        uint32_t fill = lit ? (i == 2u ? 0xFFE5484Du : 0x58FFFFFFu)
-                            : (focused ? 0x26FFFFFFu : 0x16FFFFFFu);
+        uint32_t lit = hover_amount(caption_hover_key(info, i + 1u));
+        uint32_t fill = hover_mix(focused ? 0x26FFFFFFu : 0x16FFFFFFu,
+                                  i == 2u ? 0xFFE5484Du : 0x58FFFFFFu, lit);
         fill_rounded_rect(xs[i], by, 18, 18, 9, fill);
         stroke_rounded_rect(xs[i], by, 18, 18, 9u,
-                            lit ? 0x60FFFFFFu : 0x30FFFFFFu);
+                            hover_mix(0x30FFFFFFu, 0x60FFFFFFu, lit));
     }
     uint32_t glyph = focused ? 0xFFF4F7FAu : 0xB0E4EAEFu;
     fill_rect(min_x + 5, by + 9, 8, 2, glyph);
@@ -3946,22 +4121,34 @@ static void draw_chrome_text(const syscall_window_info_t* info,
     wm_text(text_x, y + ((int32_t)TITLE_HEIGHT - 16) / 2, title,
             title_color, 0, 2);
 
-    /* Round window buttons with crisp glyphs. */
-    fill_rounded_rect(close_x, by, 18, 18, 9, opaque(info->style.close_button));
+    /* Round window buttons with crisp glyphs. Hovered, close turns red
+     * and the others light up. */
+    uint32_t close_lit = hover_amount(caption_hover_key(info, 3u));
+    uint32_t max_lit = hover_amount(caption_hover_key(info, 2u));
+    uint32_t min_lit = hover_amount(caption_hover_key(info, 1u));
+    fill_rounded_rect(close_x, by, 18, 18, 9,
+                      mix_color(opaque(info->style.close_button), 0xFFE5484Du,
+                                close_lit));
+    uint32_t close_icon = mix_color(opaque(info->style.close_icon),
+                                    0xFFFFFFFFu, close_lit);
     draw_wallpaper_line(close_x + 6, by + 6, close_x + 11, by + 11,
-                        opaque(info->style.close_icon));
+                        close_icon);
     draw_wallpaper_line(close_x + 7, by + 6, close_x + 12, by + 11,
-                        opaque(info->style.close_icon));
+                        close_icon);
     draw_wallpaper_line(close_x + 11, by + 6, close_x + 6, by + 11,
-                        opaque(info->style.close_icon));
+                        close_icon);
     draw_wallpaper_line(close_x + 12, by + 6, close_x + 7, by + 11,
-                        opaque(info->style.close_icon));
+                        close_icon);
     fill_rounded_rect(max_x, by, 18, 18, 9,
-                      opaque(info->style.maximize_button));
+                      mix_color(opaque(info->style.maximize_button),
+                                mix_color(opaque(info->style.maximize_button),
+                                          0xFFFFFFFFu, 70u), max_lit));
     stroke_rect(max_x + 5, by + 5, 8, 8, opaque(info->style.maximize_icon));
     fill_rect(max_x + 5, by + 5, 8, 2, opaque(info->style.maximize_icon));
     fill_rounded_rect(min_x, by, 18, 18, 9,
-                      opaque(info->style.minimize_button));
+                      mix_color(opaque(info->style.minimize_button),
+                                mix_color(opaque(info->style.minimize_button),
+                                          0xFFFFFFFFu, 70u), min_lit));
     fill_rect(min_x + 5, by + 11, 8, 2, opaque(info->style.minimize_icon));
 }
 
@@ -5067,8 +5254,9 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         fill_rect(0, top, width, 1, 0xA0FFFFFFu);
         fill_rect(0, top + 1, width, 1, 0x40000000u);
         /* The start orb. */
-        bool lit = start_menu_open || hover_taskbar == 0u;
-        uint32_t orb = lit ? mix_color(accent, 0xFFFFFFFFu, 60u) : accent;
+        uint32_t lit = start_menu_open ? 255u
+                                       : hover_amount(HOVER_KEY_TASKBAR);
+        uint32_t orb = mix_color(accent, 0xFFFFFFFFu, lit * 60u / 255u);
         fill_rounded_rect(3, top + 3, 42, 42, 21u, 0x70000000u);
         for (int32_t ring = 0; ring < 19; ring++) {
             /* Darker at the rim, brighter towards the middle. */
@@ -5089,10 +5277,11 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                           22u, 0x30000000u);
         liquid_glass(6, top + 3, width - 12, (int32_t)TASKBAR_HEIGHT - 6, 21,
                      0xFF14181Cu, 0x88u);
-        bool lit = start_menu_open || hover_taskbar == 0u;
+        uint32_t lit = start_menu_open ? 255u
+                                       : hover_amount(HOVER_KEY_TASKBAR);
         fill_rounded_rect(9, top + 6, 36, 36, 18u,
-                          lit ? (0xC0000000u | (accent & 0xFFFFFFu))
-                              : 0x22FFFFFFu);
+                          hover_mix(0x22FFFFFFu,
+                                    0xC0000000u | (accent & 0xFFFFFFu), lit));
         stroke_rounded_rect(9, top + 6, 36, 36, 18u, 0x40FFFFFFu);
         draw_mini_logo(15, top + 12, 0xFFF4F7FAu);
     } else {
@@ -5101,10 +5290,13 @@ static void draw_taskbar(const syscall_window_info_t* windows,
     fill_rect(0, top, width, 1, 0x2CFFFFFFu);
 
     /* Application launcher button. */
-    if (start_menu_open || hover_taskbar == 0u)
+    if (start_menu_open)
         fill_rounded_rect(4, top + 4, 40, 40, 8,
-                          start_menu_open ? (0x66000000u | (accent & 0xFFFFFFu))
-                                          : 0x26FFFFFFu);
+                          0x66000000u | (accent & 0xFFFFFFu));
+    else if (hover_amount(HOVER_KEY_TASKBAR))
+        fill_rounded_rect(4, top + 4, 40, 40, 8,
+                          hover_alpha(0x26FFFFFFu,
+                                      hover_amount(HOVER_KEY_TASKBAR)));
     draw_mini_logo(12, top + 12, 0xFFEAF2F8u);
     if (start_menu_open) fill_rect(8, top + 45, 32, 2, accent);
     }
@@ -5116,17 +5308,17 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         const syscall_window_info_t* info = &windows[i];
         bool focused = info->id == focused_id;
         bool minimized = (info->flags & SYSCALL_WINDOW_MINIMIZED) != 0;
+        uint32_t hover = hover_amount(HOVER_KEY_TASKBAR | (i + 1u));
         if (aero) {
             /* Windows 7 task buttons: framed glass, brighter when active. */
-            bool hovered = hover_taskbar == i + 1u;
-            if (focused || hovered || !minimized) {
+            if (focused || hover || !minimized) {
                 fill_gradient_rounded(x, top + 4, 176, 40, 3u,
                                       focused ? 0x70FFFFFFu
-                                              : hovered ? 0x50FFFFFFu
-                                                        : 0x28FFFFFFu,
+                                              : hover_mix(0x28FFFFFFu,
+                                                          0x50FFFFFFu, hover),
                                       focused ? 0x30FFFFFFu
-                                              : hovered ? 0x20FFFFFFu
-                                                        : 0x08FFFFFFu);
+                                              : hover_mix(0x08FFFFFFu,
+                                                          0x20FFFFFFu, hover));
                 fill_rect(x + 2, top + 24, 172, 18,
                           focused ? 0x30000000u : 0x18000000u);
                 stroke_rounded_rect(x, top + 4, 176, 40, 3u, 0xB0101820u);
@@ -5134,12 +5326,13 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                                     focused ? 0x90FFFFFFu : 0x50FFFFFFu);
             }
         } else if (liquid_style()) {
-            bool hovered = hover_taskbar == i + 1u;
-            if (focused || hovered) {
+            if (focused || hover) {
                 fill_rounded_rect(x, top + 7, 176, 34, 17u,
-                                  focused ? 0x30FFFFFFu : 0x1CFFFFFFu);
+                                  focused ? 0x30FFFFFFu
+                                          : hover_alpha(0x1CFFFFFFu, hover));
                 stroke_rounded_rect(x, top + 7, 176, 34, 17u,
-                                    focused ? 0x48FFFFFFu : 0x24FFFFFFu);
+                                    focused ? 0x48FFFFFFu
+                                            : hover_alpha(0x24FFFFFFu, hover));
             }
             if (!minimized)
                 fill_rounded_rect(x + 84, top + 40, 8, 3, 1u,
@@ -5147,8 +5340,9 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         } else {
         if (focused)
             fill_rounded_rect(x, top + 5, 176, 38, 6, 0x38FFFFFFu);
-        else if (hover_taskbar == i + 1u)
-            fill_rounded_rect(x, top + 5, 176, 38, 6, 0x24FFFFFFu);
+        else if (hover)
+            fill_rounded_rect(x, top + 5, 176, 38, 6,
+                              hover_alpha(0x24FFFFFFu, hover));
         if (focused)
             fill_rect(x + 6, top + 44, 164, 3, accent);
         else
@@ -5198,9 +5392,14 @@ static void draw_taskbar(const syscall_window_info_t* windows,
 
     draw_net_icon(aero);
     draw_sound_icon(aero);
+    popup_layer_begin(POPUP_NET);
     draw_net_menu(aero);
+    popup_layer_end(POPUP_NET);
+    popup_layer_begin(POPUP_SOUND);
     draw_sound_menu(aero);
+    popup_layer_end(POPUP_SOUND);
 
+    popup_layer_begin(POPUP_START);
     if (start_menu_open) {
         /* Kickoff-style launcher: header, system entries, applications. */
         int32_t mx, my, mw, mh;
@@ -5275,14 +5474,19 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                 fill_rect(mx + 34, hy + 13, mw - 52, 1,
                           aero ? 0xFFC5D3E0u : 0xFF353C42u);
             }
-            if (hover_start_row == row && aero) {
+            uint32_t row_hover = hover_amount(positioned_hover_key(
+                HOVER_KEY_START_ROW, 0, launcher_scroll, row));
+            if (row_hover && aero) {
                 fill_gradient_rounded(mx + 12, row_y, mw - 24, 36, 3u,
-                                      0xFFF2F8FEu, 0xFFC9E0F9u);
+                                      hover_alpha(0xFFF2F8FEu, row_hover),
+                                      hover_alpha(0xFFC9E0F9u, row_hover));
                 stroke_rounded_rect(mx + 12, row_y, mw - 24, 36, 3u,
-                                    0xFF7DA2CEu);
-            } else if (hover_start_row == row)
+                                    hover_alpha(0xFF7DA2CEu, row_hover));
+            } else if (row_hover)
                 fill_rounded_rect(mx + 8, row_y, mw - 16, 36, 6,
-                                  0x55000000u | (accent & 0xFFFFFFu));
+                                  hover_alpha(0x55000000u |
+                                              (accent & 0xFFFFFFu),
+                                              row_hover));
             if (item->kind == LAUNCHER_APP) {
                 const desktop_app_t* app = &desktop_apps[item->app];
                 if (app->has_icon)
@@ -5324,6 +5528,7 @@ static void draw_taskbar(const syscall_window_info_t* windows,
         wm_text(mx + 18, my + mh - 22, hint,
                 aero ? 0xFFF2F6F9u : 0xFF8A9AA6u, aero ? 0x90000000u : 0u, 1);
     }
+    popup_layer_end(POPUP_START);
     if (status_message[0])
         wm_text(8, 8, status_message, 0xFFFFE696u, 0xAA000000u, 2);
 }
@@ -5472,16 +5677,22 @@ static void draw_context_menu(void) {
             }
             y += 9;
         }
-        if (menu_hover == i && aero) {
+        uint32_t item_hover = hover_amount(positioned_hover_key(
+            HOVER_KEY_MENU, menu_x, menu_y, i));
+        if (item_hover && aero) {
             fill_gradient_rounded(menu_x + 3, y, MENU_WIDTH - 6,
-                                  MENU_ITEM_HEIGHT, 3u, 0xFFF2F8FEu,
-                                  0xFFDCEBFCu);
+                                  MENU_ITEM_HEIGHT, 3u,
+                                  hover_alpha(0xFFF2F8FEu, item_hover),
+                                  hover_alpha(0xFFDCEBFCu, item_hover));
             stroke_rounded_rect(menu_x + 3, y, MENU_WIDTH - 6,
-                                MENU_ITEM_HEIGHT, 3u, 0xFFAECFF7u);
-        } else if (menu_hover == i) {
+                                MENU_ITEM_HEIGHT, 3u,
+                                hover_alpha(0xFFAECFF7u, item_hover));
+        } else if (item_hover) {
             fill_rounded_rect(menu_x + 5, y, MENU_WIDTH - 10,
                               MENU_ITEM_HEIGHT, 5,
-                              0x66000000u | (accent & 0x00FFFFFFu));
+                              hover_alpha(0x66000000u |
+                                          (accent & 0x00FFFFFFu),
+                                          item_hover));
         }
         wm_icon(menu_x + 8 + (aero ? 0 : 5), y + 6, item->icon, 18u);
         wm_text(menu_x + 42, y + 10, item->label,
@@ -6733,6 +6944,10 @@ static bool window_shown(const syscall_window_info_t* info) {
            !(info->flags & SYSCALL_WINDOW_MINIMIZED);
 }
 
+static void draw_window_maybe_animated(const syscall_window_info_t* info,
+                                       cached_window_t* entry);
+static void draw_ghosts(void);
+
 /* Paints the scene into the canvas, within the current clip. */
 static void draw_scene(const syscall_window_info_t* windows, uint64_t count) {
     if (auth_state != AUTH_NONE) {
@@ -6749,12 +6964,15 @@ static void draw_scene(const syscall_window_info_t* windows, uint64_t count) {
                     continue;
                 if (!window_shown(info)) continue;
                 cached_window_t* entry = cache_for(info->id);
-                if (entry) composite_window(info, entry);
+                if (entry) draw_window_maybe_animated(info, entry);
             }
         }
+        draw_ghosts();
         debug_lap(PROFILE_WINDOW_DRAW);
         draw_taskbar(windows, count);
+        popup_layer_begin(POPUP_CONTEXT);
         draw_context_menu();
+        popup_layer_end(POPUP_CONTEXT);
         draw_dialog();
     }
     draw_debug_overlay();
@@ -6813,14 +7031,869 @@ static void damage_add(rect_t area) {
     damage[damage_count++] = area;
 }
 
-/* A window with its title bar, border and shadow. */
+/* Merges damage rectangles until none overlap, so an animation's area is
+ * always drawn in a single pass (its effects read the whole of it). */
+static void damage_merge_overlaps(void) {
+    bool merged = true;
+    while (merged) {
+        merged = false;
+        for (uint32_t i = 0; i < damage_count && !merged; i++) {
+            for (uint32_t j = i + 1u; j < damage_count; j++) {
+                rect_t* a = &damage[i];
+                const rect_t* b = &damage[j];
+                if (b->left >= a->right || b->right <= a->left ||
+                    b->top >= a->bottom || b->bottom <= a->top)
+                    continue;
+                if (b->left < a->left) a->left = b->left;
+                if (b->top < a->top) a->top = b->top;
+                if (b->right > a->right) a->right = b->right;
+                if (b->bottom > a->bottom) a->bottom = b->bottom;
+                damage[j] = damage[--damage_count];
+                merged = true;
+                break;
+            }
+        }
+    }
+}
+
+/* A window with its title bar, border and shadow. The Aero and Liquid
+ * shadows reach two pixels further down than the others. */
 static rect_t window_outer_rect(int32_t x, int32_t y, uint32_t width,
                                 uint32_t height) {
     return (rect_t){
         x - WINDOW_SHADOW_MARGIN, y - WINDOW_SHADOW_MARGIN,
         x + (int32_t)width + 2 + WINDOW_SHADOW_MARGIN,
-        y + (int32_t)height + (int32_t)TITLE_HEIGHT + 2 + WINDOW_SHADOW_MARGIN
+        y + (int32_t)height + (int32_t)TITLE_HEIGHT + 4 + WINDOW_SHADOW_MARGIN
     };
+}
+
+/* ------------------------------------------------------ window animations
+ *
+ * An animated window is drawn the normal way, between a copy of what was
+ * under it and a copy of the result; the effect then mixes the two pixel by
+ * pixel (moving, fading or replacing them). Because every effect works
+ * from those two copies, it looks right with every window style, glass
+ * included. While anything animates, its whole area is repainted each frame
+ * and the damage rectangles are merged so that area is drawn in one pass.
+ *
+ * A window that closes or minimizes is gone from the window list at once,
+ * so its last frame is kept as a "ghost" and animated from that. */
+#define MAX_GHOSTS 6u
+#define ANIM_DAMAGE_MAX 16u
+#define MATRIX_COLUMN 10
+#define MATRIX_ROW 14
+#define MATRIX_TRAIL 120
+#define KATANA_CUT 200          /* progress when the slash is complete */
+
+typedef struct {
+    bool active;
+    cached_window_t window;     /* owns window.pixels */
+    uint32_t kind;
+    uint32_t effect;
+    uint64_t start;
+    uint32_t duration;
+} ghost_t;
+
+typedef struct {
+    int32_t left, top, right, bottom, radius;
+} anim_body_t;
+
+typedef struct {
+    rect_t area;                /* the part being drawn now */
+    int32_t width;
+    const uint32_t* under;
+    const uint32_t* over;
+    anim_body_t body;
+    int32_t t;                  /* progress, 0..ANIM_ONE */
+} anim_ctx_t;
+
+typedef struct {
+    bool open;
+    uint64_t start;
+} popup_anim_t;
+
+static ghost_t ghosts[MAX_GHOSTS];
+static uint32_t* anim_under;
+static uint32_t* anim_over;
+static int32_t* anim_columns;
+static size_t anim_buffer_pixels;
+static popup_anim_t popup_anims[POPUP_COUNT];
+/* What animated last frame, repainted once more when it stops. */
+static rect_t anim_damage[ANIM_DAMAGE_MAX];
+static uint32_t anim_damage_count;
+static rect_t anim_damage_previous[ANIM_DAMAGE_MAX];
+static uint32_t anim_damage_previous_count;
+static bool anim_damage_overflow;
+
+static inline uint32_t anim_hash(uint32_t v) {
+    v ^= v >> 16;
+    v *= 0x7FEB352Du;
+    v ^= v >> 15;
+    v *= 0x846CA68Bu;
+    v ^= v >> 16;
+    return v;
+}
+
+static uint32_t window_open_duration(uint32_t effect) {
+    if (effect == MOSDESK_ANIM_OPEN_BLOCKS) return anim_duration(520u);
+    if (effect == MOSDESK_ANIM_OPEN_MATRIX) return anim_duration(780u);
+    return anim_duration(240u);
+}
+
+static uint32_t window_close_duration(uint32_t effect) {
+    if (effect == MOSDESK_ANIM_CLOSE_KATANA) return anim_duration(720u);
+    if (effect == MOSDESK_ANIM_CLOSE_MATRIX) return anim_duration(760u);
+    return anim_duration(220u);
+}
+
+/* A window has just appeared. */
+static void start_open_animation(cached_window_t* entry) {
+    uint32_t effect = desktop_settings.anim_open;
+    if (!entry || effect == MOSDESK_ANIM_NONE || auth_state != AUTH_NONE)
+        return;
+    entry->anim_kind = ANIM_KIND_OPEN;
+    entry->anim_effect = effect;
+    entry->anim_start = anim_now;
+    entry->anim_duration = window_open_duration(effect);
+}
+
+static ghost_t* ghost_slot(void) {
+    ghost_t* oldest = &ghosts[0];
+    for (uint32_t i = 0; i < MAX_GHOSTS; i++) {
+        if (!ghosts[i].active) return &ghosts[i];
+        if (ghosts[i].start < oldest->start) oldest = &ghosts[i];
+    }
+    wm_free(oldest->window.pixels);
+    memset(oldest, 0, sizeof(*oldest));
+    return oldest;
+}
+
+static bool window_shown(const syscall_window_info_t* info);
+
+/* A window has gone from the list. Takes over its pixels and returns true
+ * when it is animated away; otherwise the caller frees them. */
+static bool start_close_animation(cached_window_t* entry) {
+    uint32_t effect = desktop_settings.anim_close;
+    if (effect == MOSDESK_ANIM_NONE || auth_state != AUTH_NONE ||
+        !entry->pixels || !entry->last_info.id ||
+        !window_shown(&entry->last_info) ||
+        entry->width != entry->last_info.width ||
+        entry->height != entry->last_info.height)
+        return false;
+    ghost_t* ghost = ghost_slot();
+    ghost->active = true;
+    ghost->window = *entry;
+    ghost->kind = ANIM_KIND_CLOSE;
+    ghost->effect = effect;
+    ghost->start = anim_now;
+    ghost->duration = window_close_duration(effect);
+    return true;
+}
+
+/* The window shrinks into the panel; it keeps its own pixels. */
+static void start_minimize_animation(const syscall_window_info_t* info,
+                                     cached_window_t* entry) {
+    if (!interface_animations() || auth_state != AUTH_NONE || !entry ||
+        !entry->pixels || !window_shown(info) ||
+        entry->width != info->width || entry->height != info->height)
+        return;
+    size_t bytes = (size_t)entry->width * entry->height * sizeof(uint32_t);
+    uint32_t* copy = wm_malloc(bytes);
+    if (!copy) return;
+    memcpy(copy, entry->pixels, bytes);
+    ghost_t* ghost = ghost_slot();
+    ghost->active = true;
+    ghost->window = *entry;
+    ghost->window.pixels = copy;
+    ghost->window.last_info = *info;
+    ghost->window.last_focused = info->id == focused_id;
+    ghost->kind = ANIM_KIND_MINIMIZE;
+    ghost->effect = 0;
+    ghost->start = anim_now;
+    ghost->duration = anim_duration(260u);
+    entry->anim_kind = 0;
+}
+
+static void start_restore_animation(cached_window_t* entry) {
+    if (!interface_animations() || auth_state != AUTH_NONE || !entry) return;
+    entry->anim_kind = ANIM_KIND_RESTORE;
+    entry->anim_effect = 0;
+    entry->anim_start = anim_now;
+    entry->anim_duration = anim_duration(260u);
+}
+
+/* The window's frame (title bar and border) with its corner radius: what
+ * moves and fades. Shadows are left out and redrawn where needed. */
+static anim_body_t window_body(const syscall_window_info_t* info) {
+    int32_t x = (int32_t)info->x;
+    int32_t y = (int32_t)info->y;
+    int32_t right = x + (int32_t)info->width + 2;
+    int32_t bottom = y + (int32_t)info->height + (int32_t)TITLE_HEIGHT + 2;
+    if (ui_style == MOSDESK_UI_STYLE_AERO)
+        return (anim_body_t){x - 4, y - 4, right + 4, bottom + 4, 8};
+    if (liquid_style())
+        return (anim_body_t){x - 2, y - 2, right + 2, bottom + 2, 14};
+    return (anim_body_t){x, y, right, bottom, (int32_t)CORNER_RADIUS};
+}
+
+static inline bool body_contains(const anim_body_t* body, int32_t px,
+                                 int32_t py) {
+    if (px < body->left || py < body->top || px >= body->right ||
+        py >= body->bottom)
+        return false;
+    int32_t r = body->radius;
+    int32_t cx = px < body->left + r ? body->left + r
+        : px >= body->right - r ? body->right - r - 1 : px;
+    int32_t cy = py < body->top + r ? body->top + r
+        : py >= body->bottom - r ? body->bottom - r - 1 : py;
+    if (cx == px || cy == py) return true;
+    int32_t dx = px - cx;
+    int32_t dy = py - cy;
+    return dx * dx + dy * dy <= r * r;
+}
+
+/* Everything an animation of this window can touch. */
+static rect_t window_anim_area(const syscall_window_info_t* info,
+                               uint32_t kind, uint32_t effect) {
+    rect_t area = window_outer_rect((int32_t)info->x, (int32_t)info->y,
+                                    info->width, info->height);
+    area.bottom += 4;
+    if (kind == ANIM_KIND_CLOSE && effect == MOSDESK_ANIM_CLOSE_KATANA) {
+        area.left -= 60;
+        area.right += 60;
+        area.top -= 30;
+        area.bottom += 260;
+    } else if (kind == ANIM_KIND_MINIMIZE || kind == ANIM_KIND_RESTORE) {
+        area.bottom = (int32_t)display.height;
+    }
+    return area;
+}
+
+static bool anim_buffers(size_t pixels) {
+    if (pixels <= anim_buffer_pixels && anim_columns) return true;
+    wm_free(anim_under);
+    wm_free(anim_over);
+    anim_under = wm_malloc(pixels * sizeof(uint32_t));
+    anim_over = wm_malloc(pixels * sizeof(uint32_t));
+    if (!anim_columns)
+        anim_columns = wm_malloc((size_t)display.width * sizeof(int32_t));
+    if (!anim_under || !anim_over || !anim_columns) {
+        wm_free(anim_under);
+        wm_free(anim_over);
+        anim_under = anim_over = NULL;
+        anim_buffer_pixels = 0;
+        return false;
+    }
+    anim_buffer_pixels = pixels;
+    return true;
+}
+
+static void anim_copy_out(uint32_t* target, rect_t area) {
+    int32_t width = area.right - area.left;
+    for (int32_t y = area.top; y < area.bottom; y++)
+        copy_pixels(target + (size_t)(y - area.top) * (size_t)width,
+                    canvas + (size_t)y * display.width + area.left,
+                    (size_t)width);
+}
+
+/* `area` limited to the screen and to what may be drawn now. */
+static bool anim_visible_area(rect_t* area) {
+    rect_t bounds = draw_bounds();
+    if (area->left < bounds.left) area->left = bounds.left;
+    if (area->top < bounds.top) area->top = bounds.top;
+    if (area->right > bounds.right) area->right = bounds.right;
+    if (area->bottom > bounds.bottom) area->bottom = bounds.bottom;
+    return area->left < area->right && area->top < area->bottom;
+}
+
+static inline uint32_t* ctx_target(const anim_ctx_t* c, int32_t px,
+                                   int32_t py) {
+    return canvas + (size_t)py * display.width + px;
+}
+
+static inline uint32_t ctx_under(const anim_ctx_t* c, int32_t px,
+                                 int32_t py) {
+    return c->under[(size_t)(py - c->area.top) * (size_t)c->width +
+                    (size_t)(px - c->area.left)];
+}
+
+/* The drawn window at (qx, qy), if that point was drawn this pass. */
+static inline bool ctx_over(const anim_ctx_t* c, int32_t qx, int32_t qy,
+                            uint32_t* color) {
+    if (qx < c->area.left || qy < c->area.top || qx >= c->area.right ||
+        qy >= c->area.bottom)
+        return false;
+    *color = c->over[(size_t)(qy - c->area.top) * (size_t)c->width +
+                     (size_t)(qx - c->area.left)];
+    return true;
+}
+
+static inline uint32_t clamp255(int32_t value) {
+    return value < 0 ? 0u : value > 255 ? 255u : (uint32_t)value;
+}
+
+/* The window scaled by `scale` (ANIM_ONE = full size) about its centre,
+ * moved by (move_x, move_y) and faded to `alpha`, with a soft shadow. */
+static void effect_transform(const anim_ctx_t* c, int32_t scale,
+                             int32_t move_x, int32_t move_y,
+                             uint32_t alpha) {
+    if (scale < 16) scale = 16;
+    int32_t cx = (c->body.left + c->body.right) / 2;
+    int32_t cy = (c->body.top + c->body.bottom) / 2;
+    for (int32_t px = c->area.left; px < c->area.right; px++)
+        anim_columns[px - c->area.left] =
+            cx + (int32_t)((int64_t)(px - cx - move_x) * ANIM_ONE / scale);
+    const int32_t shadow = 12;
+    for (int32_t py = c->area.top; py < c->area.bottom; py++) {
+        int32_t qy = cy + (int32_t)((int64_t)(py - cy - move_y) * ANIM_ONE /
+                                    scale);
+        int32_t outside_y = qy < c->body.top ? c->body.top - qy
+            : qy >= c->body.bottom ? qy - c->body.bottom + 1 : 0;
+        for (int32_t px = c->area.left; px < c->area.right; px++) {
+            int32_t qx = anim_columns[px - c->area.left];
+            uint32_t under = ctx_under(c, px, py);
+            uint32_t color;
+            uint32_t* target = ctx_target(c, px, py);
+            if (body_contains(&c->body, qx, qy) && ctx_over(c, qx, qy, &color)) {
+                *target = mix_color(under, color, alpha);
+                continue;
+            }
+            /* Shadow: darker the closer to the (scaled) frame. */
+            int32_t outside_x = qx < c->body.left ? c->body.left - qx
+                : qx >= c->body.right ? qx - c->body.right + 1 : 0;
+            int32_t d = (outside_x > outside_y ? outside_x : outside_y) *
+                        scale / ANIM_ONE;
+            if (d >= shadow) {
+                *target = under;
+                continue;
+            }
+            uint32_t dark = (uint32_t)((shadow - d) * (shadow - d)) * 70u /
+                            (uint32_t)(shadow * shadow);
+            *target = mix_color(under, 0xFF000000u, dark * alpha / 255u);
+        }
+    }
+}
+
+/* Opening: the window builds up out of square blocks, in a sweep from the
+ * top left, each block growing from its centre with an accent glow. */
+static void effect_blocks(const anim_ctx_t* c) {
+    const int32_t block = 28;
+    int32_t width = c->body.right - c->body.left;
+    int32_t height = c->body.bottom - c->body.top;
+    int32_t columns = (width + block - 1) / block;
+    int32_t rows = (height + block - 1) / block;
+    uint32_t glow = mix_color(0xFF000000u | accent_color, 0xFFFFFFFFu, 110u);
+    uint32_t edge_alpha = clamp255(ease_out(c->t) * 255 / ANIM_ONE);
+    for (int32_t py = c->area.top; py < c->area.bottom; py++) {
+        int32_t row = (py - c->body.top) / block;
+        for (int32_t px = c->area.left; px < c->area.right; px++) {
+            uint32_t under = ctx_under(c, px, py);
+            uint32_t color;
+            uint32_t* target = ctx_target(c, px, py);
+            if (!ctx_over(c, px, py, &color)) continue;
+            if (!body_contains(&c->body, px, py)) {
+                *target = mix_color(under, color, edge_alpha);
+                continue;
+            }
+            int32_t column = (px - c->body.left) / block;
+            int32_t delay = (column + row) * 560 / (columns + rows) +
+                (int32_t)(anim_hash((uint32_t)(column * 131 + row * 977)) %
+                          160u);
+            int32_t local = ease_out(anim_span(c->t, delay, delay + 300));
+            int32_t half = local * (block / 2 + 1) / ANIM_ONE;
+            int32_t lx = px - c->body.left - column * block - block / 2;
+            int32_t ly = py - c->body.top - row * block - block / 2;
+            if (lx < -half || lx >= half || ly < -half || ly >= half) {
+                *target = under;
+                continue;
+            }
+            color = mix_color(color, glow,
+                              (uint32_t)((ANIM_ONE - local) * 200 / ANIM_ONE));
+            *target = mix_color(under, color,
+                                clamp255(90 + local * 165 / ANIM_ONE));
+        }
+    }
+}
+
+/* One "character" of the digital rain: a 5 x 5 pattern in a cell, which
+ * flickers to a new one now and then. */
+static inline bool matrix_glyph(int32_t column, int32_t row, int32_t lx,
+                                int32_t ly) {
+    if (lx < 2 || lx > 6 || ly < 2 || ly > 11) return false;
+    uint32_t seed = (uint32_t)column * 0x9E3779B1u ^
+                    (uint32_t)row * 0x85EBCA77u;
+    uint32_t tick = (uint32_t)(anim_now / 110u) + anim_hash(seed) % 7u;
+    uint32_t bits = anim_hash(seed ^ (tick / 3u) * 0xC2B2AE3Du);
+    return (bits >> ((uint32_t)(lx - 2) + 5u * (uint32_t)((ly - 2) / 2))) & 1u;
+}
+
+/* The window in shades of green, as if made of the rain. */
+static inline uint32_t matrix_tint(uint32_t color, uint32_t amount) {
+    uint32_t r = (color >> 16) & 255u, g = (color >> 8) & 255u, b = color & 255u;
+    uint32_t luma = (r * 54u + g * 183u + b * 19u) >> 8;
+    uint32_t green = 0xFF000000u | ((luma / 6u) << 16) |
+                     ((40u + luma * 215u / 255u) << 8) | (luma / 3u);
+    return mix_color(color, green, amount);
+}
+
+/* Opening: columns of green characters run down the window, and the
+ * window forms behind them. */
+static void effect_matrix_in(const anim_ctx_t* c) {
+    int32_t height = c->body.bottom - c->body.top;
+    uint32_t edge_alpha = clamp255(ease_out(c->t) * 255 / ANIM_ONE);
+    int32_t settle = ANIM_ONE - anim_span(c->t, 880, ANIM_ONE);
+    for (int32_t px = c->area.left; px < c->area.right; px++) {
+        int32_t column = (px - c->body.left) / MATRIX_COLUMN;
+        uint32_t h = anim_hash((uint32_t)column * 2654435761u + 17u);
+        int32_t delay = (int32_t)(h % 260u);
+        int32_t run = 600 + (int32_t)((h >> 9) % 140u);
+        anim_columns[px - c->area.left] =
+            anim_span(c->t, delay, delay + run) * (height + MATRIX_TRAIL) /
+            ANIM_ONE;
+    }
+    for (int32_t py = c->area.top; py < c->area.bottom; py++) {
+        int32_t y = py - c->body.top;
+        for (int32_t px = c->area.left; px < c->area.right; px++) {
+            uint32_t under = ctx_under(c, px, py);
+            uint32_t color;
+            uint32_t* target = ctx_target(c, px, py);
+            if (!ctx_over(c, px, py, &color)) continue;
+            if (!body_contains(&c->body, px, py)) {
+                *target = mix_color(under, color, edge_alpha);
+                continue;
+            }
+            int32_t dist = anim_columns[px - c->area.left] - y;
+            if (dist < 0) {
+                *target = under;
+                continue;
+            }
+            if (dist >= MATRIX_TRAIL) {
+                uint32_t tint = (uint32_t)((ANIM_ONE -
+                    anim_span(dist, MATRIX_TRAIL, MATRIX_TRAIL + 160)) *
+                    150 / ANIM_ONE) * (uint32_t)settle / ANIM_ONE;
+                *target = matrix_tint(color, tint);
+                continue;
+            }
+            uint32_t k = (uint32_t)(dist * 255 / MATRIX_TRAIL);
+            uint32_t base = mix_color(mix_color(under, 0xFF020A04u, 140u),
+                                      matrix_tint(color, 230u), k);
+            int32_t column = (px - c->body.left) / MATRIX_COLUMN;
+            if (matrix_glyph(column, y / MATRIX_ROW,
+                             (px - c->body.left) % MATRIX_COLUMN,
+                             y % MATRIX_ROW)) {
+                uint32_t glyph = dist < MATRIX_ROW ? 0xFFE0FFE8u
+                                                   : 0xFF3CFF7Cu;
+                base = mix_color(base, glyph, 255u - k * 3u / 4u);
+            }
+            *target = base;
+        }
+    }
+}
+
+/* Closing: the window turns green, then dissolves into rain that drains
+ * down and away. */
+static void effect_matrix_out(const anim_ctx_t* c) {
+    int32_t height = c->body.bottom - c->body.top;
+    uint32_t tint = (uint32_t)(anim_span(c->t, 0, 300) * 140 / ANIM_ONE);
+    uint32_t edge_alpha = clamp255(255 - ease_in(c->t) * 255 / ANIM_ONE);
+    for (int32_t px = c->area.left; px < c->area.right; px++) {
+        int32_t column = (px - c->body.left) / MATRIX_COLUMN;
+        uint32_t h = anim_hash((uint32_t)column * 2246822519u + 5u);
+        int32_t delay = 120 + (int32_t)(h % 240u);
+        int32_t run = 560 + (int32_t)((h >> 9) % 100u);
+        anim_columns[px - c->area.left] =
+            ease_in(anim_span(c->t, delay, delay + run)) *
+            (height + MATRIX_TRAIL) / ANIM_ONE;
+    }
+    for (int32_t py = c->area.top; py < c->area.bottom; py++) {
+        int32_t y = py - c->body.top;
+        for (int32_t px = c->area.left; px < c->area.right; px++) {
+            uint32_t under = ctx_under(c, px, py);
+            uint32_t color;
+            uint32_t* target = ctx_target(c, px, py);
+            if (!ctx_over(c, px, py, &color)) continue;
+            if (!body_contains(&c->body, px, py)) {
+                *target = mix_color(under, color, edge_alpha);
+                continue;
+            }
+            int32_t column = (px - c->body.left) / MATRIX_COLUMN;
+            bool glyph = matrix_glyph(column, y / MATRIX_ROW,
+                                      (px - c->body.left) % MATRIX_COLUMN,
+                                      y % MATRIX_ROW);
+            int32_t dist = anim_columns[px - c->area.left] - y;
+            if (dist >= MATRIX_TRAIL) {
+                *target = under;
+                continue;
+            }
+            uint32_t window = matrix_tint(color, tint);
+            if (dist < 0) {
+                /* Not reached yet: green, with the characters showing. */
+                if (glyph) window = mix_color(window, 0xFF3CFF7Cu, tint / 3u);
+                *target = window;
+                continue;
+            }
+            uint32_t k = (uint32_t)(dist * 255 / MATRIX_TRAIL);
+            uint32_t base = mix_color(window, mix_color(under, 0xFF020A04u,
+                                                        90u), 128u + k / 2u);
+            base = mix_color(base, under, k);
+            if (glyph) {
+                uint32_t bright = dist < MATRIX_ROW ? 0xFFE0FFE8u
+                                                    : 0xFF3CFF7Cu;
+                base = mix_color(base, bright, 255u - k);
+            }
+            *target = base;
+        }
+    }
+}
+
+/* Closing: a sword stroke flashes across the window, which splits along it;
+ * the halves slide apart, drop and fade. */
+static void effect_katana(const anim_ctx_t* c) {
+    /* The cut runs up to the right: u along it, n across it (x 1024). */
+    const int32_t ux = 963, uy = -348, nx = 348, ny = 963;
+    int32_t cx = (c->body.left + c->body.right) / 2;
+    int32_t cy = (c->body.top + c->body.bottom) / 2;
+    int32_t split = anim_span(c->t, KATANA_CUT, ANIM_ONE);
+    int32_t slide = ease_out(split) * 34 / ANIM_ONE;
+    int32_t gap = ease_out(split) * 7 / ANIM_ONE;
+    int32_t fall = ease_in(split);
+    /* Lower half: down along the cut; upper half: up along it. */
+    int32_t lower_x = (-ux * slide + nx * gap) / 1024;
+    int32_t lower_y = (-uy * slide + ny * gap) / 1024 + fall * 230 / ANIM_ONE;
+    int32_t upper_x = (ux * slide - nx * gap) / 1024;
+    int32_t upper_y = (uy * slide - ny * gap) / 1024 + fall * 150 / ANIM_ONE;
+    uint32_t alpha = clamp255(255 - anim_span(c->t, 560, ANIM_ONE) * 255 /
+                              ANIM_ONE);
+    uint32_t shadow = clamp255(255 - split * 255 / ANIM_ONE * 3);
+    uint32_t glint = clamp255(220 - anim_span(c->t, KATANA_CUT, 600) * 220 /
+                              ANIM_ONE);
+    /* The slash: grows across the window, then fades. */
+    int32_t width = c->body.right - c->body.left;
+    int32_t height = c->body.bottom - c->body.top;
+    int32_t reach = (width * 963 + height * 348) / 2048 + 40;
+    int32_t grow = ease_out(anim_span(c->t, 0, KATANA_CUT));
+    int32_t tip = -reach + 2 * reach * grow / ANIM_ONE;
+    uint32_t slash = clamp255(255 - anim_span(c->t, KATANA_CUT + 40,
+                                              KATANA_CUT + 320) * 255 /
+                                    ANIM_ONE);
+    for (int32_t py = c->area.top; py < c->area.bottom; py++) {
+        for (int32_t px = c->area.left; px < c->area.right; px++) {
+            uint32_t under = ctx_under(c, px, py);
+            uint32_t* target = ctx_target(c, px, py);
+            uint32_t color = under;
+            bool piece = false;
+            int32_t qx = px - lower_x, qy = py - lower_y;
+            int32_t side = (qx - cx) * nx + (qy - cy) * ny;
+            if (side >= 0 && body_contains(&c->body, qx, qy) &&
+                ctx_over(c, qx, qy, &color)) {
+                piece = true;
+            } else {
+                qx = px - upper_x;
+                qy = py - upper_y;
+                side = (qx - cx) * nx + (qy - cy) * ny;
+                if (side < 0 && body_contains(&c->body, qx, qy) &&
+                    ctx_over(c, qx, qy, &color))
+                    piece = true;
+            }
+            uint32_t out;
+            if (piece) {
+                /* The freshly cut edges catch the light. */
+                int32_t edge = (side < 0 ? -side : side) / 1024;
+                if (split && edge < 3)
+                    color = mix_color(color, 0xFFFFFFFFu,
+                                      glint * (uint32_t)(3 - edge) / 3u);
+                out = mix_color(under, color, alpha);
+            } else if (!body_contains(&c->body, px, py)) {
+                uint32_t original;
+                out = ctx_over(c, px, py, &original)
+                    ? mix_color(under, original, shadow) : under;
+            } else {
+                out = under;
+            }
+            if (slash && grow) {
+                int32_t along = ((px - cx) * ux + (py - cy) * uy) / 1024;
+                int32_t across = (px - cx) * nx + (py - cy) * ny;
+                if (across < 0) across = -across;
+                if (along >= -reach && along <= tip) {
+                    /* Thickest in the middle, tapering to the tips. */
+                    int32_t body_width = 1024 + 2048 *
+                        (reach - (along < 0 ? -along : along)) / reach;
+                    int32_t glow_width = body_width + 6 * 1024;
+                    if (across < body_width) {
+                        out = mix_color(out, 0xFFFFFFFFu, slash);
+                    } else if (across < glow_width) {
+                        uint32_t fade = (uint32_t)((glow_width - across) *
+                                                   200 / (6 * 1024));
+                        out = mix_color(out, 0xFFBFE6FFu,
+                                        fade * slash / 255u);
+                    }
+                }
+            }
+            *target = out;
+        }
+    }
+}
+
+/* The point a minimized window shrinks to, on the panel. */
+static void minimize_target(const anim_body_t* body, int32_t* x, int32_t* y) {
+    *x = (body->left + body->right) / 2;
+    *y = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT / 2;
+}
+
+/* Draws one window with its animation; `t` is its progress. */
+static void draw_window_animated(const syscall_window_info_t* info,
+                                 cached_window_t* entry, uint32_t kind,
+                                 uint32_t effect, int32_t t, bool focused) {
+    rect_t area = window_anim_area(info, kind, effect);
+    if (!anim_visible_area(&area)) return;
+    int32_t width = area.right - area.left;
+    if (!anim_buffers((size_t)width * (size_t)(area.bottom - area.top))) {
+        if (kind == ANIM_KIND_OPEN || kind == ANIM_KIND_RESTORE)
+            composite_window(info, entry);
+        return;
+    }
+    anim_copy_out(anim_under, area);
+    uint32_t saved_focus = focused_id;
+    focused_id = focused ? info->id : (focused_id == info->id ? 0u
+                                                              : focused_id);
+    composite_window(info, entry);
+    focused_id = saved_focus;
+    anim_copy_out(anim_over, area);
+    anim_ctx_t c = {area, width, anim_under, anim_over, window_body(info), t};
+    if (kind == ANIM_KIND_OPEN) {
+        if (effect == MOSDESK_ANIM_OPEN_BLOCKS) effect_blocks(&c);
+        else if (effect == MOSDESK_ANIM_OPEN_MATRIX) effect_matrix_in(&c);
+        else {
+            int32_t e = ease_out(t);
+            effect_transform(&c, 942 + e * 82 / ANIM_ONE, 0,
+                             (ANIM_ONE - e) * 10 / ANIM_ONE,
+                             clamp255(e * 255 / ANIM_ONE));
+        }
+    } else if (kind == ANIM_KIND_CLOSE) {
+        if (effect == MOSDESK_ANIM_CLOSE_KATANA) effect_katana(&c);
+        else if (effect == MOSDESK_ANIM_CLOSE_MATRIX) effect_matrix_out(&c);
+        else {
+            int32_t e = ease_in(t);
+            effect_transform(&c, ANIM_ONE - e * 82 / ANIM_ONE, 0,
+                             e * 8 / ANIM_ONE,
+                             clamp255(255 - ease_out(t) * 255 / ANIM_ONE));
+        }
+    } else {
+        /* Minimize (t forwards) or restore (t backwards): to the panel. */
+        int32_t e = kind == ANIM_KIND_MINIMIZE ? ease_in_out(t)
+                                               : ANIM_ONE - ease_out(t);
+        int32_t tx, ty;
+        minimize_target(&c.body, &tx, &ty);
+        int32_t cx = (c.body.left + c.body.right) / 2;
+        int32_t cy = (c.body.top + c.body.bottom) / 2;
+        effect_transform(&c, ANIM_ONE - e * 900 / ANIM_ONE,
+                         (tx - cx) * e / ANIM_ONE, (ty - cy) * e / ANIM_ONE,
+                         clamp255(255 - anim_span(e, 500, ANIM_ONE) * 255 /
+                                  ANIM_ONE));
+    }
+}
+
+static bool window_animating(const cached_window_t* entry) {
+    return entry && entry->anim_kind &&
+           anim_now < entry->anim_start + entry->anim_duration;
+}
+
+/* Draws a window the normal way, or animated when it is opening. */
+static void draw_window_maybe_animated(const syscall_window_info_t* info,
+                                       cached_window_t* entry) {
+    if (!window_animating(entry)) {
+        composite_window(info, entry);
+        return;
+    }
+    draw_window_animated(info, entry, entry->anim_kind, entry->anim_effect,
+                         anim_progress(entry->anim_start,
+                                       entry->anim_duration),
+                         info->id == focused_id);
+}
+
+static void draw_ghosts(void) {
+    for (uint32_t i = 0; i < MAX_GHOSTS; i++) {
+        ghost_t* ghost = &ghosts[i];
+        if (!ghost->active) continue;
+        draw_window_animated(&ghost->window.last_info, &ghost->window,
+                             ghost->kind, ghost->effect,
+                             anim_progress(ghost->start, ghost->duration),
+                             ghost->window.last_focused);
+    }
+}
+
+/* ---------------------------------------------------------------- popups
+ * The start, sound, network and context menus fade in while sliding into
+ * place. Drawing a popup is wrapped in popup_layer_begin/_end. */
+static uint32_t popup_duration(void) { return anim_duration(170u); }
+
+static bool popup_is_open(uint32_t popup) {
+    if (popup == POPUP_START) return start_menu_open;
+    if (popup == POPUP_SOUND) return sound_menu_open;
+    if (popup == POPUP_NET) return net_menu_open;
+    return menu_open;
+}
+
+/* The popup itself (body) and everything its animation may touch. */
+static bool popup_rects(uint32_t popup, rect_t* body, rect_t* area) {
+    int32_t x, y, width, height;
+    if (popup == POPUP_START) start_menu_bounds(&x, &y, &width, &height);
+    else if (popup == POPUP_SOUND) sound_menu_bounds(&x, &y, &width, &height);
+    else if (popup == POPUP_NET) net_menu_bounds(&x, &y, &width, &height);
+    else {
+        x = menu_x;
+        y = menu_y;
+        width = MENU_WIDTH;
+        height = menu_height();
+    }
+    *body = (rect_t){x, y, x + width, y + height};
+    *area = (rect_t){x - 6, y - 14, x + width + 6, y + height + 16};
+    return width > 0 && height > 0;
+}
+
+static bool popup_animating(uint32_t popup) {
+    return interface_animations() && popup_anims[popup].open &&
+           popup_is_open(popup) &&
+           anim_now < popup_anims[popup].start + popup_duration();
+}
+
+static bool popup_layer_active;
+static rect_t popup_layer_area;
+
+static void popup_layer_begin(uint32_t popup) {
+    popup_layer_active = false;
+    rect_t body, area;
+    if (!popup_animating(popup) || !popup_rects(popup, &body, &area) ||
+        !anim_visible_area(&area))
+        return;
+    size_t pixels = (size_t)(area.right - area.left) *
+                    (size_t)(area.bottom - area.top);
+    if (!anim_buffers(pixels)) return;
+    anim_copy_out(anim_under, area);
+    popup_layer_area = area;
+    popup_layer_active = true;
+}
+
+static void popup_layer_end(uint32_t popup) {
+    if (!popup_layer_active) return;
+    popup_layer_active = false;
+    rect_t body, unused;
+    popup_rects(popup, &body, &unused);
+    rect_t area = popup_layer_area;
+    anim_copy_out(anim_over, area);
+    anim_ctx_t c = {area, area.right - area.left, anim_under, anim_over,
+                    {0}, 0};
+    int32_t e = ease_out(anim_progress(popup_anims[popup].start,
+                                       popup_duration()));
+    uint32_t alpha = clamp255(e * 255 / ANIM_ONE);
+    /* Menus on the panel rise into place; the context menu drops. */
+    int32_t shift = (ANIM_ONE - e) * 12 / ANIM_ONE;
+    if (popup == POPUP_CONTEXT) shift = -shift * 2 / 3;
+    for (int32_t py = area.top; py < area.bottom; py++) {
+        for (int32_t px = area.left; px < area.right; px++) {
+            uint32_t under = ctx_under(&c, px, py);
+            uint32_t color;
+            int32_t qy = py - shift;
+            bool inside = px >= body.left && px < body.right &&
+                          qy >= body.top && qy < body.bottom;
+            uint32_t out = under;
+            if (inside && ctx_over(&c, px, qy, &color))
+                out = mix_color(under, color, alpha);
+            else if (!(px >= body.left && px < body.right &&
+                       py >= body.top && py < body.bottom) &&
+                     ctx_over(&c, px, py, &color))
+                out = mix_color(under, color, alpha);
+            *ctx_target(&c, px, py) = out;
+        }
+    }
+}
+
+/* -------------------------------------------------------- per frame work */
+static void anim_damage_add(rect_t area) {
+    if (anim_damage_count == ANIM_DAMAGE_MAX) {
+        anim_damage_overflow = true;
+        return;
+    }
+    anim_damage[anim_damage_count++] = area;
+}
+
+/* Called once a frame before the damage is worked out: advances hover
+ * highlights, notices popups opening, retires finished animations, and
+ * lists what has to be repainted for them. */
+static void anim_frame(const syscall_window_info_t* windows, uint64_t count) {
+    anim_now = mos_syscall1(SYS_UPTIME, 0);
+    memcpy(anim_damage_previous, anim_damage, sizeof(anim_damage));
+    anim_damage_previous_count = anim_damage_count;
+    anim_damage_count = 0;
+    anim_damage_overflow = false;
+
+    uint64_t elapsed = anim_now - hover_tick_ms;
+    if (!hover_tick_ms || elapsed > 200u) elapsed = 16u;
+    hover_tick_ms = anim_now;
+    for (uint32_t i = 0; i < HOVER_SLOTS; i++) {
+        hover_slot_t* slot = &hover_slots[i];
+        if (!slot->key) continue;
+        slot->target = slot->seen;
+        slot->seen = false;
+        uint32_t before = slot->level;
+        if (!interface_animations()) {
+            slot->level = slot->target ? ANIM_ONE : 0u;
+        } else if (slot->target) {
+            uint32_t step = (uint32_t)(elapsed * ANIM_ONE / HOVER_FADE_IN_MS);
+            slot->level = slot->level + step > ANIM_ONE ? ANIM_ONE
+                                                        : slot->level + step;
+        } else {
+            uint32_t step = (uint32_t)(elapsed * ANIM_ONE /
+                                       HOVER_FADE_OUT_MS);
+            slot->level = slot->level > step ? slot->level - step : 0u;
+        }
+        if (slot->level != before) anim_damage_add(slot->area);
+        if (!slot->target && !slot->level) slot->key = 0;
+    }
+
+    for (uint32_t i = 0; i < POPUP_COUNT; i++) {
+        bool open = popup_is_open(i);
+        if (open && !popup_anims[i].open) popup_anims[i].start = anim_now;
+        popup_anims[i].open = open;
+        rect_t body, area;
+        if (popup_animating(i) && popup_rects(i, &body, &area))
+            anim_damage_add(area);
+    }
+
+    if (auth_state != AUTH_NONE) return;
+    for (uint64_t i = 0; i < count; i++) {
+        cached_window_t* entry = cache_for(windows[i].id);
+        if (!entry || !entry->anim_kind) continue;
+        if (!window_animating(entry)) {
+            entry->anim_kind = 0;
+            continue;
+        }
+        if (window_shown(&windows[i]))
+            anim_damage_add(window_anim_area(&windows[i], entry->anim_kind,
+                                             entry->anim_effect));
+    }
+    for (uint32_t i = 0; i < MAX_GHOSTS; i++) {
+        ghost_t* ghost = &ghosts[i];
+        if (!ghost->active) continue;
+        if (anim_now >= ghost->start + ghost->duration) {
+            wm_free(ghost->window.pixels);
+            memset(ghost, 0, sizeof(*ghost));
+            continue;
+        }
+        anim_damage_add(window_anim_area(&ghost->window.last_info,
+                                         ghost->kind, ghost->effect));
+    }
+}
+
+/* Remembers each window as listed, for a later close animation. */
+static void anim_remember_windows(const syscall_window_info_t* windows,
+                                  uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        cached_window_t* entry = cache_for(windows[i].id);
+        if (!entry) continue;
+        entry->last_info = windows[i];
+        entry->last_focused = windows[i].id == focused_id;
+    }
 }
 
 static void scene_regions(region_state_t* regions) {
@@ -6876,9 +7949,10 @@ static void scene_regions(region_state_t* regions) {
         for (uint32_t i = 0; i < menu_item_count; i++)
             hash = hash_u64(hash, ((uint64_t)menu_items[i].action << 1) |
                                   menu_items[i].enabled);
+        /* Wide enough for the Liquid Glass menu's shadow. */
         regions[REGION_CONTEXT_MENU].area = (rect_t){
-            menu_x - 4, menu_y - 2, menu_x + MENU_WIDTH + 4,
-            menu_y + menu_height() + 6};
+            menu_x - 6, menu_y - 2, menu_x + MENU_WIDTH + 6,
+            menu_y + menu_height() + 12};
     }
     regions[REGION_CONTEXT_MENU].signature = hash;
 
@@ -6926,6 +8000,13 @@ static void collect_damage(const syscall_window_info_t* windows,
                                 top + (int32_t)info->height});
         }
     }
+    /* Animations repaint their whole area, now and once after they end. */
+    for (uint32_t i = 0; i < anim_damage_count; i++)
+        damage_add(anim_damage[i]);
+    for (uint32_t i = 0; i < anim_damage_previous_count; i++)
+        damage_add(anim_damage_previous[i]);
+    if (anim_damage_overflow) damage_everything = true;
+    damage_merge_overlaps();
     /* The sign-in screen, and a desktop drawn without its layer, are only
      * ever painted whole. */
     if (damage_count && (!desktop_layer || auth_state != AUTH_NONE))
@@ -6933,6 +8014,8 @@ static void collect_damage(const syscall_window_info_t* windows,
 }
 
 static void render(const syscall_window_info_t* windows, uint64_t count) {
+    anim_frame(windows, count);
+    anim_remember_windows(windows, count);
     ensure_wallpaper();
     ensure_glass();
     rect_t desktop_changed[2];
@@ -7482,7 +8565,65 @@ static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
 }
 
 /* Works out what the pointer is resting on, for hover highlights. */
+static void update_hover_state(syscall_window_info_t* windows,
+                               uint64_t count);
+
+/* Works out what is under the pointer, then names it to the hover fades. */
 static void update_hover(syscall_window_info_t* windows, uint64_t count) {
+    update_hover_state(windows, count);
+    int32_t top = (int32_t)display.height - (int32_t)TASKBAR_HEIGHT;
+    int32_t bottom = (int32_t)display.height;
+    if (hover_taskbar != UINT32_MAX) {
+        rect_t area = {0, top, 48, bottom};
+        if (hover_taskbar == SOUND_TASKBAR_HOVER ||
+            hover_taskbar == NET_TASKBAR_HOVER) {
+            int32_t x, y;
+            if (hover_taskbar == SOUND_TASKBAR_HOVER) sound_icon_rect(&x, &y);
+            else net_icon_rect(&x, &y);
+            area = (rect_t){x - 6, top, x + 52, bottom};
+        } else if (hover_taskbar) {
+            int32_t x = 60 + (int32_t)(hover_taskbar - 1u) * 180;
+            area = (rect_t){x - 2, top, x + 180, bottom};
+        }
+        hover_track(HOVER_KEY_TASKBAR | hover_taskbar, area);
+    }
+    if (hover_start_row != UINT32_MAX && start_menu_open) {
+        int32_t x, y, width, height;
+        start_menu_bounds(&x, &y, &width, &height);
+        int32_t row_y = start_menu_row_y(hover_start_row);
+        rect_t area = {x, row_y - 2, x + width, row_y + 40};
+        if (area.top < y) area.top = y;
+        if (area.bottom > y + height) area.bottom = y + height;
+        hover_track(positioned_hover_key(HOVER_KEY_START_ROW, 0,
+                                         launcher_scroll, hover_start_row),
+                    area);
+    }
+    if (menu_open && menu_hover != UINT32_MAX) {
+        int32_t py = menu_y + 6;
+        for (uint32_t i = 0; i < menu_item_count; i++) {
+            if (menu_items[i].separator_before) py += 9;
+            if (i == menu_hover) break;
+            py += MENU_ITEM_HEIGHT;
+        }
+        hover_track(positioned_hover_key(HOVER_KEY_MENU, menu_x, menu_y,
+                                         menu_hover),
+                    (rect_t){menu_x, py, menu_x + MENU_WIDTH,
+                             py + MENU_ITEM_HEIGHT});
+    }
+    if (caption_hover_window && caption_hover_button) {
+        for (uint64_t i = 0; i < count; i++) {
+            if (windows[i].id != caption_hover_window) continue;
+            int32_t right = (int32_t)windows[i].x + (int32_t)windows[i].width;
+            hover_track(caption_hover_key(&windows[i], caption_hover_button),
+                        (rect_t){right - 112, (int32_t)windows[i].y - 4,
+                                 right + 8,
+                                 (int32_t)windows[i].y + (int32_t)TITLE_HEIGHT});
+        }
+    }
+}
+
+static void update_hover_state(syscall_window_info_t* windows,
+                               uint64_t count) {
     sound_tick();
     net_tick();
     if (launcher_dragging) {
@@ -7534,12 +8675,10 @@ static void update_hover(syscall_window_info_t* windows, uint64_t count) {
         hover_desktop_icon = desktop_icon_at(cursor_x, cursor_y);
         return;
     }
-    if (ui_style == MOSDESK_UI_STYLE_AERO || liquid_style()) {
-        caption_hover_button = caption_button_at(
-            cursor_x - (int32_t)info->x, cursor_y - (int32_t)info->y,
-            (int32_t)info->width + 1);
-        if (caption_hover_button) caption_hover_window = info->id;
-    }
+    caption_hover_button = caption_button_at(
+        cursor_x - (int32_t)info->x, cursor_y - (int32_t)info->y,
+        (int32_t)info->width + 1);
+    if (caption_hover_button) caption_hover_window = info->id;
     if (info->id != browser_window_id) return;
     int32_t x = cursor_x - (int32_t)info->x - 1;
     int32_t y = cursor_y - (int32_t)info->y - (int32_t)TITLE_HEIGHT - 1;

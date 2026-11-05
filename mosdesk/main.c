@@ -28,7 +28,8 @@
 #define PAGE_DEBUG 5u
 #define PAGE_ABOUT 6u
 #define PAGE_TIME 7u
-#define PAGE_COUNT 8u
+#define PAGE_ANIMATIONS 8u
+#define PAGE_COUNT 9u
 
 #define WALLPAPER_DIRECTORY "0:/programs/mosWM/assets/wallpapers"
 #define THUMB_WIDTH 96u
@@ -74,11 +75,13 @@ static uint32_t photo_count;
 static bool photos_loaded;
 
 static const uint32_t nav_order[PAGE_COUNT] = {
-    PAGE_APPEARANCE, PAGE_MOUSE, PAGE_CURSOR, PAGE_LOGIN, PAGE_DESKTOP,
-    PAGE_TIME, PAGE_DEBUG, PAGE_ABOUT
+    PAGE_APPEARANCE, PAGE_ANIMATIONS, PAGE_MOUSE, PAGE_CURSOR, PAGE_LOGIN,
+    PAGE_DESKTOP, PAGE_TIME, PAGE_DEBUG, PAGE_ABOUT
 };
 /* Scroll offset of the Time page (Appearance has appearance_scroll). */
 static int32_t time_scroll;
+static int32_t animations_scroll;
+static int32_t animations_page_height(void);
 static int32_t time_page_height(void);
 static ttrend_font_t small_font = {1, 1, 0, 0};
 static ttrend_font_t large_font = {2, 1, 1, 0};
@@ -340,6 +343,138 @@ static uint32_t mix_rgb(uint32_t from, uint32_t to, uint32_t t) {
     return 0xFF000000u | r << 16 | g << 8 | b;
 }
 
+/* ----------------------------------------------------- animated controls
+ * Switches slide, selections fade between buttons, the sidebar highlight
+ * glides to the chosen page and a click sends a ripple through the button.
+ * Each animated value is kept by key and eased towards its target every
+ * time the window is drawn; while any is still moving the window keeps
+ * redrawing (ui_animating). Settings > Animations > Interface turns this
+ * off, and then everything jumps straight to its end state. */
+#define UI_ANIM_SLOTS 64u
+#define RIPPLE_MS 380u
+typedef struct {
+    uint32_t key;               /* 0: free */
+    int32_t value;              /* x 256 */
+    uint32_t used;              /* frame it was last asked for */
+} ui_anim_t;
+
+static ui_anim_t ui_anims[UI_ANIM_SLOTS];
+static uint32_t ui_frame;
+static uint64_t ui_now;
+static uint32_t ui_elapsed;
+static bool ui_animating;
+static bool ui_was_animating;
+static int32_t press_x, press_y;
+static uint64_t press_ms;
+static bool press_valid;
+
+static uint64_t ui_uptime(void) {
+    return (uint64_t)mos_syscall(SYS_UPTIME, 0, 0, 0);
+}
+
+static bool ui_animations_on(void) { return preferences.anim_interface != 0u; }
+
+/* Once per drawn frame, before any ui_smooth(). */
+static void ui_anim_frame(void) {
+    uint64_t now = ui_uptime();
+    /* Time only passes for animations that were already running; a fresh
+     * one starts from its first step. */
+    ui_elapsed = ui_was_animating && now > ui_now
+        ? (uint32_t)(now - ui_now > 60u ? 60u : now - ui_now) : 0u;
+    ui_now = now;
+    ui_frame++;
+    ui_animating = false;
+}
+
+static uint32_t ui_key(uint32_t kind, int32_t a, int32_t b) {
+    uint32_t v = kind * 0x9E3779B1u ^ (uint32_t)a * 0x85EBCA77u ^
+                 (uint32_t)b * 0xC2B2AE3Du;
+    return v ? v : 1u;
+}
+
+/* `target` approached with time constant `tau_ms`. The first time a key is
+ * seen it starts at its target. */
+static int32_t ui_smooth(uint32_t key, int32_t target, uint32_t tau_ms) {
+    ui_anim_t* slot = NULL;
+    ui_anim_t* oldest = &ui_anims[0];
+    for (uint32_t i = 0; i < UI_ANIM_SLOTS; i++) {
+        if (ui_anims[i].key == key) { slot = &ui_anims[i]; break; }
+        if (ui_anims[i].used < oldest->used) oldest = &ui_anims[i];
+    }
+    if (!slot) {
+        slot = oldest;
+        slot->key = key;
+        slot->value = target * 256;
+    }
+    slot->used = ui_frame;
+    int32_t goal = target * 256;
+    int32_t diff = goal - slot->value;
+    if (!ui_animations_on() || (diff < 48 && diff > -48)) {
+        slot->value = goal;
+        return target;
+    }
+    slot->value += (int32_t)((int64_t)diff * ui_elapsed /
+                             (tau_ms + ui_elapsed));
+    ui_animating = true;
+    return slot->value / 256;
+}
+
+/* Remembers a click for the ripple of whatever was clicked. */
+static void ui_press(int32_t x, int32_t y) {
+    press_x = x;
+    press_y = y;
+    press_ms = ui_uptime();
+    press_valid = true;
+}
+
+/* A ripple spreading from the last click, if it landed in this rounded
+ * rectangle not long ago. */
+static void draw_ripple(int32_t x, int32_t y, int32_t width, int32_t height,
+                        int32_t radius, uint32_t color) {
+    if (!press_valid || !ui_animations_on() ||
+        press_x < x || press_y < y || press_x >= x + width ||
+        press_y >= y + height)
+        return;
+    uint64_t age = ui_now > press_ms ? ui_now - press_ms : 0u;
+    if (age >= RIPPLE_MS) return;
+    ui_animating = true;
+    int32_t t = (int32_t)(age * 1024u / RIPPLE_MS);
+    int32_t eased = 1024 - (1024 - t) * (1024 - t) / 1024;
+    int32_t reach = width > height ? width : height;
+    int32_t r = 6 + reach * eased / 1024;
+    uint32_t alpha = (uint32_t)(110 * (1024 - t) / 1024);
+    for (int32_t py = y; py < y + height; py++) {
+        for (int32_t px = x; px < x + width; px++) {
+            int32_t dx = px - press_x, dy = py - press_y;
+            if (dx * dx + dy * dy > r * r) continue;
+            /* Stay inside the rounded corners. */
+            int32_t cx = px < x + radius ? x + radius
+                : px >= x + width - radius ? x + width - radius - 1 : px;
+            int32_t cy = py < y + radius ? y + radius
+                : py >= y + height - radius ? y + height - radius - 1 : py;
+            int32_t ex = px - cx, ey = py - cy;
+            if (ex * ex + ey * ey > radius * radius) continue;
+            blend_pixel(px, py, color, alpha);
+        }
+    }
+}
+
+/* An on/off switch: a pill whose knob slides across and whose colour
+ * fades to the accent. Drawn at (x, y), 46 x 24, with "On"/"Off" beside. */
+static void draw_text(int32_t x, int32_t y, const char* text,
+                      uint32_t color, bool large);
+static void draw_switch(int32_t x, int32_t y, bool on) {
+    int32_t v = ui_smooth(ui_key(1u, x, y), on ? 255 : 0, 45u);
+    uint32_t track = mix_rgb(0xFFC3CCD3u, preferences.accent_color,
+                             (uint32_t)v);
+    fill_round(x, y, 46, 24, 12, track);
+    draw_ripple(x - 6, y - 6, 58, 36, 18, 0xFFFFFFFFu);
+    int32_t knob_x = x + 12 + 22 * v / 255;
+    fill_disc(knob_x, y + 13, 9, 0x30000000u);
+    fill_disc(knob_x, y + 12, 9, 0xFFFFFFFFu);
+    draw_text(x + 58, y + 6, on ? "On" : "Off", 0xFF34434Cu, false);
+}
+
 /* A miniature window in the given style: MOSDESK_UI_STYLE_MODERN (flat dark
  * title bar, round buttons) or MOSDESK_UI_STYLE_AERO (tinted glass frame,
  * glossy title, red close button). */
@@ -473,10 +608,12 @@ static int32_t scroll_track_length(void) {
 }
 /* The scrolling page shown now: Appearance or Time. */
 static int32_t page_height(void) {
+    if (category == PAGE_ANIMATIONS) return animations_page_height();
     return category == PAGE_TIME ? time_page_height()
                                  : appearance_page_height();
 }
 static int32_t* page_scroll(void) {
+    if (category == PAGE_ANIMATIONS) return &animations_scroll;
     return category == PAGE_TIME ? &time_scroll : &appearance_scroll;
 }
 static int32_t page_max_scroll(void) {
@@ -833,7 +970,10 @@ static void draw_settings_message(void) {
                   0xFFB43A32u, false);
 }
 
+static void draw_animations_page(void);
+
 static void draw_window(void) {
+    ui_anim_frame();
     fill_rect(0, 0, (int32_t)surface.width, (int32_t)surface.height,
               0xFFF3F5F6u);
     if (nav_scroll > nav_max_scroll()) nav_scroll = nav_max_scroll();
@@ -841,7 +981,10 @@ static void draw_window(void) {
         appearance_scroll = appearance_max_scroll();
     if (category == PAGE_TIME && time_scroll > page_max_scroll())
         time_scroll = page_max_scroll();
+    if (category == PAGE_ANIMATIONS && animations_scroll > page_max_scroll())
+        animations_scroll = page_max_scroll();
     if (category == PAGE_APPEARANCE) draw_appearance_page();
+    else if (category == PAGE_ANIMATIONS) draw_animations_page();
     else if (category == PAGE_ABOUT) draw_about_page();
     else if (category == PAGE_TIME) draw_time_page();
 
@@ -849,24 +992,35 @@ static void draw_window(void) {
     static const moswm_file_icon_t nav_icons[PAGE_COUNT] = {
         MOSWM_ICON_APPEARANCE, MOSWM_ICON_MOUSE, MOSWM_ICON_POINTER,
         MOSWM_ICON_LOCK, MOSWM_ICON_DESKTOP, MOSWM_ICON_TERMINAL,
-        MOSWM_ICON_INFO, MOSWM_ICON_NETWORK};
+        MOSWM_ICON_INFO, MOSWM_ICON_NETWORK, MOSWM_ICON_VIDEO};
     static const char* const nav_names[PAGE_COUNT] = {
         "Appearance", "Mouse", "Cursor", "Login", "Desktop", "Debug",
-        "About", "Date & time"};
+        "About", "Date & time", "Animations"};
     fill_rect(0, 0, (int32_t)NAV_WIDTH, (int32_t)surface.height,
               0xFFE6EAEDu);
+    /* Hover fades in and out; the selection glides to the chosen row. */
+    int32_t selected_row = 0;
+    for (uint32_t i = 0; i < PAGE_COUNT; i++) {
+        if (nav_order[i] == category) selected_row = (int32_t)i;
+        int32_t row = NAV_TOP + (int32_t)i * NAV_PITCH - nav_scroll;
+        int32_t lit = ui_smooth(ui_key(2u, (int32_t)i, 0),
+                                nav_hover == i && nav_order[i] != category
+                                    ? 255 : 0, 35u);
+        if (lit)
+            fill_round(10, row, 128, NAV_PITCH - 4, 7,
+                       mix_rgb(0xFFE6EAEDu, 0xFFDCE4EAu, (uint32_t)lit));
+    }
+    int32_t glide = ui_smooth(ui_key(3u, 0, 0),
+                              NAV_TOP + selected_row * NAV_PITCH, 55u) -
+                    nav_scroll;
+    fill_round(10, glide, 128, NAV_PITCH - 4, 7, 0xFFD4E4EFu);
+    fill_round(12, glide + 8, 3, NAV_PITCH - 20, 1, preferences.accent_color);
     for (uint32_t i = 0; i < PAGE_COUNT; i++) {
         uint32_t page = nav_order[i];
         int32_t row = NAV_TOP + (int32_t)i * NAV_PITCH - nav_scroll;
         if (row + NAV_PITCH <= NAV_TOP - 4 || row >= (int32_t)surface.height)
             continue;
-        if (page == category) {
-            fill_round(10, row, 128, NAV_PITCH - 4, 7, 0xFFD4E4EFu);
-            fill_round(12, row + 8, 3, NAV_PITCH - 20, 1,
-                       preferences.accent_color);
-        } else if (nav_hover == i) {
-            fill_round(10, row, 128, NAV_PITCH - 4, 7, 0xFFDCE4EAu);
-        }
+        draw_ripple(10, row, 128, NAV_PITCH - 4, 7, 0xFFFFFFFFu);
         moswm_draw_file_icon_sized(surface.pixels, surface.width,
                                    surface.height, 18, row + 3,
                                    nav_icons[page], 32u);
@@ -901,15 +1055,17 @@ static void draw_window(void) {
         draw_settings_message();
         return;
     }
+    if (category == PAGE_ANIMATIONS) {
+        draw_text(content_left(), 15, "Animations", 0xFF273640u, true);
+        draw_settings_message();
+        return;
+    }
 
     if (category == PAGE_DEBUG) {
         draw_text(content_left(), 15, "Debug", 0xFF273640u, true);
-        fill_round((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
-                  preferences.debug_fps
-                      ? preferences.accent_color : 0xFFDCE2E6u);
-        fill_round((int32_t)NAV_WIDTH + 22, 229, 160, 34, 8,
-                  preferences.debug_profiler
-                      ? preferences.accent_color : 0xFFDCE2E6u);
+        draw_switch((int32_t)NAV_WIDTH + 22, 111, preferences.debug_fps);
+        draw_switch((int32_t)NAV_WIDTH + 22, 234,
+                    preferences.debug_profiler);
     } else if (category == 1u) {
         int32_t track_x = (int32_t)NAV_WIDTH + 22;
         int32_t track_y = 101;
@@ -932,18 +1088,17 @@ static void draw_window(void) {
         }
         fill_round((int32_t)NAV_WIDTH + 22, 191, 48, 27, 6, 0xFFDCE2E6u);
         fill_round((int32_t)NAV_WIDTH + 78, 191, 48, 27, 6, 0xFFDCE2E6u);
-        if (preferences.cursor_scale == 1u)
-            fill_round((int32_t)NAV_WIDTH + 30, 212, 32, 3, 1,
-                      preferences.accent_color);
-        else
-            fill_round((int32_t)NAV_WIDTH + 86, 212, 32, 3, 1,
-                      preferences.accent_color);
-        fill_round((int32_t)NAV_WIDTH + 22, 234, 84, 28, 6,
-                  preferences.cursor_pack == MOSDESK_CURSOR_PACK_POSY
-                      ? preferences.accent_color : 0xFFDCE2E6u);
-        fill_round((int32_t)NAV_WIDTH + 116, 234, 84, 28, 6,
-                  preferences.cursor_pack == MOSDESK_CURSOR_PACK_CLASSIC
-                      ? preferences.accent_color : 0xFFDCE2E6u);
+        fill_round(ui_smooth(ui_key(6u, 0, 0), (int32_t)NAV_WIDTH +
+                       (preferences.cursor_scale == 1u ? 30 : 86), 45u),
+                   212, 32, 3, 1, preferences.accent_color);
+        for (uint32_t pack = 0; pack < 2u; pack++) {
+            int32_t px = (int32_t)NAV_WIDTH + 22 + (int32_t)pack * 94;
+            uint32_t v = (uint32_t)ui_smooth(ui_key(5u, px, 234),
+                preferences.cursor_pack == pack ? 255 : 0, 40u);
+            fill_round(px, 234, 84, 28, 6,
+                       mix_rgb(0xFFDCE2E6u, preferences.accent_color, v));
+            draw_ripple(px, 234, 84, 28, 6, 0xFFFFFFFFu);
+        }
     } else if (category == 3u) {
         if (password_editing) {
             int32_t field_w = (int32_t)surface.width - (int32_t)NAV_WIDTH - 44;
@@ -960,19 +1115,22 @@ static void draw_window(void) {
         } else if (preferences.login_enabled) {
             fill_round((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
                       preferences.accent_color);
+            draw_ripple((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
+                        0xFFFFFFFFu);
             fill_round((int32_t)NAV_WIDTH + 22, 151, 160, 34, 8,
                       0xFFDCE2E6u);
+            draw_ripple((int32_t)NAV_WIDTH + 22, 151, 160, 34, 8,
+                        preferences.accent_color);
         } else {
             fill_round((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
                       preferences.accent_color);
+            draw_ripple((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
+                        0xFFFFFFFFu);
         }
     } else {
-        fill_round((int32_t)NAV_WIDTH + 22, 106, 160, 34, 8,
-                  preferences.click_once_open
-                      ? preferences.accent_color : 0xFFDCE2E6u);
-        fill_round((int32_t)NAV_WIDTH + 22, 229, 160, 34, 8,
-                  preferences.grid_enabled
-                      ? preferences.accent_color : 0xFFDCE2E6u);
+        draw_switch((int32_t)NAV_WIDTH + 22, 111,
+                    preferences.click_once_open);
+        draw_switch((int32_t)NAV_WIDTH + 22, 234, preferences.grid_enabled);
     }
     draw_control_labels();
     if (category == 3u && !password_editing) {
@@ -983,15 +1141,6 @@ static void draw_window(void) {
         if (preferences.login_enabled)
             draw_text((int32_t)NAV_WIDTH + 48, 162, "Disable password",
                       0xFF34434Cu, false);
-    } else if (category == 4u || category == PAGE_DEBUG) {
-        bool first = category == 4u ? preferences.click_once_open
-                                    : preferences.debug_fps;
-        bool second = category == 4u ? preferences.grid_enabled
-                                     : preferences.debug_profiler;
-        draw_text((int32_t)NAV_WIDTH + 33, 117, first ? "On" : "Off",
-                  first ? 0xFFFFFFFFu : 0xFF34434Cu, false);
-        draw_text((int32_t)NAV_WIDTH + 33, 240, second ? "On" : "Off",
-                  second ? 0xFFFFFFFFu : 0xFF34434Cu, false);
     }
     draw_settings_message();
 }
@@ -1089,13 +1238,19 @@ static bool inside(int32_t px, int32_t py, int32_t x, int32_t y,
     return px >= x && px < x + width && py >= y && py < y + height;
 }
 
+/* A button; a selected one is filled with the accent, and the fill fades
+ * between buttons as the selection moves. */
 static void draw_button(int32_t x, int32_t y, int32_t width, const char* label,
                         bool selected) {
+    uint32_t v = (uint32_t)ui_smooth(ui_key(4u, x, y + *page_scroll()),
+                                     selected ? 255 : 0, 40u);
     fill_round(x, y, width, TIME_BUTTON_H, 7,
-               selected ? preferences.accent_color : 0xFFDCE2E6u);
+               mix_rgb(0xFFDCE2E6u, preferences.accent_color, v));
+    draw_ripple(x, y, width, TIME_BUTTON_H, 7,
+                v > 127u ? 0xFFFFFFFFu : preferences.accent_color);
     int32_t text_width = (int32_t)ttrend_text_width(label, &small_font);
     draw_text(x + (width - text_width) / 2, y + 10, label,
-              selected ? 0xFFFFFFFFu : 0xFF34434Cu, false);
+              mix_rgb(0xFF34434Cu, 0xFFFFFFFFu, v), false);
 }
 
 static int32_t url_field_width(void) { return content_width() - 78; }
@@ -1381,6 +1536,158 @@ static void time_page_key(const syscall_window_event_t* event) {
     settings_message[0] = '\0';
 }
 
+/* ------------------------------------------------------------ animations */
+#define ANIM_OPEN_Y 60
+#define ANIM_CLOSE_Y 134
+#define ANIM_SPEED_Y 208
+#define ANIM_UI_Y 282
+#define ANIM_PREVIEW_Y 352
+#define ANIM_BUTTON_W 88
+#define ANIM_BUTTON_PITCH 94
+#define PREVIEW_WIDTH 320u
+#define PREVIEW_HEIGHT 190u
+
+static const char* const open_names[] = {"None", "Fade in", "Blocks",
+                                         "Matrix"};
+static const char* const close_names[] = {"None", "Fade out", "Katana",
+                                          "Matrix"};
+static const char* const speed_names[] = {"Slow", "Normal", "Fast"};
+static uint32_t preview_id;
+static uint32_t* preview_pixels;
+static uint64_t preview_open_at;
+static uint64_t preview_close_at;
+static uint64_t last_save_ms;
+
+static int32_t animations_page_height(void) { return ANIM_PREVIEW_Y + 64; }
+
+static void draw_animations_page(void) {
+    int32_t left = content_left();
+    int32_t s = animations_scroll;
+    draw_text(left, ANIM_OPEN_Y - s, "Opening a window", 0xFF34434Cu, true);
+    for (uint32_t i = 0; i < 4u; i++)
+        draw_button(left + (int32_t)i * ANIM_BUTTON_PITCH,
+                    ANIM_OPEN_Y + 26 - s, ANIM_BUTTON_W, open_names[i],
+                    preferences.anim_open == i);
+    draw_text(left, ANIM_CLOSE_Y - s, "Closing a window", 0xFF34434Cu, true);
+    for (uint32_t i = 0; i < 4u; i++)
+        draw_button(left + (int32_t)i * ANIM_BUTTON_PITCH,
+                    ANIM_CLOSE_Y + 26 - s, ANIM_BUTTON_W, close_names[i],
+                    preferences.anim_close == i);
+    draw_text(left, ANIM_SPEED_Y - s, "Speed", 0xFF34434Cu, true);
+    for (uint32_t i = 0; i < 3u; i++)
+        draw_button(left + (int32_t)i * ANIM_BUTTON_PITCH,
+                    ANIM_SPEED_Y + 26 - s, ANIM_BUTTON_W, speed_names[i],
+                    preferences.anim_speed == i);
+    draw_text(left, ANIM_UI_Y - s, "Interface animations", 0xFF34434Cu,
+              true);
+    draw_switch(left, ANIM_UI_Y + 28 - s, preferences.anim_interface != 0u);
+    draw_text(left + 110, ANIM_UI_Y + 34 - s,
+              "Buttons, switches, menus and hover.", 0xFF667680u, false);
+    draw_button(left, ANIM_PREVIEW_Y - s, 120, preview_id ? "Playing..."
+                                                          : "Preview",
+                preview_id != 0u);
+    draw_text(left + 134, ANIM_PREVIEW_Y + 10 - s,
+              "Opens a test window, then closes it.", 0xFF667680u, false);
+    draw_page_scrollbar();
+}
+
+/* The test window: the accent colour fading to dark, with a title. */
+static void paint_preview(void) {
+    settings_surface_t saved = surface;
+    surface = (settings_surface_t){PREVIEW_WIDTH, PREVIEW_HEIGHT,
+                                   preview_pixels};
+    for (uint32_t y = 0; y < PREVIEW_HEIGHT; y++)
+        for (uint32_t x = 0; x < PREVIEW_WIDTH; x++)
+            preview_pixels[y * PREVIEW_WIDTH + x] = mix_rgb(
+                preferences.accent_color, 0xFF1B2A36u,
+                (x + y) * 200u / (PREVIEW_WIDTH + PREVIEW_HEIGHT));
+    for (uint32_t i = 0; i < 5u; i++)
+        fill_round(24 + (int32_t)i * 56, 112, 44, 44, 10,
+                   mix_rgb(0xFFFFFFFFu, preferences.accent_color,
+                           60u + i * 30u));
+    draw_text(24, 32, "Animation preview", 0xFFFFFFFFu, true);
+    draw_text(24, 62, "This window closes by itself.", 0xFFE4ECF2u, false);
+    surface = saved;
+}
+
+static void preview_request(void) {
+    if (preview_id || preview_open_at) return;
+    /* mosWM reads the settings about twice a second: give a change made
+     * just now time to arrive, so the preview shows it. */
+    uint64_t now = ui_uptime();
+    preview_open_at = last_save_ms + 700u > now ? last_save_ms + 700u : now;
+}
+
+static void preview_tick(void) {
+    uint64_t now = ui_uptime();
+    if (preview_open_at && now >= preview_open_at) {
+        preview_open_at = 0;
+        if (!preview_pixels)
+            preview_pixels = malloc(PREVIEW_WIDTH * PREVIEW_HEIGHT * 4u);
+        syscall_window_info_t info = {0};
+        mos_window_get_info(window_id, &info);
+        if (preview_pixels)
+            preview_id = mos_window_create(0, (int32_t)info.x + 170,
+                                           (int32_t)info.y + 90,
+                                           PREVIEW_WIDTH, PREVIEW_HEIGHT,
+                                           "Animation preview");
+        if (!preview_id) {
+            strcpy(settings_message, "Could not open the preview.");
+        } else {
+            paint_preview();
+            mos_window_present(preview_id, preview_pixels,
+                               PREVIEW_WIDTH * sizeof(uint32_t), 0, 0,
+                               PREVIEW_WIDTH, PREVIEW_HEIGHT);
+            /* Long enough to see the opening finish, even when slow. */
+            preview_close_at = now + 2200u;
+        }
+        needs_redraw = true;
+    }
+    if (!preview_id) return;
+    syscall_window_event_t event = {0};
+    bool close = now >= preview_close_at;
+    while (mos_window_next_event(preview_id, &event) == SYS_SUCCESS)
+        if (event.type == SYSCALL_WINDOW_EVENT_CLOSE_REQUEST) close = true;
+    if (close) {
+        mos_window_close(preview_id);
+        preview_id = 0;
+        needs_redraw = true;
+    }
+}
+
+static void animations_page_mouse(int32_t x, int32_t y, bool pressed) {
+    if (!pressed || y < CONTENT_TOP || x < (int32_t)NAV_WIDTH) return;
+    int32_t left = content_left();
+    int32_t py = y + animations_scroll;
+    mosdesk_settings_t previous = preferences;
+    int32_t column = (x - left) / ANIM_BUTTON_PITCH;
+    bool on_column = x >= left &&
+        (x - left) % ANIM_BUTTON_PITCH < ANIM_BUTTON_W;
+    if (on_column && column < 4 &&
+        inside(x, py, left, ANIM_OPEN_Y + 26, 4 * ANIM_BUTTON_PITCH,
+               TIME_BUTTON_H)) {
+        preferences.anim_open = (uint32_t)column;
+    } else if (on_column && column < 4 &&
+               inside(x, py, left, ANIM_CLOSE_Y + 26, 4 * ANIM_BUTTON_PITCH,
+                      TIME_BUTTON_H)) {
+        preferences.anim_close = (uint32_t)column;
+    } else if (on_column && column < 3 &&
+               inside(x, py, left, ANIM_SPEED_Y + 26, 3 * ANIM_BUTTON_PITCH,
+                      TIME_BUTTON_H)) {
+        preferences.anim_speed = (uint32_t)column;
+    } else if (inside(x, py, left - 6, ANIM_UI_Y + 22, 100, 36)) {
+        preferences.anim_interface = !preferences.anim_interface;
+    } else if (inside(x, py, left, ANIM_PREVIEW_Y, 120, TIME_BUTTON_H)) {
+        preview_request();
+        return;
+    } else {
+        return;
+    }
+    if (!memcmp(&previous, &preferences, sizeof(previous))) return;
+    save_preferences(&previous);
+    last_save_ms = ui_uptime();
+}
+
 static void handle_wheel(const syscall_window_event_t* event) {
     int32_t step = event->wheel < 0 ? 44 : -44;
     /* Over the pointer-speed slider the wheel moves the slider. */
@@ -1402,7 +1709,8 @@ static void handle_wheel(const syscall_window_event_t* event) {
     } else if (category == PAGE_TIME) {
         if (!time_page_wheel(event->x, event->y, event->wheel))
             scroll_page_by(step);
-    } else if (category == PAGE_APPEARANCE) {
+    } else if (category == PAGE_APPEARANCE ||
+               category == PAGE_ANIMATIONS) {
         scroll_page_by(step);
     }
 }
@@ -1419,11 +1727,17 @@ static void handle_mouse(const syscall_window_event_t* event) {
     mosdesk_settings_t previous = preferences;
     int32_t x = event->x;
     int32_t y = event->y;
-    if ((category == PAGE_APPEARANCE || category == PAGE_TIME) &&
+    if (pressed) ui_press(x, y);
+    if ((category == PAGE_APPEARANCE || category == PAGE_TIME ||
+         category == PAGE_ANIMATIONS) &&
         page_scroll_drag(x, y, pressed))
         return;
     if (category == PAGE_TIME) {
         time_page_mouse(x, y, pressed);
+        if (x >= (int32_t)NAV_WIDTH) return;
+    }
+    if (category == PAGE_ANIMATIONS) {
+        animations_page_mouse(x, y, pressed);
         if (x >= (int32_t)NAV_WIDTH) return;
     }
     /* Only the pointer-speed slider follows a held button; everything else
@@ -1515,8 +1829,13 @@ static bool mouse_changed_window(const syscall_window_event_t* event) {
     int32_t scroll_before = appearance_scroll, time_scroll_before = time_scroll;
     uint32_t time_ui_before = time_ui_generation;
     bool dragging_before = scroll_dragging, editing_before = password_editing;
+    uint64_t press_before = press_ms;
+    int32_t animations_before = animations_scroll;
+    uint64_t preview_before = preview_open_at;
     handle_mouse(event);
     return hover_before != nav_hover || page_before != category ||
+           press_before != press_ms || animations_before != animations_scroll ||
+           preview_before != preview_open_at ||
            scroll_before != appearance_scroll ||
            time_scroll_before != time_scroll ||
            time_ui_before != time_ui_generation ||
@@ -1666,9 +1985,13 @@ int main(int argc, char** argv) {
         }
         /* Drawing and presenting only when something changed keeps the
          * compositor from recompositing this window every frame. */
+        preview_tick();
+        /* Keep drawing while a control is still moving. */
+        if (ui_animating) needs_redraw = true;
         if (needs_redraw) {
             needs_redraw = false;
             draw_window();
+            ui_was_animating = ui_animating;
             mos_window_present(window_id, surface.pixels,
                 surface.width * sizeof(uint32_t), 0, 0,
                 surface.width, surface.height);

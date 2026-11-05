@@ -18,6 +18,8 @@ https://github.com/user-attachments/assets/f69558d4-2eb4-4ade-a4f1-567f23482287
 - Shows only Home and System on the desktop by itself; everything else comes from the user's Desktop folder. "Add to desktop" (right-click an app in the launcher or anything in Files) puts a `.lnk` shortcut there
 - Files can copy or move an item into any folder through a "Copy to... / Move to..." folder picker
 - Offers a "2000s Aero" window style next to the modern one (Settings > Appearance > Window style): blurred, accent-tinted glass frames and panel, Windows 7 style caption buttons and a start orb; easyui apps follow it
+- Animates windows opening (Fade in, Blocks, Matrix) and closing (Fade out, Katana, Matrix), chosen in Settings > Animations along with the speed; a Preview button plays them. Minimizing shrinks windows into the panel, menus slide in, and hover highlights, switches and buttons fade and slide (Interface animations can be turned off)
+- easyui apps follow the window style and color theme: the Modern look is tinted by the theme, and under Liquid Glass apps are dark frosted glass with mosWM's blurred glass showing behind them
 - Includes six coordinated color themes and eight photo wallpapers selectable in Settings > Appearance, with fill, crop, stretch, and rotation controls
 - Renders smooth, anti-aliased OpenType/TrueType text (Inter, bundled) through the reusable `ttrend` / `ttrend_outline` libraries, with the bitmap font as a fallback
 - Produces SDK `.slib` bundles that can be consumed by other freestanding programs
@@ -66,7 +68,7 @@ installed into `0:/programs` with a `mos_` prefix:
 
 | Source | Built as | What it is |
 | --- | --- | --- |
-| `mosdesk/apps/calc.c` | `0:/programs/mos_calc.run` | Calculator (easyui) |
+| `mosdesk/apps/calc.c` | `0:/programs/mos_calc.run` | Calculator (easyui): whole calculations like `1+3+5/4` with the usual order of operations; make the window bigger for scientific keys (trig, logs, powers, roots, factorials) |
 | `mosdesk/apps/clock.c` | `0:/programs/mos_clock.run` | Analogue clock |
 | `mosdesk/apps/cube.c` | `0:/programs/mos_cube.run` | 3D cube with FarcadeGL: built-in lighting or an FGSL shader (L / S keys) |
 | `mosdesk/apps/edit.c` | `0:/programs/mos_edit.run` | Text editor |

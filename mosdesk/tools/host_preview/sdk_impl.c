@@ -33,6 +33,7 @@ static char hid_to_ascii(uint32_t key, uint32_t mods) {
 }
 uint64_t mos_syscall3(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
     switch (n) {
+    case SYS_UPTIME: return harness_uptime_ms;
     case SYS_HEAP: if (a == 1) return (uint64_t)(uintptr_t)calloc(1, c); if (a == 2) { free((void*)(uintptr_t)b); return 0; } return (uint64_t)-1;
     case SYS_OPEN: { int fd = open((const char*)(uintptr_t)a, b == 1 ? O_RDWR : O_RDONLY); return fd < 0 ? (uint64_t)-1 : (uint64_t)fd; }
     case SYS_FWRITE: return (uint64_t)write((int)a, (const void*)(uintptr_t)b, (size_t)c);

@@ -49,3 +49,21 @@ typedef struct {
     char created_date[32];
     char last_changed[32];
 } syscall_file_metadata_t;
+/* --- additions: the panel's sound menu (SYS_AUDIO_MIXER) --- */
+#define SYS_AUDIO_MIXER 43
+#define SYS_AUDIO_MIXER_GET    1u
+#define SYS_AUDIO_MIXER_VOLUME 2u
+#define SYS_AUDIO_MIXER_MUTE   3u
+#define SYS_AUDIO_MIXER_OUTPUT 4u
+#define SYSCALL_AUDIO_MAX_OUTPUTS 8u
+#define SYSCALL_AUDIO_OUTPUT_NAME 40u
+typedef struct {
+    uint32_t op;
+    uint32_t value;
+    uint32_t volume;
+    uint32_t muted;
+    uint32_t output_count;
+    int32_t output;
+    char driver[24];
+    char outputs[SYSCALL_AUDIO_MAX_OUTPUTS][SYSCALL_AUDIO_OUTPUT_NAME];
+} syscall_audio_mixer_t;

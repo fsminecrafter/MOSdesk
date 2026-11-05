@@ -34,3 +34,10 @@ uint32_t* settings_event(const syscall_window_event_t* e, uint32_t w, uint32_t h
     draw_window();
     return surface.pixels;
 }
+/* Draws again without any input: an animation in progress moves on. */
+uint32_t* settings_redraw(uint32_t w, uint32_t h) {
+    ui_was_animating = ui_animating;
+    resize_surface(w, h);
+    draw_window();
+    return surface.pixels;
+}

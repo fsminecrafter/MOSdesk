@@ -63,6 +63,18 @@
 #define MOSDESK_TIME_POLL_MIN 5u
 #define MOSDESK_TIME_POLL_MAX 60u
 #define MOSDESK_AUDIO_OUTPUT_SIZE 40u
+/* Window animations (Settings > Animations). */
+#define MOSDESK_ANIM_NONE 0u
+#define MOSDESK_ANIM_OPEN_FADE 1u
+#define MOSDESK_ANIM_OPEN_BLOCKS 2u
+#define MOSDESK_ANIM_OPEN_MATRIX 3u
+#define MOSDESK_ANIM_CLOSE_FADE 1u
+#define MOSDESK_ANIM_CLOSE_KATANA 2u
+#define MOSDESK_ANIM_CLOSE_MATRIX 3u
+#define MOSDESK_ANIM_EFFECT_MAX 3u
+#define MOSDESK_ANIM_SPEED_SLOW 0u
+#define MOSDESK_ANIM_SPEED_NORMAL 1u
+#define MOSDESK_ANIM_SPEED_FAST 2u
 #define MOSDESK_TIME_DEFAULT_URL \
     "https://timeapi.io/api/v1/time/current/unix_ms"
 
@@ -102,7 +114,19 @@ typedef struct {
     uint32_t audio_volume;              /* 0-100 */
     uint32_t audio_muted;
     char audio_output[MOSDESK_AUDIO_OUTPUT_SIZE];
+    /* Settings > Animations: MOSDESK_ANIM_* for windows opening and
+     * closing, whether buttons, switches and menus animate, and how fast. */
+    uint32_t anim_open;
+    uint32_t anim_close;
+    uint32_t anim_interface;
+    uint32_t anim_speed;
 } mosdesk_settings_t;
+
+/* The layout before the animation settings: a file of this size is the
+ * leading part of mosdesk_settings_t. */
+typedef struct {
+    uint8_t leading[offsetof(mosdesk_settings_t, anim_open)];
+} mosdesk_settings_v9_t;
 
 /* The layout before the sound settings: a file of this size is the
  * leading part of mosdesk_settings_t. */
@@ -372,6 +396,13 @@ static inline void mosdesk_settings_time_defaults(mosdesk_settings_t* settings) 
         settings->time_sync_url[i] = i < sizeof(url) ? url[i] : '\0';
 }
 
+static inline void mosdesk_settings_anim_defaults(mosdesk_settings_t* settings) {
+    settings->anim_open = MOSDESK_ANIM_OPEN_FADE;
+    settings->anim_close = MOSDESK_ANIM_CLOSE_FADE;
+    settings->anim_interface = 1u;
+    settings->anim_speed = MOSDESK_ANIM_SPEED_NORMAL;
+}
+
 static inline mosdesk_settings_t mosdesk_settings_default(void) {
     mosdesk_settings_t settings = {0};
     settings.magic = MOSDESK_SETTINGS_MAGIC;
@@ -388,6 +419,7 @@ static inline mosdesk_settings_t mosdesk_settings_default(void) {
     }
     mosdesk_settings_time_defaults(&settings);
     settings.audio_volume = 80u;
+    mosdesk_settings_anim_defaults(&settings);
     return settings;
 }
 
@@ -401,6 +433,11 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
                 (uintptr_t)&settings, sizeof(settings)) !=
             (long)sizeof(settings))
+            settings = mosdesk_settings_default();
+    } else if (size == (long)sizeof(mosdesk_settings_v9_t)) {
+        /* v9 is the leading part; the animations keep their defaults. */
+        if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
+                (uintptr_t)&settings, (uint64_t)size) != size)
             settings = mosdesk_settings_default();
     } else if (size == (long)sizeof(mosdesk_settings_v8_t)) {
         /* v8 is the leading part; the sound settings keep their defaults. */
@@ -559,6 +596,11 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         settings.audio_muted = 0u;
         settings.audio_output[0] = '\0';
     }
+    if (settings.anim_open > MOSDESK_ANIM_EFFECT_MAX ||
+        settings.anim_close > MOSDESK_ANIM_EFFECT_MAX ||
+        settings.anim_interface > 1u ||
+        settings.anim_speed > MOSDESK_ANIM_SPEED_FAST)
+        mosdesk_settings_anim_defaults(&settings);
     /* An unusable name is asked for again rather than used as a path. */
     if (!mosdesk_username_valid(settings.username))
         settings.username[0] = '\0';
