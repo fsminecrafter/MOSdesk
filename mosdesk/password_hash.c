@@ -2,7 +2,14 @@
 #include <string.h>
 
 #include "password_hash.h"
+/* SHA-256 from minimaSSL. MOSdesk's own SDK submodule when it is checked
+ * out; otherwise the SDK doing the build (Minimal-OS builds MOSdesk with
+ * its own, MOSDESK_SDK_DIR), found through that SDK's include directory. */
+#if __has_include("../Minimal-OS-SDK/libraries/minimaSSL/src/crypto.c")
 #include "../Minimal-OS-SDK/libraries/minimaSSL/src/crypto.c"
+#else
+#include "../libraries/minimaSSL/src/crypto.c"
+#endif
 
 #define PASSWORD_HASH_ROUNDS 4096u
 #define PASSWORD_MAX_LENGTH 63u
