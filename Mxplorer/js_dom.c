@@ -2381,7 +2381,7 @@ static int network_get(const char* url, char** body, size_t* length) {
 static js_val win_fetch(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self; (void)callee;
     js_str* url = ARG(0).type == JS_OBJ ? js_to_string(js_get_c(ARG(0), "url")) : js_to_string(ARG(0));
-    char resolved[1024];
+    char resolved[2048];
     mx_html_resolve(url->data, resolved, sizeof(resolved));
     if (ARG(1).type == JS_OBJ) {
         js_val method = js_get_c(ARG(1), "method");
@@ -2428,7 +2428,7 @@ static js_val xhr_method(js_val self, js_val* args, int argc, js_obj* callee) {
         js_set_c(self, "readyState", js_num(1));
         return js_undef();
     case 2: {   /* send */
-        char resolved[1024];
+        char resolved[2048];
         mx_html_resolve(js_to_string(js_get_c(self, "\x01url"))->data, resolved, sizeof(resolved));
         char* body = NULL;
         size_t length = 0;
@@ -2536,7 +2536,7 @@ static js_val url_to_string(js_val self, js_val* args, int argc, js_obj* callee)
 
 static js_val url_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self; (void)callee;
-    char resolved[1024];
+    char resolved[2048];
     js_str* input = js_to_string(ARG(0));
     if (argc > 1) {
         js_str* base = js_to_string(ARG(1));
@@ -2746,7 +2746,7 @@ static void run_script_node(mx_node_t* script) {
         return;
     const char* src = mx_dom_attr(script, "src");
     if (src && *src) {
-        char url[1024];
+        char url[2048];
         mx_html_resolve(src, url, sizeof(url));
         char* body = NULL;
         size_t length = 0;
@@ -3122,6 +3122,95 @@ void js_dom_init(void) {
 
 static int active;
 
+/* Browser APIs that are simplest to write in JavaScript on top of the
+ * native DOM. Runs once per page, before the page's own scripts. */
+static const char js_prelude[] =
+"(function(){\n"
+"var NF={FILTER_ACCEPT:1,FILTER_REJECT:2,FILTER_SKIP:3,SHOW_ALL:0xFFFFFFFF,SHOW_ELEMENT:1,\n"
+" SHOW_ATTRIBUTE:2,SHOW_TEXT:4,SHOW_CDATA_SECTION:8,SHOW_PROCESSING_INSTRUCTION:64,\n"
+" SHOW_COMMENT:128,SHOW_DOCUMENT:256,SHOW_DOCUMENT_TYPE:512,SHOW_DOCUMENT_FRAGMENT:1024};\n"
+"window.NodeFilter=NF;\n"
+"function W(root,what,filter){this.root=root;this.whatToShow=what===undefined?0xFFFFFFFF:what>>>0;\n"
+" this.filter=filter||null;this.currentNode=root;}\n"
+"W.prototype._ok=function(n){var t=n.nodeType||1;if(!(this.whatToShow&(1<<(t-1))))return 3;\n"
+" var f=this.filter;if(!f)return 1;var r=typeof f==='function'?f(n):f.acceptNode(n);return r||1;};\n"
+"W.prototype._next=function(n,skipKids){if(!skipKids&&n.firstChild)return n.firstChild;\n"
+" while(n&&n!==this.root){if(n.nextSibling)return n.nextSibling;n=n.parentNode;}return null;};\n"
+"W.prototype._prev=function(n){if(n===this.root)return null;var p=n.previousSibling;\n"
+" if(!p)return n.parentNode;while(p.lastChild)p=p.lastChild;return p;};\n"
+"W.prototype.nextNode=function(){var n=this.currentNode,r=1;\n"
+" for(;;){n=this._next(n,r===2);if(!n)return null;r=this._ok(n);if(r===1)return this.currentNode=n;}};\n"
+"W.prototype.previousNode=function(){var n=this.currentNode;\n"
+" for(;;){n=this._prev(n);if(!n)return null;if(this._ok(n)===1)return this.currentNode=n;}};\n"
+"W.prototype.parentNode=function(){var n=this.currentNode;\n"
+" while(n&&n!==this.root){n=n.parentNode;if(n&&this._ok(n)===1)return this.currentNode=n;}return null;};\n"
+"W.prototype._kid=function(first){for(var n=first?this.currentNode.firstChild:this.currentNode.lastChild;n;\n"
+" n=first?n.nextSibling:n.previousSibling)if(this._ok(n)===1)return this.currentNode=n;return null;};\n"
+"W.prototype.firstChild=function(){return this._kid(true);};\n"
+"W.prototype.lastChild=function(){return this._kid(false);};\n"
+"W.prototype._sib=function(next){if(this.currentNode===this.root)return null;\n"
+" for(var n=next?this.currentNode.nextSibling:this.currentNode.previousSibling;n;\n"
+" n=next?n.nextSibling:n.previousSibling)if(this._ok(n)===1)return this.currentNode=n;return null;};\n"
+"W.prototype.nextSibling=function(){return this._sib(true);};\n"
+"W.prototype.previousSibling=function(){return this._sib(false);};\n"
+"window.TreeWalker=W;\n"
+"document.createTreeWalker=function(root,what,filter){return new W(root,what,filter);};\n"
+"document.createNodeIterator=function(root,what,filter){var w=new W(root,what,filter),started=false;\n"
+" return {root:root,whatToShow:w.whatToShow,filter:w.filter,referenceNode:root,detach:function(){},\n"
+"  nextNode:function(){if(!started){started=true;if(w._ok(root)===1)return root;}return w.nextNode();},\n"
+"  previousNode:function(){return w.previousNode();}};};\n"
+"var p=window.performance,t0=Date.now()-Math.round(p.now());\n"
+"var fields=['navigationStart','unloadEventStart','unloadEventEnd','redirectStart','redirectEnd',\n"
+" 'fetchStart','domainLookupStart','domainLookupEnd','connectStart','connectEnd','secureConnectionStart',\n"
+" 'requestStart','responseStart','responseEnd','domLoading','domInteractive','domContentLoadedEventStart',\n"
+" 'domContentLoadedEventEnd','domComplete','loadEventStart','loadEventEnd'];\n"
+"var timing={};for(var i=0;i<fields.length;i++)timing[fields[i]]=t0;p.timing=timing;\n"
+"p.navigation={type:0,redirectCount:0};p.timeOrigin=t0;\n"
+"var nav={name:location.href,entryType:'navigation',startTime:0,duration:0,type:'navigate',\n"
+" initiatorType:'navigation',nextHopProtocol:'http/1.1',transferSize:0,encodedBodySize:0,decodedBodySize:0};\n"
+"for(var i=0;i<fields.length;i++)if(fields[i]!=='navigationStart')nav[fields[i]]=0;\n"
+"nav.toJSON=function(){return this;};\n"
+"p.getEntriesByType=function(t){return t==='navigation'?[nav]:[];};\n"
+"p.getEntriesByName=function(){return [];};p.getEntries=function(){return [nav];};\n"
+"if(!p.clearMarks)p.clearMarks=function(){};if(!p.clearMeasures)p.clearMeasures=function(){};\n"
+"if(!p.setResourceTimingBufferSize)p.setResourceTimingBufferSize=function(){};\n"
+"if(!window.PerformanceObserver){var PO=function(cb){this.cb=cb;};PO.prototype.observe=function(){};\n"
+" PO.prototype.disconnect=function(){};PO.prototype.takeRecords=function(){return [];};\n"
+" PO.supportedEntryTypes=[];window.PerformanceObserver=PO;}\n"
+"{ /* replaces the native stub: listeners, reason, throwIfAborted, any() */\n"
+" var AS=function(){this.aborted=false;this.reason=undefined;this.onabort=null;this._l=[];};\n"
+" var abortError=function(name){var e=new Error(name==='TimeoutError'?'The operation timed out.':'The operation was aborted.');e.name=name||'AbortError';return e;};\n"
+" AS.prototype.addEventListener=function(t,f){if(t==='abort'&&f)this._l.push(f);};\n"
+" AS.prototype.removeEventListener=function(t,f){var i=this._l.indexOf(f);if(i>=0)this._l.splice(i,1);};\n"
+" AS.prototype.dispatchEvent=function(){return true;};\n"
+" AS.prototype.throwIfAborted=function(){if(this.aborted)throw this.reason;};\n"
+" AS.prototype._abort=function(r){if(this.aborted)return;this.aborted=true;\n"
+"  this.reason=r===undefined?abortError():r;var e={type:'abort',target:this,currentTarget:this};\n"
+"  if(typeof this.onabort==='function')this.onabort.call(this,e);\n"
+"  var l=this._l.slice();for(var i=0;i<l.length;i++){var f=l[i];if(typeof f==='function')f.call(this,e);else if(f&&f.handleEvent)f.handleEvent(e);}};\n"
+" AS.abort=function(r){var s=new AS();s._abort(r);return s;};\n"
+" AS.timeout=function(ms){var s=new AS();setTimeout(function(){s._abort(abortError('TimeoutError'));},ms);return s;};\n"
+" AS.any=function(list){var s=new AS();for(var i=0;i<list.length;i++){(function(x){\n"
+"  if(x.aborted)s._abort(x.reason);else x.addEventListener('abort',function(){s._abort(x.reason);});})(list[i]);}return s;};\n"
+" var AC=function(){this.signal=new AS();};AC.prototype.abort=function(r){this.signal._abort(r);};\n"
+" window.AbortSignal=AS;window.AbortController=AC;}\n"
+"try{var cl=document.documentElement.classList,cp=Object.getPrototypeOf(cl);\n"
+" if(cp&&!cp[Symbol.iterator])cp[Symbol.iterator]=function(){var a=[];for(var i=0;i<this.length;i++)a.push(this.item(i));return a[Symbol.iterator]();};}catch(e){}\n"
+"})();\n";
+
+static void run_prelude(void) {
+    char error[160];
+    int line = 0;
+    js_rt.steps = 0;
+    js_rt.step_limit = 1000000;     /* enter() sets the real limit per script */
+    js_node* program = js_parse(js_prelude, sizeof(js_prelude) - 1, "prelude", error, sizeof(error), &line);
+    if (program) js_exec_program(program);
+    if (js_rt.ctl == CTL_THROW) js_report_exception();
+    js_rt.ctl = CTL_NONE;
+    js_rt.steps = 0;
+    js_rt.timed_out = 0;
+}
+
 void mx_js_begin(mx_document_t* doc, const char* url, const mx_js_host_t* host) {
     mx_js_end();
     memset(&js_rt, 0, sizeof(js_rt));
@@ -3132,6 +3221,7 @@ void mx_js_begin(mx_document_t* doc, const char* url, const mx_js_host_t* host) 
     js_core_init();
     js_runtime_init();
     js_dom_init();
+    run_prelude();
     active = 1;
 }
 

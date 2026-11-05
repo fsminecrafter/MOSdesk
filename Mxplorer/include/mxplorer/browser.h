@@ -6,7 +6,7 @@
 
 #define MX_BROWSER_MAX_TABS 12
 #define MX_BROWSER_MAX_HISTORY 16
-#define MX_BROWSER_URL_LENGTH 512
+#define MX_BROWSER_URL_LENGTH 2048
 
 /* Chrome geometry (window client coordinates). */
 #define MX_BROWSER_TAB_HEIGHT 40

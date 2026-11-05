@@ -1,6 +1,9 @@
 #include "mxplorer/devlog.h"
 #include "mxplorer/util.h"
 #include "string.h"
+#ifndef MX_HOST
+#include "minimalos.h"
+#endif
 
 static mx_console_entry_t console_entries[MX_CONSOLE_MAX];
 static int console_first;
@@ -39,6 +42,26 @@ void mx_console_add(mx_log_level_t level, const char* source, int line,
     entry->time_ms = mx_now_ms();
     mx_copy(entry->source, sizeof(entry->source), source ? source : "");
     mx_copy(entry->text, sizeof(entry->text), text ? text : "");
+#ifndef MX_HOST
+    /* Also to the kernel log, so 'make netboot' shows site errors live. */
+    static const char* const names[] = {"log", "info", "warn", "error", "debug", "input", "result", "page"};
+    static char log_line[sizeof(entry->text) + sizeof(entry->source) + 48];
+    log_line[0] = 0;
+    mx_append(log_line, sizeof(log_line), "console ");
+    mx_append(log_line, sizeof(log_line),
+              (unsigned)level < sizeof(names) / sizeof(names[0]) ? names[level] : "?");
+    mx_append(log_line, sizeof(log_line), ": ");
+    if (entry->source[0]) {
+        mx_append(log_line, sizeof(log_line), entry->source);
+        if (line > 0) {
+            mx_append(log_line, sizeof(log_line), ":");
+            mx_append_int(log_line, sizeof(log_line), line);
+        }
+        mx_append(log_line, sizeof(log_line), " ");
+    }
+    mx_append(log_line, sizeof(log_line), entry->text);
+    mos_log(log_line);
+#endif
 }
 
 void mx_console_clear(void) {

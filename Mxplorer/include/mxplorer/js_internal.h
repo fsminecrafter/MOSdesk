@@ -59,6 +59,7 @@ typedef js_val (*js_native)(js_val self, js_val* args, int argc,
 typedef struct js_obj {
     uint8_t cls;
     uint8_t frozen;
+    uint8_t typed;              /* typed array element type (js_typed.c), 0: none */
     int16_t magic;              /* native function variant */
     struct js_obj* proto;
     js_prop* props;
@@ -159,6 +160,8 @@ typedef struct js_env {
     js_obj* new_target;
     uint8_t is_function;
     uint8_t on_stack;
+    uint8_t captured;      /* a closure keeps this scope alive */
+    uint8_t pool_class;    /* 1..: may go back to that free list; 0: never */
 } js_env;
 
 /* ---- runtime ---- */
@@ -196,6 +199,12 @@ extern js_obj* js_promise_proto;
 extern js_obj* js_map_proto;
 extern js_obj* js_set_proto;
 extern js_env* js_global_env;
+
+js_val js_list_iterator(js_obj* values);
+
+/* js_typed.c */
+double js_typed_coerce(int kind, double n);
+void js_typed_init(void);
 extern mx_document_t* js_doc;
 extern mx_js_host_t js_host;
 

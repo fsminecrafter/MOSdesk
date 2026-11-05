@@ -10,6 +10,8 @@
 #include "mxplorer/media.h"
 #include "mxplorer/devlog.h"
 #include "mxplorer/http.h"
+#include "mxplorer/image_decode.h"
+#include "mxplorer/cache.h"
 #include "mxplorer/icon_ids.h"
 #include "mxplorer/text.h"
 #include "mxplorer/util.h"
@@ -26,7 +28,7 @@
 
 #define MAX_IMAGES 96
 #define MAX_PLAYERS 8
-#define URL_MAX 1024
+#define URL_MAX 2048
 #define IMAGE_FILE_MAX (64u * 1024u * 1024u)
 #define PIXEL_BUDGET (40u * 1024u * 1024u)   /* decoded pixels kept, all pictures */
 #define SOUND_FILE "0:/data/mxplorer-video.vid"
@@ -87,8 +89,13 @@ int mx_media_kind_of_url(const char* url) {
     while (url[n] && url[n] != '?' && url[n] != '#') n++;
     if (n < 5 || url[n - 4] != '.') return MX_MEDIA_NONE;
     char ext[4] = {mx_lower(url[n - 3]), mx_lower(url[n - 2]), mx_lower(url[n - 1]), 0};
-    if (!strcmp(ext, "img")) return MX_MEDIA_IMAGE;
+    if (!strcmp(ext, "img") || !strcmp(ext, "png") || !strcmp(ext, "jpg") ||
+        !strcmp(ext, "gif"))
+        return MX_MEDIA_IMAGE;
     if (!strcmp(ext, "vid")) return MX_MEDIA_VIDEO;
+    if (n >= 6 && url[n - 5] == '.' && mx_lower(url[n - 4]) == 'j' && mx_lower(url[n - 3]) == 'p' &&
+        mx_lower(url[n - 2]) == 'e' && mx_lower(url[n - 1]) == 'g')
+        return MX_MEDIA_IMAGE;
     return MX_MEDIA_NONE;
 }
 
@@ -180,48 +187,147 @@ static image_t* find_image(const char* url) {
     return NULL;
 }
 
-static image_t* get_image(const char* url) {
-    image_t* img = find_image(url);
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int base64_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+/* The bytes of a data: address (base64 or percent-encoded). */
+static uint8_t* decode_data_url(const char* url, size_t* size) {
+    const char* comma = strchr(url, ',');
+    if (!comma) return NULL;
+    int base64 = 0;
+    for (const char* p = url; p + 7 <= comma; p++)
+        if (!strncmp(p, ";base64", 7)) base64 = 1;
+    const char* in = comma + 1;
+    size_t n = strlen(in);
+    if (n > IMAGE_FILE_MAX) return NULL;
+    uint8_t* out = (uint8_t*)malloc(n + 1);
+    if (!out) return NULL;
+    size_t used = 0;
+    if (base64) {
+        uint32_t acc = 0;
+        int bits = 0;
+        for (size_t i = 0; i < n; i++) {
+            char c = in[i];
+            if (c == '%' && i + 2 < n && hex_value(in[i + 1]) >= 0 && hex_value(in[i + 2]) >= 0) {
+                c = (char)(hex_value(in[i + 1]) * 16 + hex_value(in[i + 2]));
+                i += 2;
+            }
+            int v = base64_value(c);
+            if (v < 0) continue;            /* '=', spaces, line breaks */
+            acc = acc << 6 | (uint32_t)v;
+            bits += 6;
+            if (bits >= 8) { bits -= 8; out[used++] = (uint8_t)(acc >> bits); }
+        }
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            if (in[i] == '%' && i + 2 < n && hex_value(in[i + 1]) >= 0 && hex_value(in[i + 2]) >= 0) {
+                out[used++] = (uint8_t)(hex_value(in[i + 1]) * 16 + hex_value(in[i + 2]));
+                i += 2;
+            } else {
+                out[used++] = (uint8_t)in[i];
+            }
+        }
+    }
+    *size = used;
+    return out;
+}
+
+/* `key` names the picture in the cache; `src` is where it comes from
+ * (the same address, or a data: address too long to use as the key). */
+static image_t* get_image_from(const char* key, const char* src) {
+    image_t* img = find_image(key);
     if (img) return img;
     if (image_count >= MAX_IMAGES) return NULL;
     img = &images[image_count++];
     memset(img, 0, sizeof(*img));
-    mx_copy(img->url, sizeof(img->url), url);
+    mx_copy(img->url, sizeof(img->url), key);
     img->state = ST_FAILED;
     size_t size = 0;
-    uint8_t* data = load_file(url, "image", IMAGE_FILE_MAX, &size);
+    int inline_data = !strncmp(src, "data:", 5);
+    uint8_t* data = inline_data ? decode_data_url(src, &size)
+                                : load_file(src, "image", IMAGE_FILE_MAX, &size);
     if (!data) {
-        report("Could not load the picture", url);
+        report("Could not load the picture", key);
         return img;
     }
     mimg_info_t info;
-    if (!mimg_info(data, size, &info)) {
-        report("Not a .img picture, or damaged", url);
-        free(data);
-        return img;
-    }
-    size_t count = (size_t)info.width * info.height;
-    if (pixels_used + count > PIXEL_BUDGET) {
-        report("Too many pictures on this page; skipped", url);
-        free(data);
-        return img;
-    }
-    img->px = (uint32_t*)malloc(count * 4u);
-    if (!img->px || !mimg_decode(data, size, img->px, info.width)) {
-        report(img->px ? "Damaged .img picture" : "Not enough memory for the picture", url);
-        free(img->px);
-        img->px = NULL;
-        free(data);
-        return img;
+    uint32_t* px = NULL;
+    int w = 0, h = 0, alpha = 0;
+    if (mimg_info(data, size, &info)) {
+        /* Minimal-OS's own .img */
+        size_t count = (size_t)info.width * info.height;
+        if (pixels_used + count > PIXEL_BUDGET) {
+            report("Too many pictures on this page; skipped", key);
+            free(data);
+            return img;
+        }
+        px = (uint32_t*)malloc(count * 4u);
+        if (!px || !mimg_decode(data, size, px, info.width)) {
+            report(px ? "Damaged .img picture" : "Not enough memory for the picture", key);
+            free(px);
+            free(data);
+            return img;
+        }
+        w = (int)info.width;
+        h = (int)info.height;
+        alpha = info.alpha;
+    } else {
+        /* PNG, JPEG, GIF from the web, decoded to the same pixels */
+        const char* why = "";
+        px = mx_image_decode(data, size, &w, &h, &alpha, &why);
+        if (!px) {
+            char text[160];
+            mx_copy(text, sizeof(text), "Picture not shown (");
+            mx_append(text, sizeof(text), why);
+            mx_append(text, sizeof(text), ")");
+            report(text, key);
+            free(data);
+            return img;
+        }
+        if (pixels_used + (size_t)w * h > PIXEL_BUDGET) {
+            report("Too many pictures on this page; skipped", key);
+            free(px);
+            free(data);
+            return img;
+        }
+        /* Keep it converted: next time the cache hands back a .img and
+         * nothing is decoded again (only for downloaded pictures). */
+        if (!inline_data) {
+            size_t cap = mimg_encode_bound((uint32_t)w, (uint32_t)h);
+            uint8_t* encoded = cap <= IMAGE_FILE_MAX ? (uint8_t*)malloc(cap) : NULL;
+            size_t made = encoded ? mimg_encode(px, (uint32_t)w, (uint32_t)h, (uint32_t)w, alpha != 0,
+                                                encoded, cap) : 0;
+            if (made) mx_cache_replace(src, encoded, made);
+            free(encoded);
+        }
     }
     free(data);
-    if (info.alpha)
-        for (size_t i = 0; i < count; i++) img->px[i] = premultiply(img->px[i]);
-    img->w = (int)info.width;
-    img->h = (int)info.height;
+    size_t count = (size_t)w * h;
+    if (alpha)
+        for (size_t i = 0; i < count; i++) px[i] = premultiply(px[i]);
+    img->px = px;
+    img->w = w;
+    img->h = h;
     img->state = ST_READY;
     pixels_used += count;
     return img;
+}
+
+static image_t* get_image(const char* url) {
+    return get_image_from(url, url);
 }
 
 /* Area average (shrinking) or bilinear (enlarging) resampling of
@@ -733,9 +839,27 @@ void mx_media_end(void) {
 static image_t* element_image(mx_node_t* n, const char* attr) {
     const char* src = mx_dom_attr(n, attr);
     if (!src || !*src) return NULL;
+    while (*src == ' ' || *src == '\t' || *src == '\n') src++;
+    if (!strncmp(src, "data:", 5)) {
+        /* inline picture: keyed by a hash, the address itself can be huge */
+        uint32_t hash = 2166136261u;
+        size_t len = 0;
+        for (const char* p = src; *p; p++, len++) hash = (hash ^ (uint8_t)*p) * 16777619u;
+        char key[64];
+        mx_copy(key, sizeof(key), "data:#");
+        mx_append_int(key, sizeof(key), (long)hash);
+        mx_append(key, sizeof(key), "/");
+        mx_append_int(key, sizeof(key), (long)len);
+        return get_image_from(key, src);
+    }
     char url[URL_MAX];
     mx_html_resolve(src, url, sizeof(url));
-    if (mx_media_kind_of_url(url) != MX_MEDIA_IMAGE) return NULL;
+    /* any address: the format is told from the file, not its name */
+    if (mx_media_kind_of_url(url) == MX_MEDIA_VIDEO) return NULL;
+    if (strncmp(url, "http://", 7) && strncmp(url, "https://", 8) &&
+        mx_media_kind_of_url(url) != MX_MEDIA_IMAGE && strncmp(url, "file:", 5) &&
+        !(url[0] >= '0' && url[0] <= '9' && url[1] == ':'))
+        return NULL;
     return get_image(url);
 }
 

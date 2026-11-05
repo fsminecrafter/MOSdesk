@@ -452,12 +452,20 @@ static int set_on(js_obj* o, js_str* key, js_val value, js_val receiver) {
     if (o->cls >= CLS_NODE && o->cls <= CLS_DATASET && js_dom_set(o, key, value)) return 1;
     if (o->cls == CLS_ARRAY || o->cls == CLS_ARGUMENTS) {
         if (key == S_length) {
+            if (o->typed) return 1;
             double n = js_to_number(value);
             if (n >= 0 && n < 1e8) js_array_set_length(o, (uint32_t)n);
             return 1;
         }
         uint32_t index;
-        if (js_array_index(key, &index) && index < o->length + 100000u) {
+        if (o->typed) {
+            /* fixed length; writes are converted to the element type */
+            if (js_array_index(key, &index)) {
+                if (index < o->length)
+                    o->items[index] = js_num(js_typed_coerce(o->typed, js_to_number(value)));
+                return 1;
+            }
+        } else if (js_array_index(key, &index) && index < o->length + 100000u) {
             if (index >= o->length) js_array_set_length(o, index + 1);
             o->items[index] = value;
             return 1;
@@ -504,7 +512,13 @@ void js_set_index(js_val target, js_val key, js_val value) {
     if (target.type == JS_OBJ && key.type == JS_NUM && target.u.obj->cls == CLS_ARRAY) {
         double n = key.u.num;
         js_obj* a = target.u.obj;
-        if (n >= 0 && n == (double)(uint32_t)n && (uint32_t)n < a->length + 100000u) {
+        if (a->typed) {
+            if (n >= 0 && n == (double)(uint32_t)n) {
+                if ((uint32_t)n < a->length)
+                    a->items[(uint32_t)n] = js_num(js_typed_coerce(a->typed, js_to_number(value)));
+                return;
+            }
+        } else if (n >= 0 && n == (double)(uint32_t)n && (uint32_t)n < a->length + 100000u) {
             uint32_t i = (uint32_t)n;
             if (i >= a->length) js_array_set_length(a, i + 1);
             a->items[i] = value;
@@ -2825,14 +2839,52 @@ js_node* js_parse(const char* source, size_t length, const char* name,
 
 static int scope_allowed;   /* current function may use the scope stack */
 
+/* The heap has no garbage collector, so every call used to leave its
+ * scope behind: Google Search made close to a million of them (over
+ * 200 MiB) and the browser ran out of memory. A scope whose function
+ * (or block) has finished and that no closure captured cannot be reached
+ * any more, so it goes on a free list by size and the next scope reuses
+ * it. Closures are the only thing that keeps a scope: js_make_function()
+ * marks the whole chain as captured. Generators and await run eagerly,
+ * so nothing else outlives the call. */
+#define ENV_POOL_CLASSES 7          /* capacities 4, 8, ..., 256 vars */
+static js_env* env_pool[ENV_POOL_CLASSES + 1];
+
+static int env_pool_class(uint32_t capacity) {
+    uint32_t c = 4;
+    for (int k = 1; k <= ENV_POOL_CLASSES; k++, c <<= 1)
+        if (capacity <= c) return k;
+    return 0;
+}
+
+static void env_release(js_env* e) {
+    if (!e || e->on_stack || e->captured || !e->pool_class || e == js_global_env) return;
+    int k = e->pool_class;
+    e->parent = env_pool[k];
+    env_pool[k] = e;
+}
+
+static void env_pool_reset(void) {
+    memset(env_pool, 0, sizeof(env_pool));
+}
+
 static js_env* new_env(js_env* parent, uint32_t capacity, int use_stack) {
     js_env* e = NULL;
     if (use_stack) e = (js_env*)scope_alloc(sizeof(js_env) + sizeof(js_var) * capacity);
     if (e) {
         e->on_stack = 1;
     } else {
-        e = (js_env*)js_alloc(sizeof(js_env) + sizeof(js_var) * capacity);
+        int k = env_pool_class(capacity);
+        if (k && env_pool[k]) {
+            e = env_pool[k];
+            env_pool[k] = e->parent;
+        } else {
+            if (k) capacity = 4u << (k - 1);
+            e = (js_env*)js_alloc(sizeof(js_env) + sizeof(js_var) * capacity);
+        }
         memset(e, 0, sizeof(js_env));
+        e->pool_class = (uint8_t)k;
+        if (k) capacity = 4u << (k - 1);
     }
     e->parent = parent;
     e->vars = (js_var*)(e + 1);
@@ -2965,6 +3017,7 @@ js_val js_make_function(js_func* func, js_env* env, js_val this_val) {
     f->cls = CLS_FUNCTION;
     f->func = func;
     f->env = env;
+    for (js_env* e = env; e && !e->captured; e = e->parent) e->captured = 1;
     f->name = func->name ? func->name : js_intern_c("");
     f->home_this = this_val;
     return js_obj_val(f);
@@ -3176,6 +3229,7 @@ static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
     js_rt.source = saved_source;
     scope_top = saved_top;
     scope_allowed = saved_allowed;
+    env_release(env);
     if (f->generator) {
         current_gen = collector.prev;
         if (js_rt.ctl == CTL_THROW) return js_undef();
@@ -3190,6 +3244,14 @@ static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
         return js_promise_resolved(result, 0);
     }
     return result;
+}
+
+/* An iterator ({next, return, throw, [Symbol.iterator]}) over a snapshot
+ * of values: what Array.prototype.values(), Map.prototype.entries() and
+ * the like return. It is a finished generator's object, which already
+ * implements the protocol. */
+js_val js_list_iterator(js_obj* values) {
+    return make_generator(values, js_undef(), 0);
 }
 
 js_val js_construct(js_val fn, js_val* args, int argc) {
@@ -4131,6 +4193,7 @@ static void exec_block(js_node* n, js_env* env) {
     if (block_needs_scope(n)) scope = new_env(env, 4, scope_allowed);
     for (uint32_t i = 0; i < n->count && !js_rt.ctl; i++) exec(n->list[i], scope);
     if (scope != env && scope->on_stack) scope_top = saved;
+    if (scope != env) env_release(scope);
 }
 
 /* Copies loop variables into a fresh scope so closures see per-iteration
@@ -4205,6 +4268,7 @@ static void exec_for_in_of(js_node* n, js_env* env, js_str* label) {
         if (js_rt.ctl) return;
         exec(n->c, scope);
         if (scope != env && scope->on_stack) scope_top = saved;
+        if (scope != env) env_release(scope);
         if (!loop_continue(n, label)) return;
     }
 }
@@ -4296,11 +4360,17 @@ static void exec(js_node* n, js_env* env) {
             }
             exec(n->d, iter);
             if (!loop_continue(n, label)) break;
-            if (per_iteration) iter = iteration_scope(iter, env);
+            if (per_iteration) {
+                js_env* done = iter;
+                iter = iteration_scope(iter, env);
+                env_release(done);
+            }
             if (n->c) eval(n->c, iter);
             if (!step()) break;
         }
         if (loop_env->on_stack) scope_top = saved;
+        if (iter != loop_env && iter != env) env_release(iter);
+        if (loop_env != env) env_release(loop_env);
         return;
     }
     case N_FOR_IN:
@@ -4376,6 +4446,7 @@ static void exec(js_node* n, js_env* env) {
             js_node* c = n->list[i];
             for (uint32_t k = 0; k < c->count && !js_rt.ctl; k++) exec(c->list[k], scope);
         }
+        env_release(scope);
         if (js_rt.ctl == CTL_BREAK && (!js_rt.label || js_rt.label == label)) {
             js_rt.ctl = CTL_NONE;
             js_rt.label = NULL;
@@ -4399,6 +4470,9 @@ static void exec(js_node* n, js_env* env) {
 
 js_val js_exec_program(js_node* program) {
     js_func* f = program->func;
+    /* In a classic script, top-level `this` is the global object (window).
+     * Google's pages start with `this.gbar_ = ...`. */
+    if (js_global) js_global_env->this_val = js_obj_val(js_global);
     hoist(f, js_global_env);
     /* top-level var and function declarations become window properties */
     for (int i = 0; i < f->var_count; i++) {
@@ -4690,7 +4764,9 @@ void js_core_init(void) {
     import_map = js_undef();
     parse_as_module = 0;
     parse_module_url = NULL;
+    env_pool_reset();
     js_global_env = new_env(NULL, 64, 0);
+    js_global_env->pool_class = 0;
 }
 
 void js_core_reset_scope_stack(void);

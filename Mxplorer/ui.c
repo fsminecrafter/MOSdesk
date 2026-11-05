@@ -556,6 +556,15 @@ static int settings_layout(const mx_ui_state_t* s, settings_row_t* rows, int cap
         y += 64;
         ROW(MX_SET_CLEAR_DATA, ROW_BUTTON, cx, y, cw, 64, "Clear browsing data",
             "Cookies, site storage and cached pages", 0, 0);
+        y += 80;
+        ROW(-1, ROW_HEADER, cx, y, cw, 30, "Cache",
+            "Saved pages, pictures (as .img) and videos. Sites are still checked for new content.", 0, 0);
+        y += 54;
+        ROW(MX_SET_CACHE_SIZE, ROW_BUTTON, cx, y, cw, 64, "Maximum cache size",
+            s->cache_size_text ? s->cache_size_text : "", 0, 0);
+        y += 64;
+        ROW(MX_SET_CACHE_CLEAR, ROW_BUTTON, cx, y, cw, 64, "Clear cache",
+            s->cache_usage_text ? s->cache_usage_text : "", 0, 0);
         break;
     case 3:
         ROW(-1, ROW_HEADER, cx, y, cw, 30, "Developer tools", "Inspect pages, run JavaScript and watch requests.", 0, 0);
@@ -576,7 +585,7 @@ static int settings_layout(const mx_ui_state_t* s, settings_row_t* rows, int cap
         y += 56;
         ROW(-1, ROW_INFO, cx, y, cw, 56, "JavaScript", "ES2020 interpreter with DOM, events, timers, fetch and modules", 0, 0);
         y += 56;
-        ROW(-1, ROW_INFO, cx, y, cw, 56, "Not yet supported", "Images, video, canvas, WebSockets, certificate checks", 0, 0);
+        ROW(-1, ROW_INFO, cx, y, cw, 56, "Not yet supported", "WebP and SVG pictures, canvas, WebSockets, certificate checks", 0, 0);
         y += 56;
         ROW(-1, ROW_INFO, cx, y, cw, 56, "Fonts and icons",
             "Inter and Roboto Mono (OFL), Material Symbols by Google (Apache 2.0)", 0, 0);
@@ -663,7 +672,7 @@ void mx_ui_draw_settings(const mx_ui_state_t* s) {
                                  r->kind == ROW_FIELD ? MX_TEXT_MONO : 0);
             if (r->kind == ROW_TOGGLE) draw_toggle(&page, t, right - 40, r->y + (r->h - 22) / 2, r->on);
             if (r->kind == ROW_BUTTON) {
-                const char* label = "Clear";
+                const char* label = r->id == MX_SET_CACHE_SIZE ? "Change" : "Clear";
                 int bw = text_w(label, 13, MX_TEXT_MEDIUM) + 32;
                 int bx = right - bw, by = r->y + (r->h - 32) / 2;
                 mx_round_rect_stroke(&page, bx, by, bw, 32, 16, 1, t->border);

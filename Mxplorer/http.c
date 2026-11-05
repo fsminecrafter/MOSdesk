@@ -10,7 +10,7 @@
 #define HTTP_MEDIA_TIMEOUT_MS 120000u
 #define HTTP_MAX_REDIRECTS 5u
 #define HTTP_REDIRECT_TIMEOUT_MS 2000u
-#define HTTP_URL_MAX 1024u
+#define HTTP_URL_MAX 2048u
 #define HTTP_REDIRECT_RESULT 2
 
 /* Raw response: headers and body. Grows for large downloads (media) and
@@ -359,7 +359,7 @@ static int resolve_location(const char* base_url, const char* location,
     }
 
     char host[128];
-    char path[512];
+    char path[2048];
     char ignored_error[1];
     uint16_t port;
     int use_tls;
@@ -465,14 +465,23 @@ static void header_value(const char* headers, size_t length, const char* name,
     }
 }
 
+static char pending_etag[128];
+static char pending_last_modified[64];
+
+void mx_http_set_validators(const char* etag, const char* last_modified) {
+    strlcpy_safe(pending_etag, etag ? etag : "", sizeof(pending_etag));
+    strlcpy_safe(pending_last_modified, last_modified ? last_modified : "",
+                 sizeof(pending_last_modified));
+}
+
 static int http_get_once(const char* url, char* body, size_t body_capacity,
                          size_t* body_length, int allow_insecure_tls,
                          uint32_t timeout_ms, char* redirect,
                          size_t redirect_capacity, char* error,
                          size_t error_capacity, mx_http_info_t* info) {
     char host[128];
-    char path[512];
-    char request[1024];
+    char path[2048];
+    char request[3072];   /* path, validators, headers */
     uint16_t port;
     int use_tls = 0;
     size_t response_length = 0;
@@ -527,6 +536,12 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
         append_text(request, sizeof(request), &request_length, host) &&
         ((use_tls && port == 443) || (!use_tls && port == 80) ||
          append_port(request, sizeof(request), &request_length, port)) &&
+        (!pending_etag[0] ||
+         (append_text(request, sizeof(request), &request_length, "\r\nIf-None-Match: ") &&
+          append_text(request, sizeof(request), &request_length, pending_etag))) &&
+        (!pending_last_modified[0] ||
+         (append_text(request, sizeof(request), &request_length, "\r\nIf-Modified-Since: ") &&
+          append_text(request, sizeof(request), &request_length, pending_last_modified))) &&
         append_text(request, sizeof(request), &request_length,
             "\r\nUser-Agent: Mozilla/5.0 (Minimal-OS; x86_64) Mxplorer/0.3\r\n"
             "Accept: text/html,application/xhtml+xml,text/css,*/*;q=0.8\r\n"
@@ -602,6 +617,11 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
         info->header_bytes = header_length + 4;
         header_value(response, header_length, "content-type", info->content_type,
                      sizeof(info->content_type));
+        header_value(response, header_length, "etag", info->etag, sizeof(info->etag));
+        header_value(response, header_length, "last-modified", info->last_modified,
+                     sizeof(info->last_modified));
+        header_value(response, header_length, "cache-control", info->cache_control,
+                     sizeof(info->cache_control));
     }
     if (is_redirect_status(status)) {
         if (!redirect || !parse_location(response, header_length, redirect,
@@ -662,6 +682,7 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
     long started = mos_uptime();
     if (info) memset(info, 0, sizeof(*info));
     if (!url || strlen(url) >= sizeof(current_url)) {
+        pending_etag[0] = pending_last_modified[0] = '\0';
         if (body_length) *body_length = 0;
         set_error(error, error_capacity, "HTTP address is too long.");
         return 0;
@@ -680,6 +701,7 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
                                    location, sizeof(location), error,
                                    error_capacity, info);
         if (result != HTTP_REDIRECT_RESULT) {
+            pending_etag[0] = pending_last_modified[0] = '\0';
             response_trim();
             if (info) {
                 strlcpy_safe(info->final_url, current_url, sizeof(info->final_url));
@@ -688,6 +710,8 @@ int mx_http_get(const char* url, char* body, size_t body_capacity,
             }
             return result;
         }
+        /* a redirect goes elsewhere: the validators were for this address */
+        pending_etag[0] = pending_last_modified[0] = '\0';
         if (redirects >= HTTP_MAX_REDIRECTS) {
             set_error(error, error_capacity, "Too many HTTP redirects (maximum 5).");
             response_trim();

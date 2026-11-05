@@ -25,7 +25,7 @@ static int fetch(void* user, const char* url, const char* kind, char** body,
                  size_t* length) {
     (void)user;
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "curl -sL --max-time 10 -A 'Mozilla/5.0 Mxplorer' '%s'", url);
+    snprintf(cmd, sizeof(cmd), "curl -sL --max-time 10 -A 'Mozilla/5.0 (Minimal-OS; x86_64) Mxplorer/0.3' -H 'Accept-Language: en-US,en;q=0.8' '%s'", url);
     FILE* p = popen(cmd, "r");
     if (!p) return 0;
     *body = read_all(p, length);

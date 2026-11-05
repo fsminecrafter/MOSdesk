@@ -64,7 +64,7 @@ static mx_html_stats_t stats;
 static mx_node_t* focused;
 static mx_node_t* highlighted;
 static int scripts_enabled;
-static char resolved_link[1024];
+static char resolved_link[2048];
 static uint32_t accent = 0xFF1A73E8u;
 
 /* containing blocks for positioned elements */
@@ -2170,7 +2170,7 @@ static void add_stylesheets(void) {
                 mx_console_add(MX_LOG_WARN, "CSS", 0, "Too many stylesheets; skipping the rest.");
                 break;
             }
-            char url[1024];
+            char url[2048];
             mx_html_resolve(href, url, sizeof(url));
             char* body = NULL;
             size_t length = 0;
@@ -2200,7 +2200,7 @@ static void html_navigate(const char* url, void* user);
 static void (*host_navigate)(const char* url, void* user);
 static void (*host_alert)(const char* text, void* user);
 static void* host_user;
-static char pending_navigation[1024];
+static char pending_navigation[2048];
 
 static void html_navigate(const char* url, void* user) {
     (void)user;
@@ -2217,7 +2217,7 @@ static int html_fetch(void* user, const char* url, const char* kind, char** body
                       size_t* length) {
     (void)user;
     if (!fetch_callback) return 0;
-    char resolved[1024];
+    char resolved[2048];
     mx_html_resolve(url, resolved, sizeof(resolved));
     return fetch_callback(fetch_user, resolved, kind, body, length);
 }
@@ -2246,7 +2246,7 @@ static void run_scripts(void) {
         char name[48];
         if (src && *src) {
             if (!fetch_enabled || !fetch_callback) continue;
-            char url[1024];
+            char url[2048];
             mx_html_resolve(src, url, sizeof(url));
             const char* base = strrchr(url, '/');
             mx_copy(name, sizeof(name), base && base[1] ? base + 1 : url);
@@ -2271,7 +2271,7 @@ static void run_scripts(void) {
             char* text = mx_dom_text_content(&doc, script);
             long s0 = mx_now_ms();
             if (module) {
-                char url[600];
+                char url[2048];
                 mx_copy(url, sizeof(url), doc.base_url);
                 mx_append(url, sizeof(url), "#module-");
                 mx_append_int(url, sizeof(url), inline_index);
@@ -2698,7 +2698,7 @@ static int submit_form(mx_node_t* form, mx_node_t* submitter, char* navigate,
     if (method && mx_streq_nocase(method, "post"))
         mx_console_add(MX_LOG_WARN, "Forms", 0,
                        "POST forms are sent as GET requests by Mxplorer.");
-    char url[1024];
+    char url[2048];
     mx_html_resolve(action && *action ? action : doc.base_url, url, sizeof(url));
     char* q = strchr(url, '?');
     if (q) *q = '\0';
@@ -2760,7 +2760,7 @@ static int activate(mx_node_t* target, char* navigate, size_t capacity) {
             if (mx_starts_with_nocase(href, "javascript:")) {
                 if (scripts_enabled) {
                     const char* code = href + 11;
-                    char decoded[1024];
+                    char decoded[2048];
                     size_t used = 0;
                     for (const char* p = code; *p && used + 1 < sizeof(decoded); p++) {
                         if (*p == '%' && p[1] && p[2]) {

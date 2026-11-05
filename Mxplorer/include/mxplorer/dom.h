@@ -49,6 +49,7 @@ typedef struct mx_node {
     void* css_inline;                 /* parsed style="" declarations */
     const char* css_inline_source;    /* attribute value they came from */
     uint16_t css_inline_count;
+    uint32_t css_inline_generation;   /* mx_css_reset() count they belong to */
     uint16_t class_count;             /* cached tokens of class="" */
     const char* class_source;
     struct mx_class_token* classes;

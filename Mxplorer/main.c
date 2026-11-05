@@ -1,4 +1,5 @@
 #include "mxplorer/browser.h"
+#include "mxplorer/cache.h"
 #include "mxplorer/devlog.h"
 #include "mxplorer/devtools.h"
 #include "mxplorer/html.h"
@@ -225,6 +226,8 @@ static void load_settings(void) {
             else if (!strcmp(line, "subresources")) subresources_enabled = value != 0;
             else if (!strcmp(line, "darkpages")) dark_pages = value != 0;
             else if (!strcmp(line, "devtools")) mx_devtools_set_height(value);
+            else if (!strcmp(line, "cachemb") && value >= 0 && value <= 4096)
+                mx_cache_set_limit_mb((uint32_t)value);
         }
         if (!end) break;
         line = end + 1;
@@ -242,6 +245,8 @@ static void save_settings(void) {
     mx_append_int(text, sizeof(text), dark_pages);
     mx_append(text, sizeof(text), "\ndevtools=");
     mx_append_int(text, sizeof(text), mx_devtools_height());
+    mx_append(text, sizeof(text), "\ncachemb=");
+    mx_append_int(text, sizeof(text), (long)mx_cache_limit_mb());
     mx_append(text, sizeof(text), "\n");
     if (!write_file(SETTINGS_PATH, text, strlen(text))) set_status("Could not save settings.");
 }
@@ -451,9 +456,16 @@ static int fetch_resource(void* user, const char* url, const char* kind, char** 
     }
     size_t received = 0;
     char error[128];
-    mx_http_info_t info;
-    int ok = mx_http_get(url, buffer, capacity, &received, allow_insecure_tls,
-                         error, sizeof(error), &info);
+    static mx_http_info_t info;
+    int how = MX_CACHE_NETWORK;
+    int ok = mx_cache_get(url, buffer, capacity, &received, allow_insecure_tls,
+                          error, sizeof(error), &info, &how);
+    entry->from_cache = how != MX_CACHE_NETWORK;
+    if (how == MX_CACHE_OFFLINE) {
+        char note[200] = "Offline: showing the saved copy of ";
+        mx_append(note, sizeof(note), url);
+        mx_console_add(MX_LOG_WARN, "Cache", 0, note);
+    }
     entry->status = info.status;
     entry->duration_ms = mx_now_ms() - entry->started_ms;
     entry->redirects = info.redirects;
@@ -528,7 +540,7 @@ static int render_source(const char* source, size_t length, const char* url, int
 /* A page that shows one picture or video, for addresses that are .img or
  * .vid files themselves. */
 static char* media_document(const char* url, int kind, size_t* length) {
-    char escaped[URL_LENGTH * 6];
+    static char escaped[URL_LENGTH * 6];   /* too big for the 64 KiB stack */
     size_t used = 0;
     for (const char* p = url; *p && used + 7 < sizeof(escaped); p++) {
         const char* entity = *p == '&' ? "&amp;" : *p == '"' ? "&quot;" : *p == '<' ? "&lt;"
@@ -650,9 +662,16 @@ static void load_page(int force_reload) {
         mx_network_entry_t* entry = mx_network_add(tab->url, "document");
         char error[160];
         size_t body_length = 0;
-        mx_http_info_t info;
-        int ok = mx_http_get(tab->url, page_buffer, MX_HTTP_BODY_MAX, &body_length,
-                             allow_insecure_tls, error, sizeof(error), &info);
+        static mx_http_info_t info;
+        int how = MX_CACHE_NETWORK;
+        int ok = mx_cache_get(tab->url, page_buffer, MX_HTTP_BODY_MAX, &body_length,
+                              allow_insecure_tls, error, sizeof(error), &info, &how);
+        entry->from_cache = how != MX_CACHE_NETWORK;
+        if (how == MX_CACHE_OFFLINE)
+            mx_console_add(MX_LOG_WARN, "Cache", 0,
+                           "The network is unavailable: showing the saved copy of this page.");
+        else if (how == MX_CACHE_REVALIDATED)
+            mx_console_add(MX_LOG_SYSTEM, "Cache", 0, "Page unchanged on the server: using the saved copy.");
         entry->status = ok ? info.status : 0;
         entry->duration_ms = mx_now_ms() - entry->started_ms;
         entry->size = body_length;
@@ -702,6 +721,7 @@ static void load_page(int force_reload) {
     page_loaded = render_source(tab->page_source, tab->page_source_length, tab->url,
                                 javascript_enabled, theme_dark && dark_pages);
     loading = 0;
+    mx_cache_flush();       /* pictures were converted while rendering */
     if (page_loaded) {
         const char* title = mx_html_title();
         if (title && *title) mx_copy(tab->title, sizeof(tab->title), title);
@@ -987,7 +1007,22 @@ static void apply_setting(int id) {
         }
         mx_js_clear_storage();
         mx_network_clear();
+        mx_cache_clear();
         set_status("Cookies, site storage and cached pages were cleared.");
+        break;
+    case MX_SET_CACHE_SIZE: {
+        static const uint32_t sizes[] = {0, 32, 64, 128, 256, 512, 1024};
+        uint32_t now = mx_cache_limit_mb(), next = sizes[0];
+        for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
+            if (sizes[i] > now) { next = sizes[i]; break; }
+        mx_cache_set_limit_mb(next);
+        save_settings();
+        set_status(next ? "Cache size changed." : "The cache is off.");
+        break;
+    }
+    case MX_SET_CACHE_CLEAR:
+        mx_cache_clear();
+        set_status("The cache was cleared.");
         break;
     case MX_SET_DEVTOOLS:
         toggle_devtools(!devtools_open);
@@ -1456,6 +1491,28 @@ static mx_ui_state_t ui_state(void) {
     s.content_height = page_loaded ? mx_html_content_height() : 0;
     s.scroll_y = page_loaded ? mx_html_scroll_y() : 0;
     s.settings_category = settings_category;
+    static char cache_size_text[32], cache_usage_text[64];
+    {
+        uint32_t mb = mx_cache_limit_mb();
+        cache_size_text[0] = 0;
+        if (!mb) {
+            mx_copy(cache_size_text, sizeof(cache_size_text), "Off - pages are always downloaded");
+        } else {
+            mx_append_int(cache_size_text, sizeof(cache_size_text), (long)mb);
+            mx_append(cache_size_text, sizeof(cache_size_text), " MB - click to change");
+        }
+        uint64_t used = mx_cache_used_bytes();
+        long tenths = (long)(used * 10u / (1024u * 1024u));
+        cache_usage_text[0] = 0;
+        mx_append_int(cache_usage_text, sizeof(cache_usage_text), tenths / 10);
+        mx_append(cache_usage_text, sizeof(cache_usage_text), ".");
+        mx_append_int(cache_usage_text, sizeof(cache_usage_text), tenths % 10);
+        mx_append(cache_usage_text, sizeof(cache_usage_text), " MB used in ");
+        mx_append_int(cache_usage_text, sizeof(cache_usage_text), (long)mx_cache_count());
+        mx_append(cache_usage_text, sizeof(cache_usage_text), " files");
+    }
+    s.cache_size_text = cache_size_text;
+    s.cache_usage_text = cache_usage_text;
     s.theme_dark = theme_dark;
     s.dark_pages = dark_pages;
     s.javascript = javascript_enabled;
@@ -1519,6 +1576,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     read_os_accent();
+    mx_cache_init();
     load_settings();
     load_homepage_setting();
     load_homepage_asset();
@@ -1583,7 +1641,7 @@ int main(int argc, char** argv) {
             }
             memset(&event, 0, sizeof(event));
         }
-        if (!running) break;
+        if (!running) { mx_cache_flush(); break; }
 
         syscall_window_info_t now_info;
         if (mos_window_get_info(window_id, &now_info) != SYS_SUCCESS) break;

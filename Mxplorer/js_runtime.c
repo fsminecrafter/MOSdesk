@@ -1684,7 +1684,7 @@ static js_val object_to_string(js_val self, js_val* args, int argc, js_obj* call
     const char* tag = "Object";
     if (self.type == JS_OBJ) {
         switch (self.u.obj->cls) {
-        case CLS_ARRAY: tag = "Array"; break;
+        case CLS_ARRAY: tag = self.u.obj->typed ? "Object" : "Array"; break;
         case CLS_FUNCTION: case CLS_NATIVE: case CLS_BOUND: tag = "Function"; break;
         case CLS_ERROR: tag = "Error"; break;
         case CLS_DATE: tag = "Date"; break;
@@ -1728,6 +1728,20 @@ static js_val function_ctor(js_val self, js_val* args, int argc, js_obj* callee)
     char error[160];
     int line = 0;
     js_node* program = js_parse(source->data, source->length, "Function", error, sizeof(error), &line);
+    if (!program) return js_throw_error("SyntaxError", error);
+    return js_exec_program(program);
+}
+
+/* Global eval. It always runs at global scope ("indirect eval"); a
+ * direct eval that reads the caller's local variables is not supported. */
+static js_val global_eval(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)callee;
+    js_val code = ARG(0);
+    if (code.type != JS_STR) return code;
+    js_str* source = code.u.str;
+    char error[160];
+    int line = 0;
+    js_node* program = js_parse(source->data, source->length, "eval", error, sizeof(error), &line);
     if (!program) return js_throw_error("SyntaxError", error);
     return js_exec_program(program);
 }
@@ -1843,6 +1857,12 @@ static js_val iterate_to_array(js_val v) {
     return js_obj_val(out);
 }
 
+static js_val string_iterator(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)args; (void)argc; (void)callee;
+    js_val list = iterate_to_array(self.type == JS_STR ? self : js_str_val(js_to_string(self)));
+    return js_list_iterator(list.u.obj);
+}
+
 static js_val array_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self; (void)callee;
     if (argc == 1 && args[0].type == JS_NUM) {
@@ -1859,7 +1879,7 @@ static js_val array_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
 
 static js_val array_is_array(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self; (void)callee;
-    return js_bool(ARG(0).type == JS_OBJ && ARG(0).u.obj->cls == CLS_ARRAY);
+    return js_bool(ARG(0).type == JS_OBJ && ARG(0).u.obj->cls == CLS_ARRAY && !ARG(0).u.obj->typed);
 }
 
 static js_val array_from(js_val self, js_val* args, int argc, js_obj* callee) {
@@ -2205,7 +2225,7 @@ static js_val array_keys(js_val self, js_val* args, int argc, js_obj* callee) {
             js_array_push(out, js_obj_val(pair));
         }
     }
-    return js_obj_val(out);
+    return js_list_iterator(out);
 }
 
 static js_val array_to_string(js_val self, js_val* args, int argc, js_obj* callee) {
@@ -3753,15 +3773,15 @@ static js_val collection_method(js_val self, js_val* args, int argc, js_obj* cal
     case 6: {   /* keys */
         js_obj* out = js_new_array(c->length);
         for (uint32_t i = 0; i < c->length; i++) js_array_push(out, c->items[i]);
-        return js_obj_val(out);
+        return js_list_iterator(out);
     }
     case 7: {   /* values */
         js_obj* out = js_new_array(c->length);
         for (uint32_t i = 0; i < c->length; i++) js_array_push(out, values ? values->items[i] : c->items[i]);
-        return js_obj_val(out);
+        return js_list_iterator(out);
     }
-    case 8:   /* entries */
-        return iterate_to_array(self.u.obj->cls == CLS_SET
+    case 8: {  /* entries */
+        js_val list = iterate_to_array(self.u.obj->cls == CLS_SET
             ? ({ js_obj* out = js_new_array(c->length);
                  for (uint32_t i = 0; i < c->length; i++) {
                      js_obj* pair = js_new_array(2);
@@ -3771,6 +3791,8 @@ static js_val collection_method(js_val self, js_val* args, int argc, js_obj* cal
                  }
                  js_obj_val(out); })
             : self);
+        return list.type == JS_OBJ ? js_list_iterator(list.u.obj) : list;
+    }
     }
     return js_undef();
 }
@@ -4347,6 +4369,7 @@ void js_runtime_init(void) {
     method(sp, "padEnd", string_pad, 1);
     method(sp, "repeat", string_repeat, 0);
     method(sp, "split", string_split, 0);
+    method(sp, "@@iterator", string_iterator, 0);
     method(sp, "replace", string_replace, 0);
     method(sp, "replaceAll", string_replace, 1);
     method(sp, "match", string_match, 0);
@@ -4512,6 +4535,8 @@ void js_runtime_init(void) {
     method(js_set_proto, "@@iterator", collection_method, 7);
     js_define_accessor(js_set_proto, "size", collection_size, NULL);
 
+    js_typed_init();
+
     /* Symbol */
     js_obj* symbol = js_new_native("Symbol", symbol_fn, 0);
     js_define(js_global, "Symbol", js_obj_val(symbol), PROP_HIDDEN);
@@ -4535,6 +4560,7 @@ void js_runtime_init(void) {
     js_define(js_global, "Infinity", js_num(inf_value()), PROP_HIDDEN | PROP_READONLY);
     js_define(js_global, "undefined", js_undef(), PROP_HIDDEN | PROP_READONLY);
     method(js_global, "parseInt", global_parse_int, 0);
+    method(js_global, "eval", global_eval, 1);
     method(js_global, "parseFloat", global_parse_float, 0);
     method(js_global, "isNaN", global_is_nan, 0);
     method(js_global, "isFinite", global_is_nan, 1);

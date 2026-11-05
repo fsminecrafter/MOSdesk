@@ -47,6 +47,13 @@
 #define MOSDESK_UI_STYLE_MODERN 0u
 #define MOSDESK_UI_STYLE_AERO 1u
 #define MOSDESK_UI_STYLE_LIQUID 2u
+/* What is behind window content (Settings > Appearance): what the style
+ * does (Liquid Glass is see-through, the others solid), always solid, or
+ * frosted glass in every style. easyui apps follow it; mosWM draws the
+ * glass behind any window whose pixels are see-through. */
+#define MOSDESK_WINDOW_BG_THEME 0u
+#define MOSDESK_WINDOW_BG_SOLID 1u
+#define MOSDESK_WINDOW_BG_GLASS 2u
 #define MOSDESK_USERNAME_SIZE 32u
 #define MOSDESK_WALLPAPER_FILL 0u
 #define MOSDESK_WALLPAPER_CROP 1u
@@ -120,7 +127,20 @@ typedef struct {
     uint32_t anim_close;
     uint32_t anim_interface;
     uint32_t anim_speed;
+    uint32_t window_background;         /* MOSDESK_WINDOW_BG_* */
 } mosdesk_settings_t;
+
+/* The layout before the window background setting: a file of this size is
+ * the leading part of mosdesk_settings_t. */
+typedef struct {
+    uint8_t leading[offsetof(mosdesk_settings_t, window_background)];
+} mosdesk_settings_v10_t;
+
+/* easyui reads window_background at this offset too (after ui_style). */
+#define MOSDESK_SETTINGS_WINDOW_BG_OFFSET 1140u
+_Static_assert(offsetof(mosdesk_settings_t, window_background) ==
+                   MOSDESK_SETTINGS_WINDOW_BG_OFFSET,
+               "easyui reads window_background at this offset");
 
 /* The layout before the animation settings: a file of this size is the
  * leading part of mosdesk_settings_t. */
@@ -434,6 +454,11 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
                 (uintptr_t)&settings, sizeof(settings)) !=
             (long)sizeof(settings))
             settings = mosdesk_settings_default();
+    } else if (size == (long)sizeof(mosdesk_settings_v10_t)) {
+        /* v10 is the leading part; the window background follows the style. */
+        if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
+                (uintptr_t)&settings, (uint64_t)size) != size)
+            settings = mosdesk_settings_default();
     } else if (size == (long)sizeof(mosdesk_settings_v9_t)) {
         /* v9 is the leading part; the animations keep their defaults. */
         if ((long)MOSDESK_SYSCALL(SYS_READ, (uintptr_t)fd,
@@ -601,6 +626,8 @@ static inline mosdesk_settings_t mosdesk_settings_load(void) {
         settings.anim_interface > 1u ||
         settings.anim_speed > MOSDESK_ANIM_SPEED_FAST)
         mosdesk_settings_anim_defaults(&settings);
+    if (settings.window_background > MOSDESK_WINDOW_BG_GLASS)
+        settings.window_background = MOSDESK_WINDOW_BG_THEME;
     /* An unusable name is asked for again rather than used as a path. */
     if (!mosdesk_username_valid(settings.username))
         settings.username[0] = '\0';

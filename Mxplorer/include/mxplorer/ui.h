@@ -43,6 +43,8 @@ enum {
     MX_SET_UNSAFE_HTTPS,
     MX_SET_CLEAR_DATA,
     MX_SET_DEVTOOLS,
+    MX_SET_CACHE_SIZE,
+    MX_SET_CACHE_CLEAR,
     MX_SET_COUNT
 };
 
@@ -86,6 +88,8 @@ typedef struct {
     int homepage_editing;
     const char* custom_homepage;
     int devtools_open;
+    const char* cache_size_text;     /* "64 MB" or "Off" */
+    const char* cache_usage_text;    /* "12.3 MB in 48 files" */
     const mx_browser_theme_t* theme;
 } mx_ui_state_t;
 

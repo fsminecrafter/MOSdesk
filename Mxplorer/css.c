@@ -91,6 +91,11 @@ typedef struct css_bucket {
 #define CSS_TABLE 4096u
 
 static mx_arena_t css_arena;
+/* Bumped by mx_css_reset(): parsed inline styles cached on nodes live in
+ * css_arena and are stale after a reset, even though the style attribute
+ * (which the cache is keyed on) has not changed. Starts at 1 so a fresh
+ * node (0) never matches. */
+static uint32_t css_generation = 1;
 static css_rule_t* rules;
 static unsigned rule_count;
 static unsigned rule_capacity;
@@ -1539,6 +1544,7 @@ static void parse_sheet(const char* s, size_t length, int origin) {
 
 void mx_css_reset(void) {
     mx_arena_free_all(&css_arena);
+    css_generation++;
     css_arena.limit = 24u * 1024u * 1024u;
     rules = NULL;
     rule_count = rule_capacity = 0;
@@ -2570,10 +2576,12 @@ void mx_css_compute(mx_arena_t* arena, mx_node_t* e, const mx_style_t* parent,
     css_decl_t* inline_decls = NULL;
     const char* inline_style = mx_dom_attr(e, "style");
     if (inline_style && *inline_style) {
-        if (e->css_inline_source != inline_style) {
+        if (e->css_inline_source != inline_style ||
+            e->css_inline_generation != css_generation) {
             e->css_inline = parse_declarations(inline_style, strlen(inline_style),
                                                &e->css_inline_count);
             e->css_inline_source = inline_style;
+            e->css_inline_generation = css_generation;
         }
         inline_decls = (css_decl_t*)e->css_inline;
         inline_count = e->css_inline_count;

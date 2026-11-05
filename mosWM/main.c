@@ -9,6 +9,14 @@
 #include "wm_text.h"
 #include "wm_panel_icons.h"
 #include "net.h"
+
+/* SYS_POWER, as in the kernel's x86_64/syscall.h (an older SDK copy may
+ * not have it). */
+#ifndef SYS_POWER
+#define SYS_POWER 44
+#define SYS_POWER_SHUTDOWN 1u
+#define SYS_POWER_REBOOT   2u
+#endif
 #if defined(__has_include)
 #if __has_include("mosmedia.h")
 #include "mosmedia.h"       /* .img wallpapers */
@@ -188,7 +196,9 @@ typedef enum {
     MENU_ACTION_TIME_SETTINGS,
     MENU_ACTION_ADD_TO_DESKTOP,
     MENU_ACTION_COPY_TO,
-    MENU_ACTION_MOVE_TO
+    MENU_ACTION_MOVE_TO,
+    MENU_ACTION_SHUTDOWN,
+    MENU_ACTION_RESTART
 } menu_action_t;
 
 typedef struct {
@@ -277,6 +287,7 @@ static uint32_t mouse_speed = 100u;
 static uint32_t accent_color = 0xFF3DAEE9u;
 /* MOSDESK_UI_STYLE_MODERN, or MOSDESK_UI_STYLE_AERO for the glass look. */
 static uint32_t ui_style;
+static uint32_t window_background;     /* MOSDESK_WINDOW_BG_* */
 static bool liquid_style(void) { return ui_style == MOSDESK_UI_STYLE_LIQUID; }
 static uint32_t wallpaper_style;
 static uint32_t wallpaper_mode;
@@ -644,6 +655,7 @@ static void load_desktop_settings(void) {
     mouse_speed = settings.mouse_speed;
     accent_color = settings.accent_color;
     ui_style = settings.ui_style;
+    window_background = settings.window_background;
     cursor_fill_color = settings.cursor_fill;
     cursor_scale = settings.cursor_scale;
     cursor_pack = settings.cursor_pack;
@@ -3781,6 +3793,15 @@ static void sync_window_modes(syscall_window_info_t* windows, uint64_t count) {
 static void draw_chrome_text(const syscall_window_info_t* info,
                              const cached_window_t* entry);
 
+/* Frosted glass behind a see-through window's content (the rows above
+ * the rounded bottom corners; those belong to the frame). */
+static void window_content_glass(int32_t x, int32_t y, int32_t width, int32_t height,
+                                 uint32_t tint, uint32_t alpha) {
+    int32_t rows = height - (int32_t)CORNER_RADIUS;
+    for (int32_t row = 0; row < rows; row++)
+        glass_span(x, x + width, y + row, tint, alpha, 0u);
+}
+
 static void composite_window(const syscall_window_info_t* info,
                              cached_window_t* entry) {
     int32_t x = (int32_t)info->x;
@@ -3837,10 +3858,18 @@ static void composite_window(const syscall_window_info_t* info,
         stroke_rounded_rect(x - border + 1, y - border + 1,
                             outer_width + 2 * border - 2,
                             outer_height + 2 * border - 2, 7u, 0x60FFFFFFu);
-        if (!filled)
-            fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT + 1,
-                      (int32_t)info->width, (int32_t)info->height,
-                      0xFF000000u | info->style.content_background);
+        if (!filled) {
+            if (window_background == MOSDESK_WINDOW_BG_GLASS)
+                /* glass in the accent colour, like the frame */
+                window_content_glass(x + 1, y + (int32_t)TITLE_HEIGHT + 1,
+                                     (int32_t)info->width, (int32_t)info->height,
+                                     0xFF000000u | (accent_color & 0x00FFFFFFu),
+                                     window_focused ? 0x60u : 0x48u);
+            else
+                fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT + 1,
+                          (int32_t)info->width, (int32_t)info->height,
+                          0xFF000000u | info->style.content_background);
+        }
         stroke_rect(x - 1, y + (int32_t)TITLE_HEIGHT - 1, outer_width + 2,
                     (int32_t)info->height + 4, 0x58FFFFFFu);
         stroke_rect(x, y + (int32_t)TITLE_HEIGHT, outer_width,
@@ -3875,13 +3904,16 @@ static void composite_window(const syscall_window_info_t* info,
                   window_focused ? 0x90FFFFFFu : 0x50FFFFFFu);
         if (!filled) {
             /* A see-through window (easyui's Liquid look, say) has the
-             * glass behind its content too, not a flat colour. The rows
-             * by the rounded bottom corners are the frame's glass. */
-            int32_t top = y + (int32_t)TITLE_HEIGHT + 1;
-            int32_t rows = (int32_t)info->height - (int32_t)CORNER_RADIUS;
-            for (int32_t row = 0; row < rows; row++)
-                glass_span(x + 1, x + 1 + (int32_t)info->width, top + row,
-                           0xFF161A1Fu, window_focused ? 0x70u : 0x58u, 0u);
+             * glass behind its content too, not a flat colour - unless
+             * Settings asks for solid window backgrounds. The rows by the
+             * rounded bottom corners are the frame's glass. */
+            if (window_background == MOSDESK_WINDOW_BG_SOLID)
+                fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT + 1, (int32_t)info->width,
+                          (int32_t)info->height - (int32_t)CORNER_RADIUS, 0xFF161A1Fu);
+            else
+                window_content_glass(x + 1, y + (int32_t)TITLE_HEIGHT + 1,
+                                     (int32_t)info->width, (int32_t)info->height,
+                                     0xFF161A1Fu, window_focused ? 0x70u : 0x58u);
         }
         fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT, outer_width - 2, 1,
                   0x28FFFFFFu);
@@ -3893,11 +3925,21 @@ static void composite_window(const syscall_window_info_t* info,
                              CORNER_RADIUS + 1u,
                              window_focused ? 0x40000000u : 0x24000000u,
                              covered);
+    /* Glass backgrounds: a see-through window gets frosted glass behind
+     * its content instead of the flat content colour. */
+    bool modern_glass = !filled && window_background == MOSDESK_WINDOW_BG_GLASS &&
+                        entry && entry->pixels;
+    const int32_t* behind = modern_glass ? content : filled;
     fill_rounded_rect_around(x, y, outer_width, outer_height, CORNER_RADIUS,
-                             info->style.border, filled);
+                             info->style.border, behind);
     fill_rounded_rect_around(x + 1, y + 1, outer_width - 2, outer_height - 2,
                              CORNER_RADIUS - 1u,
-                             info->style.content_background, filled);
+                             info->style.content_background, behind);
+    if (modern_glass)
+        window_content_glass(x + 1, y + (int32_t)TITLE_HEIGHT + 1, (int32_t)info->width,
+                             (int32_t)info->height,
+                             0xFF000000u | (info->style.content_background & 0x00FFFFFFu),
+                             window_focused ? 0x90u : 0x78u);
     fill_rect(x + 1, y + (int32_t)TITLE_HEIGHT, outer_width - 2, 2,
               info->style.title_bar);
     fill_rounded_rect(x + 1, y + 1, outer_width - 2,
@@ -4547,6 +4589,55 @@ static uint32_t start_menu_row_at(int32_t px, int32_t py) {
 
 /* Opens a launcher item; menu_for_app asks for the right-click menu. */
 static void launcher_activate(uint32_t item, bool menu_for_app);
+
+/* Power button: top right of the launcher header, beside the badge. */
+#define LAUNCHER_POWER_SIZE 30
+static void launcher_power_rect(int32_t* px, int32_t* py) {
+    int32_t x, y, width, height;
+    start_menu_bounds(&x, &y, &width, &height);
+    *px = x + width - 12 - LAUNCHER_POWER_SIZE;
+    *py = y + 12;
+}
+
+static bool launcher_power_hit(int32_t cx, int32_t cy) {
+    int32_t x, y;
+    launcher_power_rect(&x, &y);
+    return cx >= x && cx < x + LAUNCHER_POWER_SIZE && cy >= y &&
+           cy < y + LAUNCHER_POWER_SIZE;
+}
+
+static uint32_t isqrt_u32(uint32_t v) {
+    uint32_t r = 0, bit = 1u << 30;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) { v -= r + bit; r = (r >> 1) + bit; }
+        else r >>= 1;
+        bit >>= 2;
+    }
+    return r;
+}
+
+/* The power symbol: a ring open at the top with a bar through the gap,
+ * anti-aliased (distances in 1/16 pixel). */
+static void draw_power_symbol(int32_t cx, int32_t cy, uint32_t color) {
+    const int32_t radius = 7 * 16, half = 12;        /* ring centre line, half width */
+    uint32_t base_alpha = color >> 24, rgb = color & 0x00FFFFFFu;
+    for (int32_t y = -10; y <= 10; y++)
+        for (int32_t x = -10; x <= 10; x++) {
+            int32_t fx = x * 16, fy = y * 16;
+            int32_t d = (int32_t)isqrt_u32((uint32_t)(fx * fx + fy * fy));
+            int32_t off = d > radius ? d - radius : radius - d;
+            int32_t cover = half + 8 - off;              /* 16 = full pixel */
+            /* the gap: 45 degrees either side of straight up */
+            if (y < 0 && (x < 0 ? -x : x) * 10 < -y * 10 && -y > 2) cover = 0;
+            if (x >= -1 && x <= 0 && y >= -10 && y <= -1) cover = 16;  /* the bar */
+            if (cover <= 0) continue;
+            if (cover > 16) cover = 16;
+            put_pixel(cx + x, cy + y, ((base_alpha * (uint32_t)cover / 16u) << 24) | rgb);
+        }
+}
+
+static void menu_show_for_power(void);
 
 /* ------------------------------------------------------------ sound tray
  *
@@ -5517,6 +5608,16 @@ static void draw_taskbar(const syscall_window_info_t* windows,
                                   (accent_color & 0x00FFFFFFu))
                               : aero ? 0xA06A7F94u : 0xA0FFFFFFu);
         }
+        {
+            /* power button */
+            int32_t bx, by;
+            launcher_power_rect(&bx, &by);
+            fill_rounded_rect(bx, by, LAUNCHER_POWER_SIZE, LAUNCHER_POWER_SIZE,
+                              LAUNCHER_POWER_SIZE / 2,
+                              aero ? 0x50FFFFFFu : 0x40FFFFFFu);
+            draw_power_symbol(bx + LAUNCHER_POWER_SIZE / 2 - 1,
+                              by + LAUNCHER_POWER_SIZE / 2 + 1, 0xF0FFFFFFu);
+        }
         if (!aero) fill_rect(mx + 18, my + mh - 34, mw - 36, 1, 0xFF353C42u);
         /* Fitted, because the fallback bitmap font is wider than the menu. */
         char hint[48];
@@ -5616,6 +5717,13 @@ static void menu_show_for_clock(void) {
     menu_item_count = 0;
     menu_add(MENU_ACTION_TIME_SETTINGS, "Date & time settings",
              MOSWM_ICON_SETTINGS, false, true);
+    menu_show(CLICK_ACTION_NONE, "");
+}
+
+static void menu_show_for_power(void) {
+    menu_item_count = 0;
+    menu_add(MENU_ACTION_SHUTDOWN, "Shut down", MOSWM_ICON_COMPUTER, false, true);
+    menu_add(MENU_ACTION_RESTART, "Restart", MOSWM_ICON_REFRESH, false, true);
     menu_show(CLICK_ACTION_NONE, "");
 }
 
@@ -6368,6 +6476,18 @@ static void run_menu_action(menu_action_t action) {
         case MENU_ACTION_MOVE_TO:
             picker_open(action == MENU_ACTION_MOVE_TO, menu_path);
             break;
+        case MENU_ACTION_SHUTDOWN:
+        case MENU_ACTION_RESTART: {
+            uint64_t op = action == MENU_ACTION_SHUTDOWN ? SYS_POWER_SHUTDOWN
+                                                         : SYS_POWER_REBOOT;
+            mos_syscall1(SYS_POWER, op);
+            /* only returns when the machine could not do it */
+            open_note(false, action == MENU_ACTION_SHUTDOWN
+                                 ? "This PC cannot be shut down from here."
+                                 : "This PC could not be restarted.",
+                      true);
+            break;
+        }
         default:
             break;
     }
@@ -6901,6 +7021,7 @@ static uint64_t compute_scene_signature(const syscall_window_info_t* windows,
     hash = hash_u64(hash, auth_state);
     hash = hash_u64(hash, accent_color);
     hash = hash_u64(hash, ui_style);
+    hash = hash_u64(hash, window_background);
     hash = hash_u64(hash, glass_generation);
     hash = hash_text(hash, status_message);
     if (auth_state != AUTH_NONE) {
@@ -8410,6 +8531,11 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         cursor_x < menu_left + menu_width && cursor_y >= menu_top &&
         cursor_y < menu_top + menu_tall) {
         last_click_valid = false;
+        if (launcher_power_hit(cursor_x, cursor_y)) {
+            start_menu_open = false;
+            menu_show_for_power();
+            return;
+        }
         if (launcher_scrollbar_press(cursor_x, cursor_y)) return;
         uint32_t row = start_menu_row_at(cursor_x, cursor_y);
         if (row == UINT32_MAX) return;

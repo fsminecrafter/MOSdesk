@@ -585,7 +585,8 @@ static int32_t tile_rows(uint32_t tiles) {
  * window style, the accent swatches, then the wallpaper gallery (themes,
  * photos, photo fit). */
 static int32_t style_y(void) { return 96; }
-static int32_t accent_y(void) { return style_y() + TILE_PITCH_Y + 46; }
+static int32_t window_bg_y(void) { return style_y() + TILE_PITCH_Y + 46; }
+static int32_t accent_y(void) { return window_bg_y() + 78; }
 static int32_t wallpaper_themes_y(void) { return accent_y() + 102; }
 static int32_t wallpaper_photos_y(void) {
     return wallpaper_themes_y() + tile_rows(6u) * TILE_PITCH_Y + 34;
@@ -692,6 +693,26 @@ static void draw_appearance_page(void) {
         draw_style_tile(x, y, i);
         draw_tile_frame(x, y, preferences.ui_style == i, style_names[i]);
     }
+    /* What is behind window content: easyui apps follow this too. */
+    static const char* const window_bg_names[3] = {"Style default", "Solid", "Glass"};
+    draw_text(left, window_bg_y() - 33 - scroll, "Window background", 0xFF34434Cu,
+              true);
+    for (uint32_t i = 0; i < 3u; i++) {
+        int32_t x = left + (int32_t)i * 124;
+        int32_t y = window_bg_y() - scroll;
+        bool selected = preferences.window_background == i;
+        fill_round(x, y, 116, 28, 6,
+                   selected ? preferences.accent_color : 0xFFDCE2E6u);
+        draw_text(x + 14, y + 9, window_bg_names[i],
+                  selected ? 0xFFFFFFFFu : 0xFF34434Cu, false);
+    }
+    draw_text(left + 3 * 124 + 4, window_bg_y() + 9 - scroll,
+              preferences.window_background == MOSDESK_WINDOW_BG_GLASS
+                  ? "Apps show frosted glass behind their content"
+                  : preferences.window_background == MOSDESK_WINDOW_BG_SOLID
+                      ? "Plain colour, also in Liquid Glass"
+                      : "Glass in Liquid Glass, solid otherwise",
+              0xFF667680u, false);
     draw_text(left, accent_y() - 33 - scroll, "Desktop accent",
               0xFF34434Cu, true);
     for (uint32_t i = 0; i < 6u; i++) {
@@ -775,6 +796,12 @@ static bool appearance_page_click(int32_t x, int32_t y) {
         if (index >= 3 || x - left - index * TILE_PITCH_X >= (int32_t)THUMB_WIDTH)
             return false;
         preferences.ui_style = (uint32_t)index;
+        return true;
+    }
+    if (page_y >= window_bg_y() && page_y < window_bg_y() + 28) {
+        int32_t index = (x - left) / 124;
+        if (index >= 3 || x - left - index * 124 >= 116) return false;
+        preferences.window_background = (uint32_t)index;
         return true;
     }
     if (page_y >= accent_y() - 4 && page_y < accent_y() + 36) {
