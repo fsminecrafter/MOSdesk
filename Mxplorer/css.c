@@ -1875,8 +1875,8 @@ static void apply_declaration(apply_ctx_t* ctx, uint16_t property,
         int found = 0;
         color = first_color_in(value, &found);
         if (found) s->background = color == COLOR_CURRENT ? s->color : color;
-        else if (property == P_BACKGROUND && !strstr(value, "url("))
-            s->background = 0;
+        else if (property == P_BACKGROUND)
+            s->background = 0;   /* the shorthand resets the colour too */
         break;
     }
     case P_FONT_SIZE:
@@ -2701,7 +2701,7 @@ const char mx_css_user_agent[] =
     "input,button,select,textarea{display:inline-block;font-size:13px;"
     "line-height:normal}"
     "button,input[type=submit],input[type=button],input[type=reset]{"
-    "padding:5px 14px;border:1px solid #b8c1cc;border-radius:6px;"
+    "padding:5px 14px;border:1px solid #b8c1cc;border-radius:6px;box-sizing:border-box;"
     "background-color:#eef1f5;color:#1f2933;cursor:pointer}"
     "input,select,textarea{border:1px solid #b8c1cc;border-radius:4px;"
     "background-color:#fff;color:#1f2933;padding:4px 6px}"

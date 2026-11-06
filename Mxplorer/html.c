@@ -311,6 +311,8 @@ static void measure_children(mx_node_t* n, int* min_w, int* max_w) {
     if (line > *max_w) *max_w = line;
 }
 
+static void table_measure(mx_node_t* table, int* min_out, int* max_out);
+
 static void measure(mx_node_t* n, int* min_out, int* max_out) {
     *min_out = *max_out = 0;
     if (n->type != MX_NODE_ELEMENT || is_hidden(n)) return;
@@ -324,11 +326,15 @@ static void measure(mx_node_t* n, int* min_out, int* max_out) {
     if (is_replaced(n)) {
         int w, h;
         replaced_size(n, viewport_w, &w, &h);
-        min_w = max_w = w;
+        /* w has padding and border already; they are added below */
+        min_w = max_w = w - (box_extra(s, 0) - mx_len_resolve(s->margin[1], 0) -
+                             mx_len_resolve(s->margin[3], 0));
     } else if (s->width.kind == MX_LEN_SET && !s->width.pct) {
         min_w = max_w = s->width.px;
         if (s->border_box) min_w = max_w = s->width.px - (box_extra(s, 0) -
             mx_len_resolve(s->margin[1], 0) - mx_len_resolve(s->margin[3], 0));
+    } else if (s->display == MX_DISPLAY_TABLE) {
+        table_measure(n, &min_w, &max_w);
     } else if (s->display == MX_DISPLAY_TABLE_ROW ||
                ((s->display == MX_DISPLAY_FLEX || s->display == MX_DISPLAY_INLINE_FLEX) &&
                 s->flex_direction != MX_FLEX_COLUMN &&
@@ -1722,38 +1728,30 @@ typedef struct {
     mx_node_t* cells[TABLE_MAX_COLS];
     int cell_h[TABLE_MAX_COLS];
     unsigned cell_items[TABLE_MAX_COLS][2], cell_laid[TABLE_MAX_COLS][2];
+    int col_pct[TABLE_MAX_COLS];   /* width="25%" on a cell: percent * 100 */
 } table_work_t;
 
-static int layout_table(mx_node_t* table, int x, int y, int w) {
-    /* the work area lives in the layout arena: tables nest */
-    table_work_t* t = (table_work_t*)mx_arena_zalloc(&layout_arena, sizeof(table_work_t));
-    if (!t) return 0;
-    mx_node_t** rows = t->rows;
-    int row_count = 0;
-    int caption_h = 0;
+#define TABLE_SPACING 2
+
+/* Finds the rows (captions skipped) and sizes the columns: smallest and
+ * widest content, and the percentage width cells ask for. Returns the
+ * column count. */
+static int table_columns(mx_node_t* table, table_work_t* t, int* row_count_out) {
+    int row_count = 0, cols = 0;
     for (mx_node_t* c = table->first; c; c = c->next) {
         if (c->type != MX_NODE_ELEMENT || is_hidden(c)) continue;
-        if (c->style->display == MX_DISPLAY_TABLE_CAPTION) {
-            caption_h += layout_block(c, x, y + caption_h, w, -1);
-            continue;
-        }
         if (c->style->display == MX_DISPLAY_TABLE_ROW) {
-            if (row_count < TABLE_MAX_ROWS) rows[row_count++] = c;
+            if (row_count < TABLE_MAX_ROWS) t->rows[row_count++] = c;
         } else if (c->style->display == MX_DISPLAY_TABLE_GROUP) {
             for (mx_node_t* r = c->first; r; r = r->next)
                 if (r->type == MX_NODE_ELEMENT && !is_hidden(r) &&
                     r->style->display == MX_DISPLAY_TABLE_ROW && row_count < TABLE_MAX_ROWS)
-                    rows[row_count++] = r;
+                    t->rows[row_count++] = r;
         }
     }
-    y += caption_h;
-    int spacing = 2;
-    int cols = 0;
-    int* col_min = t->col_min;
-    int* col_max = t->col_max;
     for (int r = 0; r < row_count; r++) {
         int col = 0;
-        for (mx_node_t* cell = rows[r]->first; cell; cell = cell->next) {
+        for (mx_node_t* cell = t->rows[r]->first; cell; cell = cell->next) {
             if (cell->type != MX_NODE_ELEMENT || is_hidden(cell)) continue;
             int span = attr_int(cell, "colspan", 1);
             if (span < 1) span = 1;
@@ -1762,24 +1760,135 @@ static int layout_table(mx_node_t* table, int x, int y, int w) {
             measure(cell, &mn, &mxw);
             for (int k = 0; k < span; k++) {
                 int share_min = mn / span, share_max = mxw / span;
-                if (share_min > col_min[col + k]) col_min[col + k] = share_min;
-                if (share_max > col_max[col + k]) col_max[col + k] = share_max;
+                if (share_min > t->col_min[col + k]) t->col_min[col + k] = share_min;
+                if (share_max > t->col_max[col + k]) t->col_max[col + k] = share_max;
             }
+            const mx_len_t* cw = &cell->style->width;
+            if (span == 1 && cw->kind == MX_LEN_SET && cw->pct > 0 && !cw->px &&
+                cw->pct > t->col_pct[col])
+                t->col_pct[col] = cw->pct;
             col += span;
         }
         if (col > cols) cols = col;
     }
-    if (!cols) return caption_h;
-    int sum_min = 0, sum_max = 0;
+    int pct_total = 0;
     for (int i = 0; i < cols; i++) {
-        if (col_max[i] < col_min[i]) col_max[i] = col_min[i];
+        if (t->col_max[i] < t->col_min[i]) t->col_max[i] = t->col_min[i];
+        /* percentages past 100% are dropped, as browsers do */
+        if (pct_total + t->col_pct[i] > 10000) t->col_pct[i] = 0;
+        pct_total += t->col_pct[i];
+    }
+    *row_count_out = row_count;
+    return cols;
+}
+
+/* The width the columns want, without spacing. A 25% column holding 100px
+ * needs a 400px table; the other columns need what the percentages leave. */
+static int table_wanted(const table_work_t* t, int cols) {
+    int sum_max = 0, rest_max = 0, pct_total = 0, need = 0;
+    for (int i = 0; i < cols; i++) {
+        sum_max += t->col_max[i];
+        if (t->col_pct[i]) {
+            pct_total += t->col_pct[i];
+            int w = (int)((long)t->col_max[i] * 10000 / t->col_pct[i]);
+            if (w > need) need = w;
+        } else {
+            rest_max += t->col_max[i];
+        }
+    }
+    if (pct_total && pct_total < 10000) {
+        int w = (int)((long)rest_max * 10000 / (10000 - pct_total));
+        if (w > need) need = w;
+    }
+    return need > sum_max ? need : sum_max;
+}
+
+static void table_measure(mx_node_t* table, int* min_out, int* max_out) {
+    table_work_t* t = (table_work_t*)mx_arena_zalloc(&layout_arena, sizeof(table_work_t));
+    *min_out = *max_out = 0;
+    if (!t) return;
+    int row_count;
+    int cols = table_columns(table, t, &row_count);
+    if (!cols) return;
+    int sum_min = 0;
+    for (int i = 0; i < cols; i++) sum_min += t->col_min[i];
+    *min_out = sum_min + TABLE_SPACING * (cols + 1);
+    *max_out = table_wanted(t, cols) + TABLE_SPACING * (cols + 1);
+}
+
+/* Shares `amount` between the columns in `pick` (1 = take part): first up
+ * to each one's widest content, then the rest by that width. */
+static void table_share(int* widths, const int* col_min, const int* col_max,
+                        const int* pick, int cols, int amount) {
+    int sum_min = 0, sum_max = 0, count = 0;
+    for (int i = 0; i < cols; i++)
+        if (pick[i]) { sum_min += col_min[i]; sum_max += col_max[i]; count++; }
+    if (!count) return;
+    for (int i = 0; i < cols; i++) {
+        if (!pick[i]) continue;
+        if (amount <= sum_min) {
+            widths[i] = col_min[i];
+        } else if (amount <= sum_max) {
+            int range = sum_max - sum_min;
+            widths[i] = col_min[i] + (range ? (int)((long)(amount - sum_min) *
+                                                    (col_max[i] - col_min[i]) / range) : 0);
+        } else {
+            int extra = amount - sum_max;
+            widths[i] = col_max[i] + (sum_max ? (int)((long)extra * col_max[i] / sum_max)
+                                              : extra / count);
+        }
+    }
+}
+
+static int layout_table(mx_node_t* table, int x, int y, int w) {
+    /* the work area lives in the layout arena: tables nest */
+    table_work_t* t = (table_work_t*)mx_arena_zalloc(&layout_arena, sizeof(table_work_t));
+    if (!t) return 0;
+    int caption_h = 0;
+    for (mx_node_t* c = table->first; c; c = c->next) {
+        if (c->type != MX_NODE_ELEMENT || is_hidden(c)) continue;
+        if (c->style->display == MX_DISPLAY_TABLE_CAPTION)
+            caption_h += layout_block(c, x, y + caption_h, w, -1);
+    }
+    y += caption_h;
+    int spacing = TABLE_SPACING;
+    int row_count;
+    int cols = table_columns(table, t, &row_count);
+    if (!cols) return caption_h;
+    mx_node_t** rows = t->rows;
+    int* col_min = t->col_min;
+    int* col_max = t->col_max;
+    int* col_pct = t->col_pct;
+    int sum_min = 0, sum_max = 0, pct_total = 0;
+    for (int i = 0; i < cols; i++) {
         sum_min += col_min[i];
         sum_max += col_max[i];
+        pct_total += col_pct[i];
     }
     int avail = w - spacing * (cols + 1);
     int fixed_width = table->style->width.kind == MX_LEN_SET;
     int* widths = t->widths;
-    if (sum_max <= avail) {
+    if (pct_total && sum_min < avail) {
+        /* percentage columns take their share of the table, the others
+         * the rest (the table was sized for this in layout_block) */
+        int pick[TABLE_MAX_COLS];
+        int used = 0, auto_cols = 0;
+        for (int i = 0; i < cols; i++) {
+            pick[i] = !col_pct[i];
+            auto_cols += pick[i];
+            if (col_pct[i]) {
+                widths[i] = (int)((long)avail * col_pct[i] / 10000);
+                if (widths[i] < col_min[i]) widths[i] = col_min[i];
+                used += widths[i];
+            }
+        }
+        if (auto_cols) {
+            table_share(widths, col_min, col_max, pick, cols, avail - used);
+        } else if (avail > used) {
+            for (int i = 0; i < cols; i++)
+                widths[i] += (int)((long)(avail - used) * col_pct[i] / pct_total);
+        }
+    } else if (sum_max <= avail) {
         int extra = fixed_width ? avail - sum_max : 0;
         for (int i = 0; i < cols; i++)
             widths[i] = col_max[i] + (sum_max ? (int)((long)extra * col_max[i] / sum_max)
@@ -1947,6 +2056,17 @@ static int layout_block(mx_node_t* n, int x, int y, int container_w,
     if (s->min_width.kind == MX_LEN_SET) {
         int min = mx_len_resolve(s->min_width, cw) - (s->border_box ? frame_h : 0);
         if (content_w < min) content_w = min;
+    }
+    if (forced_w < 0 && s->display == MX_DISPLAY_TABLE && s->width.kind != MX_LEN_SET) {
+        /* an auto-width table is as wide as its columns want (so <center>
+         * and margin:auto can centre it), never wider than the space */
+        int tmin, tmax;
+        measure(n, &tmin, &tmax);
+        int want = tmax - frame_h - ml - mr;
+        if (want < content_w) {
+            content_w = want;
+            explicit_width = 1;
+        }
     }
     if (content_w < 0) content_w = 0;
     if (explicit_width && forced_w < 0) {
