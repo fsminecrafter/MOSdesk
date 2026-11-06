@@ -4,8 +4,9 @@
  *     run 0:/programs/mos_video.run file.vid
  *
  * mosWM opens .vid files with it. Frames are read from the file as they
- * are needed (never the whole video at once) and decoded on the CPU. The
- * soundtrack plays in the kernel straight from the same file
+ * are needed (never the whole video at once) and decoded on the CPU,
+ * using SMP tile decoding when the kernel supports it. The soundtrack
+ * plays in the kernel straight from the same file
  * (mos_audio_open_at), and the picture follows the sound's clock, so they
  * stay in step; without a sound card the picture keeps its own time.
  *
