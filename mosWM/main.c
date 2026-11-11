@@ -337,7 +337,18 @@ static uint32_t desktop_apps_generation;
 static uint64_t scene_signature;
 static bool scene_valid;
 static uint32_t cursor_patch[CURSOR_PATCH_SIZE * CURSOR_PATCH_SIZE];
+#ifndef SYSCALL_WINDOW_POINTER_LOCK         /* built against an older SDK */
+#define SYSCALL_WINDOW_POINTER_LOCK (1u << 6)
+#define SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE (SYSCALL_WINDOW_EVENT_MOUSE_WHEEL + 1)
+#endif
 static bool cursor_drawn;
+/* Pointer lock: the focused window has SYSCALL_WINDOW_POINTER_LOCK (a
+ * game). The cursor is hidden and stays where it is; the window gets the
+ * mouse's own movement as SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE. It ends
+ * when the window drops the flag, loses focus, or a menu or dialog of
+ * mosWM's opens. */
+static bool pointer_locked;
+static int32_t lock_dx, lock_dy;    /* movement not delivered yet (queue full) */
 static int32_t cursor_drawn_x;
 static int32_t cursor_drawn_y;
 static int32_t cursor_drawn_width;
@@ -4255,6 +4266,7 @@ static void present_frame(bool full, const rect_t* areas,
     signature = hash_u64(signature, ((uint64_t)cursor_fill_color << 32) |
                                     scale);
     signature = hash_text(signature, cached_cursor_pack);
+    signature = hash_u64(signature, pointer_locked);
     if (!full && !area_count && cursor_drawn &&
         signature == cursor_drawn_signature)
         return;
@@ -4285,6 +4297,7 @@ static void present_frame(bool full, const rect_t* areas,
     if (width > (int32_t)CURSOR_PATCH_SIZE) width = (int32_t)CURSOR_PATCH_SIZE;
     if (height > (int32_t)CURSOR_PATCH_SIZE)
         height = (int32_t)CURSOR_PATCH_SIZE;
+    if (pointer_locked) width = height = 0;     /* hidden */
     if (width > 0 && height > 0) {
         for (int32_t row = 0; row < height; row++)
             copy_pixels(cursor_patch + (size_t)row * CURSOR_PATCH_SIZE,
@@ -8897,6 +8910,72 @@ static void on_mouse_up(syscall_window_info_t* windows, uint64_t count,
     drag_mode = DRAG_NONE;
 }
 
+/* The window that has the mouse to itself now, or NULL. */
+static syscall_window_info_t* pointer_lock_window(syscall_window_info_t* windows,
+                                                  uint64_t count) {
+    if (auth_state != AUTH_NONE || menu_open || dialog_kind != DIALOG_NONE ||
+        start_menu_open || !focused_id)
+        return NULL;
+    for (uint64_t i = 0; i < count; i++) {
+        if (windows[i].id != focused_id) continue;
+        uint32_t flags = windows[i].flags;
+        if ((flags & SYSCALL_WINDOW_POINTER_LOCK) && (flags & SYSCALL_WINDOW_VISIBLE) &&
+            !(flags & SYSCALL_WINDOW_MINIMIZED))
+            return &windows[i];
+        return NULL;
+    }
+    return NULL;
+}
+
+/* Mouse input while a window has the pointer locked: everything goes to
+ * it, nothing to the desktop. Returns true if the event was handled so. */
+static bool route_locked_mouse(const syscall_input_event_t* input,
+                               syscall_window_info_t* windows, uint64_t count) {
+    syscall_window_info_t* target = pointer_lock_window(windows, count);
+    if (pointer_locked != (target != NULL)) {
+        pointer_locked = target != NULL;
+        lock_dx = lock_dy = 0;
+        scene_valid = false;        /* the cursor appears or goes */
+    }
+    if (!target) return false;
+    if (input->type == SYSCALL_INPUT_MOUSE_MOVE) {
+        int32_t scaled_x = input->dx * (int32_t)mouse_speed + mouse_remainder_x;
+        int32_t scaled_y = input->dy * (int32_t)mouse_speed + mouse_remainder_y;
+        lock_dx += scaled_x / 100;
+        lock_dy += scaled_y / 100;
+        mouse_remainder_x = scaled_x % 100;
+        mouse_remainder_y = scaled_y % 100;
+        if (!lock_dx && !lock_dy) return true;
+        syscall_window_event_t event = {
+            .type = SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE,
+            .x = lock_dx,
+            .y = lock_dy,
+            .buttons = input->buttons,
+            .mods = input->mods,
+            .time_ms = input->time_ms
+        };
+        /* A full queue keeps the movement for the next event. */
+        if (mos_window_post_event(target->id, &event) == SYS_SUCCESS) lock_dx = lock_dy = 0;
+        return true;
+    }
+    if (input->type == SYSCALL_INPUT_MOUSE_BUTTON || input->type == SYSCALL_INPUT_MOUSE_WHEEL) {
+        previous_buttons = input->buttons;
+        syscall_window_event_t event = {
+            .type = input->type == SYSCALL_INPUT_MOUSE_WHEEL ? SYSCALL_WINDOW_EVENT_MOUSE_WHEEL
+                                                              : SYSCALL_WINDOW_EVENT_MOUSE,
+            .x = cursor_x - (int32_t)target->x - 1,
+            .y = cursor_y - (int32_t)target->y - (int32_t)TITLE_HEIGHT - 1,
+            .buttons = input->buttons,
+            .wheel = input->wheel,
+            .mods = input->mods,
+            .time_ms = input->time_ms
+        };
+        mos_window_post_event(target->id, &event);
+        return true;
+    }
+    return false;
+}
+
 static void route_input(const syscall_input_event_t* input,
                         syscall_window_info_t* windows, uint64_t count) {
     if (input->type == SYSCALL_INPUT_MOUSE_MOVE) debug_mouse_events++;
@@ -8928,6 +9007,7 @@ static void route_input(const syscall_input_event_t* input,
         }
         return;
     }
+    if (route_locked_mouse(input, windows, count)) return;
     if (input->type == SYSCALL_INPUT_MOUSE_MOVE) {
         int32_t scaled_x = input->dx * (int32_t)mouse_speed + mouse_remainder_x;
         int32_t scaled_y = input->dy * (int32_t)mouse_speed + mouse_remainder_y;
