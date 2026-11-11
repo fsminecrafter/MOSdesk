@@ -95,7 +95,11 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define SHORTCUT_EXTENSION ".lnk"
 #define FILE_TREE_MAX_DEPTH 6u
 #define FILE_COPY_CHUNK (64u * 1024u)
-#define FRAME_INTERVAL_MS 16u
+/* Frames are paced at 60 per second, the refresh rate of nearly every
+ * display: 16 2/3 ms, kept in thirds of a millisecond. A whole 16 ms
+ * (62.5 Hz) drifted against a 60 Hz screen and showed a frame twice or
+ * skipped one every 0.4 s - a visible hitch in anything moving. */
+#define FRAME_INTERVAL_THIRDS 50u
 #define DAMAGE_MAX_RECTS 8u
 #define WINDOW_SHADOW_MARGIN 10
 
@@ -3764,9 +3768,11 @@ static bool set_window_mode(const syscall_window_info_t* info,
     if (previous_mode == MODE_MINIMIZED && mode != MODE_MINIMIZED)
         start_restore_animation(entry);
 
-    if (mode == MODE_MAXIMIZED || mode == MODE_FULLSCREEN) {
-        uint32_t work_height = mode == MODE_FULLSCREEN
-            ? display.height : display.height - TASKBAR_HEIGHT;
+    if (mode == MODE_FULLSCREEN)
+        return mos_window_set_bounds(info->id, 0, 0, display.width,
+                                     display.height) == SYS_SUCCESS;
+    if (mode == MODE_MAXIMIZED) {
+        uint32_t work_height = display.height - TASKBAR_HEIGHT;
         if (display.width <= 2u || work_height <= TITLE_HEIGHT + 2u)
             return false;
         return mos_window_set_bounds(info->id, 0, 0, display.width - 2u,
@@ -3806,6 +3812,35 @@ static void draw_chrome_text(const syscall_window_info_t* info,
 
 /* Frosted glass behind a see-through window's content (the rows above
  * the rounded bottom corners; those belong to the frame). */
+/* A full-screen window has no frame: its content is the whole screen.
+ * Every other window has a title bar and a one-pixel border, and its
+ * position is the frame's top-left corner. */
+static bool borderless(const syscall_window_info_t* info) {
+    return (info->flags & SYSCALL_WINDOW_FULLSCREEN) &&
+           !(info->flags & SYSCALL_WINDOW_MINIMIZED);
+}
+static int32_t content_left(const syscall_window_info_t* info) {
+    return (int32_t)info->x + (borderless(info) ? 0 : 1);
+}
+static int32_t content_top(const syscall_window_info_t* info) {
+    return (int32_t)info->y + (borderless(info) ? 0 : (int32_t)TITLE_HEIGHT + 1);
+}
+static int32_t frame_right(const syscall_window_info_t* info) {
+    return (int32_t)info->x + (int32_t)info->width + (borderless(info) ? 0 : 2);
+}
+static int32_t frame_bottom(const syscall_window_info_t* info) {
+    return (int32_t)info->y + (int32_t)info->height +
+           (borderless(info) ? 0 : (int32_t)TITLE_HEIGHT + 2);
+}
+static int32_t title_height_of(const syscall_window_info_t* info) {
+    return borderless(info) ? 0 : (int32_t)TITLE_HEIGHT;
+}
+
+/* The focused window when it is full screen and nothing (menu, dialog)
+ * is open over it: the taskbar is hidden and every click is its. */
+static const syscall_window_info_t* fullscreen_front(
+        const syscall_window_info_t* windows, uint64_t count);
+
 static void window_content_glass(int32_t x, int32_t y, int32_t width, int32_t height,
                                  uint32_t tint, uint32_t alpha) {
     int32_t rows = height - (int32_t)CORNER_RADIUS;
@@ -3813,8 +3848,40 @@ static void window_content_glass(int32_t x, int32_t y, int32_t width, int32_t he
         glass_span(x, x + width, y + row, tint, alpha, 0u);
 }
 
+static void composite_borderless(const syscall_window_info_t* info,
+                                 cached_window_t* entry) {
+    int32_t x = (int32_t)info->x, y = (int32_t)info->y;
+    rect_t bounds = draw_bounds();
+    if (!entry || !entry->pixels) {
+        fill_rect(x, y, (int32_t)info->width, (int32_t)info->height, 0xFF000000u);
+        return;
+    }
+    int32_t first = x < bounds.left ? bounds.left - x : 0;
+    int32_t last = (int32_t)info->width;
+    if (x + last > bounds.right) last = bounds.right - x;
+    if (last <= first) return;
+    for (uint32_t py = 0; py < info->height; py++) {
+        int32_t dy = y + (int32_t)py;
+        if (dy < bounds.top || dy >= bounds.bottom) continue;
+        const uint32_t* source = entry->pixels + (size_t)py * info->width;
+        uint32_t* target = canvas + (size_t)dy * display.width + x;
+        if (entry->opaque) {
+            copy_pixels(target + first, source + first, (size_t)(last - first));
+            continue;
+        }
+        for (int32_t px = first; px < last; px++) {
+            uint32_t color = source[px];
+            target[px] = color >> 24 == 255u ? color : alpha_blend(color, target[px]);
+        }
+    }
+}
+
 static void composite_window(const syscall_window_info_t* info,
                              cached_window_t* entry) {
+    if (borderless(info)) {
+        composite_borderless(info, entry);
+        return;
+    }
     int32_t x = (int32_t)info->x;
     int32_t y = (int32_t)info->y;
     int32_t outer_width = (int32_t)info->width + 2;
@@ -7083,6 +7150,20 @@ static void draw_window_maybe_animated(const syscall_window_info_t* info,
 static void draw_ghosts(void);
 
 /* Paints the scene into the canvas, within the current clip. */
+static const syscall_window_info_t* fullscreen_front(
+        const syscall_window_info_t* windows, uint64_t count) {
+    if (auth_state != AUTH_NONE || menu_open || dialog_kind != DIALOG_NONE ||
+        start_menu_open || sound_menu_open || net_menu_open || !focused_id)
+        return NULL;
+    for (uint64_t i = 0; i < count; i++) {
+        if (windows[i].id != focused_id) continue;
+        if ((windows[i].flags & SYSCALL_WINDOW_VISIBLE) && borderless(&windows[i]))
+            return &windows[i];
+        return NULL;
+    }
+    return NULL;
+}
+
 static void draw_scene(const syscall_window_info_t* windows, uint64_t count) {
     if (auth_state != AUTH_NONE) {
         draw_auth_screen();
@@ -7103,7 +7184,7 @@ static void draw_scene(const syscall_window_info_t* windows, uint64_t count) {
         }
         draw_ghosts();
         debug_lap(PROFILE_WINDOW_DRAW);
-        draw_taskbar(windows, count);
+        if (!fullscreen_front(windows, count)) draw_taskbar(windows, count);
         popup_layer_begin(POPUP_CONTEXT);
         draw_context_menu();
         popup_layer_end(POPUP_CONTEXT);
@@ -8128,8 +8209,8 @@ static void collect_damage(const syscall_window_info_t* windows,
             damage_add(window_outer_rect((int32_t)info->x, (int32_t)info->y,
                                          info->width, info->height));
         } else if (entry->drawn_version != entry->frame_version) {
-            int32_t left = (int32_t)info->x + 1;
-            int32_t top = (int32_t)info->y + (int32_t)TITLE_HEIGHT + 1;
+            int32_t left = content_left(info);
+            int32_t top = content_top(info);
             damage_add((rect_t){left, top, left + (int32_t)info->width,
                                 top + (int32_t)info->height});
         }
@@ -8199,9 +8280,8 @@ static syscall_window_info_t* window_at(syscall_window_info_t* windows,
                 (info->flags & SYSCALL_WINDOW_MINIMIZED) ||
                 ((info->id == focused_id) != (focus_pass == 0)))
                 continue;
-            int32_t right = (int32_t)info->x + (int32_t)info->width + 2;
-            int32_t bottom = (int32_t)info->y + (int32_t)info->height +
-                             (int32_t)TITLE_HEIGHT + 2;
+            int32_t right = frame_right(info);
+            int32_t bottom = frame_bottom(info);
             if (px >= (int32_t)info->x && px < right &&
                 py >= (int32_t)info->y && py < bottom)
                 return info;
@@ -8264,9 +8344,8 @@ static syscall_window_info_t* resize_target(syscall_window_info_t* windows,
                 (info->flags & SYSCALL_WINDOW_MINIMIZED) ||
                 ((info->id == focused_id) != (focus_pass == 0)))
                 continue;
-            int32_t right = (int32_t)info->x + (int32_t)info->width + 2;
-            int32_t bottom = (int32_t)info->y + (int32_t)info->height +
-                             (int32_t)TITLE_HEIGHT + 2;
+            int32_t right = frame_right(info);
+            int32_t bottom = frame_bottom(info);
             bool inside = px >= (int32_t)info->x && px < right &&
                           py >= (int32_t)info->y && py < bottom;
             uint32_t e = resize_edges_of(info, px, py);
@@ -8320,7 +8399,7 @@ static void update_cursor_appearance(syscall_window_info_t* windows,
         int32_t x = cursor_x - (int32_t)under->x;
         int32_t y = cursor_y - (int32_t)under->y;
         int32_t right = (int32_t)under->width + 1;
-        if (y < (int32_t)TITLE_HEIGHT) {
+        if (y < title_height_of(under)) {
             if (caption_button_at(x, y, right)) status = SYSCALL_CURSOR_HAND;
             else status = SYSCALL_CURSOR_MOVE;
             app_window = NULL;
@@ -8506,6 +8585,12 @@ static void launcher_activate(uint32_t item, bool menu_for_app) {
 
 static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
     pending_click_action = CLICK_ACTION_NONE;
+    /* A full-screen window has the whole screen: the click went to it as
+     * a window event already. */
+    if (fullscreen_front(windows, count)) {
+        last_click_valid = false;
+        return;
+    }
     desktop_icon_drag_index = UINT32_MAX;
     desktop_icon_drag_moved = false;
     uint32_t taskbar_y = display.height - TASKBAR_HEIGHT;
@@ -8639,7 +8724,7 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
         }
     }
     last_click_valid = false;
-    if (y < (int32_t)TITLE_HEIGHT) {
+    if (y < title_height_of(info)) {
         uint32_t button = caption_button_at(x, y, right);
         if (button == 3u) {
             request_close(info);
@@ -8656,6 +8741,7 @@ static void on_mouse_down(syscall_window_info_t* windows, uint64_t count) {
 static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
     pending_click_action = CLICK_ACTION_NONE;
     last_click_valid = false;
+    if (fullscreen_front(windows, count)) return;
     if (start_menu_open) {
         /* Right-clicking an application in the launcher offers its menu,
          * Add to desktop included. */
@@ -8780,6 +8866,7 @@ static void update_hover_state(syscall_window_info_t* windows,
     if (auth_state == AUTH_NONE && dialog_kind == DIALOG_PICK_FOLDER)
         picker_update_hover();
     if (auth_state != AUTH_NONE || dialog_kind != DIALOG_NONE) return;
+    if (fullscreen_front(windows, count)) return;   /* no taskbar, no frame */
     if (menu_open) {
         uint32_t item = menu_item_at(cursor_x, cursor_y);
         if (item != UINT32_MAX && menu_items[item].enabled) menu_hover = item;
@@ -8814,7 +8901,7 @@ static void update_hover_state(syscall_window_info_t* windows,
         hover_desktop_icon = desktop_icon_at(cursor_x, cursor_y);
         return;
     }
-    caption_hover_button = caption_button_at(
+    caption_hover_button = borderless(info) ? 0u : caption_button_at(
         cursor_x - (int32_t)info->x, cursor_y - (int32_t)info->y,
         (int32_t)info->width + 1);
     if (caption_hover_button) caption_hover_window = info->id;
@@ -8963,8 +9050,8 @@ static bool route_locked_mouse(const syscall_input_event_t* input,
         syscall_window_event_t event = {
             .type = input->type == SYSCALL_INPUT_MOUSE_WHEEL ? SYSCALL_WINDOW_EVENT_MOUSE_WHEEL
                                                               : SYSCALL_WINDOW_EVENT_MOUSE,
-            .x = cursor_x - (int32_t)target->x - 1,
-            .y = cursor_y - (int32_t)target->y - (int32_t)TITLE_HEIGHT - 1,
+            .x = cursor_x - content_left(target),
+            .y = cursor_y - content_top(target),
             .buttons = input->buttons,
             .wheel = input->wheel,
             .mods = input->mods,
@@ -9028,9 +9115,8 @@ static void route_input(const syscall_input_event_t* input,
         if (under) {
             syscall_window_event_t event = {
                 .type = SYSCALL_WINDOW_EVENT_MOUSE,
-                .x = cursor_x - (int32_t)under->x - 1,
-                .y = cursor_y - (int32_t)under->y -
-                     (int32_t)TITLE_HEIGHT - 1,
+                .x = cursor_x - content_left(under),
+                .y = cursor_y - content_top(under),
                 .buttons = input->buttons,
                 .mods = input->mods,
                 .time_ms = input->time_ms
@@ -9078,9 +9164,8 @@ static void route_input(const syscall_input_event_t* input,
             focus_window(under);
             syscall_window_event_t event = {
                 .type = SYSCALL_WINDOW_EVENT_MOUSE,
-                .x = cursor_x - (int32_t)under->x - 1,
-                .y = cursor_y - (int32_t)under->y -
-                     (int32_t)TITLE_HEIGHT - 1,
+                .x = cursor_x - content_left(under),
+                .y = cursor_y - content_top(under),
                 .buttons = input->buttons,
                 .mods = input->mods,
                 .time_ms = input->time_ms
@@ -9136,9 +9221,8 @@ static void route_input(const syscall_input_event_t* input,
         if (under) {
             syscall_window_event_t event = {
                 .type = SYSCALL_WINDOW_EVENT_MOUSE_WHEEL,
-                .x = cursor_x - (int32_t)under->x - 1,
-                .y = cursor_y - (int32_t)under->y -
-                     (int32_t)TITLE_HEIGHT - 1,
+                .x = cursor_x - content_left(under),
+                .y = cursor_y - content_top(under),
                 .wheel = input->wheel,
                 .buttons = input->buttons,
                 .mods = input->mods,
@@ -9258,7 +9342,7 @@ int main(void) {
     load_fonts();
     syscall_window_info_t windows[MAX_WINDOWS];
     syscall_input_event_t input[32];
-    uint64_t frame_due_ms = mos_syscall1(SYS_UPTIME, 0);
+    uint64_t frame_due_thirds = mos_syscall1(SYS_UPTIME, 0) * 3u;
 
     for (;;) {
         bool refresh_icons = ++icon_poll_frames >= 30u;
@@ -9315,9 +9399,11 @@ int main(void) {
         /* Sleep to the next frame boundary rather than a fixed 16 ms, so
          * the time a frame took to draw comes out of its own wait. */
         uint64_t now_ms = mos_syscall1(SYS_UPTIME, 0);
-        frame_due_ms += FRAME_INTERVAL_MS;
+        frame_due_thirds += FRAME_INTERVAL_THIRDS;
+        uint64_t frame_due_ms = frame_due_thirds / 3u;
         if (frame_due_ms <= now_ms) {
-            frame_due_ms = now_ms;
+            /* Late: start counting again from now. */
+            frame_due_thirds = now_ms * 3u;
             mos_sleep(1);
         } else {
             mos_sleep(frame_due_ms - now_ms);
