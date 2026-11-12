@@ -50,4 +50,17 @@ int mx_url_local_path(const char* url, char* out, size_t capacity);
 /* Milliseconds since boot (host builds use a monotonic clock). */
 long mx_now_ms(void);
 
+/* A lock for state the fetch threads share with the main thread (cache.c,
+ * the fetch pool in main.c). Host builds are single-threaded. */
+#ifdef MX_HOST
+typedef struct { int unused; } mx_lock_t;
+static inline void mx_lock(mx_lock_t* l) { (void)l; }
+static inline void mx_unlock(mx_lock_t* l) { (void)l; }
+#else
+#include "thread.h"
+typedef mos_mutex_t mx_lock_t;
+static inline void mx_lock(mx_lock_t* l) { mos_mutex_lock(l); }
+static inline void mx_unlock(mx_lock_t* l) { mos_mutex_unlock(l); }
+#endif
+
 #endif
