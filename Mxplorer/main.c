@@ -2,6 +2,7 @@
 #include "mxplorer/cache.h"
 #include "mxplorer/devlog.h"
 #include "mxplorer/devtools.h"
+#include "mxplorer/fetch.h"
 #include "mxplorer/html.h"
 #include "mxplorer/http.h"
 #include "mxplorer/js.h"
@@ -446,32 +447,39 @@ static int fetch_resource(void* user, const char* url, const char* kind, char** 
         resources_loaded++;
         return 1;
     }
-    /* pictures and videos may be larger than pages: they get their own buffer */
+    /* Downloads run on the fetch threads (fetch.c); the page may already
+     * have asked for this one (prefetch_subresources). Pictures and videos
+     * get the larger media limit. */
     int media = !strcmp(kind, "image") || !strcmp(kind, "video");
-    size_t capacity = media ? MX_HTTP_MEDIA_MAX : MX_HTTP_BODY_MAX;
-    char* buffer = media ? (char*)malloc(capacity) : resource_buffer;
-    if (!buffer) {
-        mx_copy(entry->error, sizeof(entry->error), "Not enough memory for this file.");
+    int id = mx_fetch_find(url);
+    if (!id) id = mx_fetch_request(url, media, allow_insecure_tls);
+    static mx_fetch_result_t fetched;      /* ~2.7 KiB: off the 64 KiB stack */
+    memset(&fetched, 0, sizeof(fetched));
+    long deadline = loading ? load_started + PAGE_BUDGET_MS : mx_now_ms() + PAGE_BUDGET_MS;
+    if (!id || !mx_fetch_wait(id, &fetched, deadline, present_chrome_now)) {
+        mx_copy(entry->error, sizeof(entry->error),
+                id ? "Skipped: the page took too long to load." : "Too many downloads at once.");
+        if (id) resources_skipped++;
         return 0;
     }
-    size_t received = 0;
-    char error[128];
-    static mx_http_info_t info;
-    int how = MX_CACHE_NETWORK;
-    int ok = mx_cache_get(url, buffer, capacity, &received, allow_insecure_tls,
-                          error, sizeof(error), &info, &how);
+    entry->started_ms = fetched.queued_ms;
+    size_t received = fetched.length;
+    const char* error = fetched.error;
+    const mx_http_info_t* info_p = &fetched.info;
+    int how = fetched.how;
+    int ok = fetched.ok;
     entry->from_cache = how != MX_CACHE_NETWORK;
     if (how == MX_CACHE_OFFLINE) {
         char note[200] = "Offline: showing the saved copy of ";
         mx_append(note, sizeof(note), url);
         mx_console_add(MX_LOG_WARN, "Cache", 0, note);
     }
-    entry->status = info.status;
+    entry->status = info_p->status;
     entry->duration_ms = mx_now_ms() - entry->started_ms;
-    entry->redirects = info.redirects;
+    entry->redirects = info_p->redirects;
     entry->size = received;
-    mx_copy(entry->content_type, sizeof(entry->content_type), info.content_type);
-    if (!ok || info.status >= 400) {
+    mx_copy(entry->content_type, sizeof(entry->content_type), info_p->content_type);
+    if (!ok || info_p->status >= 400) {
         mx_copy(entry->error, sizeof(entry->error), ok ? "HTTP error status" : error);
         if (!ok) entry->status = 0;
         char message[200];
@@ -480,25 +488,104 @@ static int fetch_resource(void* user, const char* url, const char* kind, char** 
         mx_append(message, sizeof(message), ": ");
         mx_append(message, sizeof(message), url);
         mx_console_add(MX_LOG_WARN, "Network", 0, message);
-        if (media) free(buffer);
+        free(fetched.body);
         return 0;
     }
-    if (media) {
-        /* hand over the buffer itself, trimmed to the file */
-        char* fitted = (char*)realloc(buffer, received + 1);
-        *body = fitted ? fitted : buffer;
-        *length = received;
-        resources_loaded++;
-        return 1;
-    }
-    char* copy = (char*)malloc(received + 1);
-    if (!copy) return 0;
-    memcpy(copy, resource_buffer, received);
-    copy[received] = '\0';
-    *body = copy;
+    *body = fetched.body;          /* already NUL-terminated and fitted */
     *length = received;
     resources_loaded++;
     return 1;
+}
+
+/* ---------------------------------------------------- prefetching */
+
+static int ascii_equal_n(const char* a, size_t n, const char* b) {
+    for (size_t i = 0; i < n; i++, b++)
+        if (!*b || ((a[i] | 0x20) != (*b | 0x20))) return 0;
+    return !*b;
+}
+
+static int is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+/* Starts downloading what the page will ask for (stylesheets and scripts
+ * first, then pictures) before the engine reaches them, so they download
+ * side by side on the fetch threads instead of one after another. A
+ * guess from the markup: what it misses is fetched when asked for. */
+static void prefetch_subresources(const char* html, size_t length, const char* base) {
+    char ignored[8];
+    if (!subresources_enabled || mx_url_local_path(base, ignored, sizeof(ignored))) return;
+    for (int pass = 0; pass < 2; pass++) {
+        int pictures = 0;
+        for (size_t i = 0; i + 5 < length; i++) {
+            if (html[i] != '<') continue;
+            const char* t = html + i + 1;
+            int is_link = ascii_equal_n(t, 4, "link") && is_space(t[4]);
+            int is_script = ascii_equal_n(t, 6, "script") && is_space(t[6]);
+            int is_img = ascii_equal_n(t, 3, "img") && is_space(t[3]);
+            if (pass == 0 ? !(is_link || (is_script && javascript_enabled)) : !is_img) continue;
+            const char* href = NULL; size_t href_len = 0;
+            const char* rel = NULL; size_t rel_len = 0;
+            const char* type = NULL; size_t type_len = 0;
+            int nomodule = 0;
+            size_t p = i + 1;
+            while (p < length && !is_space(html[p]) && html[p] != '>') p++;
+            /* attributes, to the end of the tag */
+            while (p < length && html[p] != '>') {
+                while (p < length && (is_space(html[p]) || html[p] == '/')) p++;
+                size_t name = p;
+                while (p < length && html[p] != '=' && !is_space(html[p]) && html[p] != '>') p++;
+                size_t name_len = p - name;
+                const char* value = NULL; size_t value_len = 0;
+                if (p < length && html[p] == '=') {
+                    p++;
+                    char q = 0;
+                    if (p < length && (html[p] == '"' || html[p] == '\'')) q = html[p++];
+                    value = html + p;
+                    while (p < length && (q ? html[p] != q : (!is_space(html[p]) && html[p] != '>'))) p++;
+                    value_len = (size_t)(html + p - value);
+                    if (q && p < length) p++;
+                }
+                if (!name_len) {
+                    if (p < length && html[p] != '>') p++;
+                    continue;
+                }
+                const char* n = html + name;
+                if (is_link ? ascii_equal_n(n, name_len, "href") : ascii_equal_n(n, name_len, "src")) {
+                    href = value; href_len = value_len;
+                } else if (ascii_equal_n(n, name_len, "rel")) {
+                    rel = value; rel_len = value_len;
+                } else if (ascii_equal_n(n, name_len, "type")) {
+                    type = value; type_len = value_len;
+                } else if (ascii_equal_n(n, name_len, "nomodule")) {
+                    nomodule = 1;
+                }
+            }
+            i = p;
+            if (!href || !href_len || href_len >= 1024 || !strncmp(href, "data:", 5)) continue;
+            if (is_link) {
+                char r[64];
+                size_t n = rel && rel_len < sizeof(r) - 1 ? rel_len : 0;
+                for (size_t k = 0; k < n; k++) r[k] = (char)(rel[k] | 0x20);
+                r[n] = '\0';
+                if (!strstr(r, "stylesheet") || strstr(r, "alternate")) continue;
+            }
+            if (is_script && (nomodule ||
+                              (type && type_len && !ascii_equal_n(type, type_len, "module") &&
+                               !ascii_equal_n(type, type_len, "text/javascript") &&
+                               !ascii_equal_n(type, type_len, "application/javascript"))))
+                continue;
+            if (is_img && ++pictures > 24) continue;
+            char reference[1024];
+            memcpy(reference, href, href_len);
+            reference[href_len] = '\0';
+            char* amp;              /* the one entity common in addresses */
+            while ((amp = strstr(reference, "&amp;")) != NULL) memmove(amp + 1, amp + 5, strlen(amp + 5) + 1);
+            static char url[URL_LENGTH];
+            if (!mx_url_resolve(base, reference, url, sizeof(url))) continue;
+            if (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)) continue;
+            mx_fetch_request(url, is_img, allow_insecure_tls);
+        }
+    }
 }
 
 static void page_navigate_request(const char* url, void* user) {
@@ -576,8 +663,59 @@ static char* media_document(const char* url, int kind, size_t* length) {
     return page;
 }
 
+/* The document being downloaded on a fetch thread (0: none). The main loop
+ * polls it and calls finish_document(); the window keeps working meanwhile. */
+static int doc_job;
+static void render_current_tab(void);
+
+static void finish_document(mx_fetch_result_t* r) {
+    browser_tab_t* tab = &tabs[active_tab];
+    mx_network_entry_t* entry = mx_network_add(tab->url, "document");
+    entry->started_ms = r->queued_ms;
+    entry->from_cache = r->how != MX_CACHE_NETWORK;
+    if (r->how == MX_CACHE_OFFLINE)
+        mx_console_add(MX_LOG_WARN, "Cache", 0,
+                       "The network is unavailable: showing the saved copy of this page.");
+    else if (r->how == MX_CACHE_REVALIDATED)
+        mx_console_add(MX_LOG_SYSTEM, "Cache", 0, "Page unchanged on the server: using the saved copy.");
+    entry->status = r->ok ? r->info.status : 0;
+    entry->duration_ms = mx_now_ms() - entry->started_ms;
+    entry->size = r->length;
+    entry->redirects = r->info.redirects;
+    mx_copy(entry->content_type, sizeof(entry->content_type), r->info.content_type);
+    if (!r->ok) {
+        mx_copy(entry->error, sizeof(entry->error), r->error);
+        classify_error(tab, r->error);
+        mx_console_add(MX_LOG_ERROR, "Network", 0, r->error);
+        set_status(r->error);
+        loading = 0;
+        page_dirty = chrome_dirty = 1;
+        return;
+    }
+    if (r->info.final_url[0] && !text_equal(r->info.final_url, tab->url)) {
+        /* redirects update the address */
+        mx_copy(tab->url, sizeof(tab->url), r->info.final_url);
+        mx_copy(tab->history[tab->history_index], URL_LENGTH, r->info.final_url);
+        if (!address_focused) reset_address();
+    }
+    free(tab->page_source);
+    tab->page_source = r->body;              /* the fetch result, NUL-terminated */
+    tab->page_source_length = r->length;
+    r->body = NULL;
+    mx_copy(tab->source_url, sizeof(tab->source_url), tab->url);
+    tab->scroll_y = 0;
+    if (r->info.status >= 400) {
+        char text[96] = "Server answered with status ";
+        mx_append_int(text, sizeof(text), r->info.status);
+        mx_console_add(MX_LOG_WARN, "Network", 0, text);
+    }
+    render_current_tab();
+}
+
 static void load_page(int force_reload) {
     browser_tab_t* tab = &tabs[active_tab];
+    mx_fetch_cancel_all();      /* the previous page's downloads */
+    doc_job = 0;
     page_loaded = 0;
     tab->error = MX_PAGE_ERROR_NONE;
     tab->error_detail[0] = '\0';
@@ -659,65 +797,31 @@ static void load_page(int force_reload) {
         mx_copy(tab->source_url, sizeof(tab->source_url), tab->url);
         tab->scroll_y = 0;
     } else if (!from_cache) {
-        mx_network_entry_t* entry = mx_network_add(tab->url, "document");
-        char error[160];
-        size_t body_length = 0;
-        static mx_http_info_t info;
-        int how = MX_CACHE_NETWORK;
-        int ok = mx_cache_get(tab->url, page_buffer, MX_HTTP_BODY_MAX, &body_length,
-                              allow_insecure_tls, error, sizeof(error), &info, &how);
-        entry->from_cache = how != MX_CACHE_NETWORK;
-        if (how == MX_CACHE_OFFLINE)
-            mx_console_add(MX_LOG_WARN, "Cache", 0,
-                           "The network is unavailable: showing the saved copy of this page.");
-        else if (how == MX_CACHE_REVALIDATED)
-            mx_console_add(MX_LOG_SYSTEM, "Cache", 0, "Page unchanged on the server: using the saved copy.");
-        entry->status = ok ? info.status : 0;
-        entry->duration_ms = mx_now_ms() - entry->started_ms;
-        entry->size = body_length;
-        entry->redirects = info.redirects;
-        mx_copy(entry->content_type, sizeof(entry->content_type), info.content_type);
-        if (!ok) {
-            mx_copy(entry->error, sizeof(entry->error), error);
-            classify_error(tab, error);
-            mx_console_add(MX_LOG_ERROR, "Network", 0, error);
-            set_status(error);
+        /* downloaded on a fetch thread; the main loop finishes it */
+        doc_job = mx_fetch_request(tab->url, 0, allow_insecure_tls);
+        if (!doc_job) {
+            classify_error(tab, "Too many downloads at once.");
+            set_status("Too many downloads at once.");
             loading = 0;
-            return;
         }
-        if (info.final_url[0] && !text_equal(info.final_url, tab->url)) {
-            /* redirects update the address */
-            mx_copy(tab->url, sizeof(tab->url), info.final_url);
-            mx_copy(tab->history[tab->history_index], URL_LENGTH, info.final_url);
-            if (!address_focused) reset_address();
-        }
-        char* saved = (char*)malloc(body_length + 1);
-        if (!saved) {
-            classify_error(tab, "Not enough memory to keep this page.");
-            loading = 0;
-            return;
-        }
-        memcpy(saved, page_buffer, body_length);
-        saved[body_length] = '\0';
-        free(tab->page_source);
-        tab->page_source = saved;
-        tab->page_source_length = body_length;
-        mx_copy(tab->source_url, sizeof(tab->source_url), tab->url);
-        tab->scroll_y = 0;
-        if (info.status >= 400) {
-            char text[96] = "Server answered with status ";
-            mx_append_int(text, sizeof(text), info.status);
-            mx_console_add(MX_LOG_WARN, "Network", 0, text);
-        }
+        return;
     } else {
         mx_network_entry_t* entry = mx_network_add(tab->url, "document");
         entry->status = 200;
         entry->from_cache = 1;
         entry->size = tab->page_source_length;
     }
+    render_current_tab();
+}
+
+/* Renders the active tab's saved source (the end of every page load). */
+static void render_current_tab(void) {
+    browser_tab_t* tab = &tabs[active_tab];
     loading = 60;
     set_status("Rendering...");
     present_chrome_now();
+    /* its files start downloading side by side before the engine asks */
+    prefetch_subresources(tab->page_source, tab->page_source_length, tab->url);
     page_loaded = render_source(tab->page_source, tab->page_source_length, tab->url,
                                 javascript_enabled, theme_dark && dark_pages);
     loading = 0;
@@ -906,7 +1010,8 @@ static void close_tab(int index) {
 
 static void reorder_tab(int from, int to) {
     if (from < 0 || to < 0 || from >= tab_count || to >= tab_count || from == to) return;
-    browser_tab_t moved = tabs[from];
+    static browser_tab_t moved;     /* ~37 KiB: too big for the 64 KiB stack */
+    moved = tabs[from];
     if (from < to) for (int i = from; i < to; i++) tabs[i] = tabs[i + 1];
     else for (int i = from; i > to; i--) tabs[i] = tabs[i - 1];
     tabs[to] = moved;
@@ -1577,6 +1682,7 @@ int main(int argc, char** argv) {
     }
     read_os_accent();
     mx_cache_init();
+    mx_fetch_start();           /* downloads run on these threads */
     load_settings();
     load_homepage_setting();
     load_homepage_asset();
@@ -1642,6 +1748,27 @@ int main(int argc, char** argv) {
             memset(&event, 0, sizeof(event));
         }
         if (!running) { mx_cache_flush(); break; }
+
+        if (doc_job) {
+            static mx_fetch_result_t doc_result;
+            int s = mx_fetch_poll(doc_job, &doc_result);
+            if (s != 0) {
+                doc_job = 0;
+                if (s > 0) {
+                    finish_document(&doc_result);
+                    free(doc_result.body);          /* NULL once the tab took it */
+                }
+            } else if (loading && loading < 55) {
+                /* still downloading: let the bar creep */
+                static long last_step;
+                long t = mx_now_ms();
+                if (t - last_step > 250) {
+                    last_step = t;
+                    loading++;
+                    chrome_dirty = 1;
+                }
+            }
+        }
 
         syscall_window_info_t now_info;
         if (mos_window_get_info(window_id, &now_info) != SYS_SUCCESS) break;

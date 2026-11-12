@@ -42,6 +42,9 @@ static uint64_t tick;
 static uint64_t used_bytes;
 static uint32_t limit_mb = MX_CACHE_DEFAULT_MB;
 static int loaded, dirty;
+/* The fetch threads (main.c) all go through mx_cache_get(); every public
+ * function holds this, except while a download runs. */
+static mx_lock_t cache_lock;
 
 /* ---------------------------------------------------------------- files */
 
@@ -196,7 +199,7 @@ static void load_index(void) {
     free(d);
 }
 
-void mx_cache_flush(void) {
+static void flush_locked(void) {
     if (!dirty || !fs_ready()) return;
     size_t n = 16u + entry_count * sizeof(entry_t);
     char* d = (char*)malloc(n);
@@ -236,26 +239,58 @@ static void make_room(uint64_t need) {
     }
 }
 
-void mx_cache_init(void) { load_index(); }
-
-void mx_cache_set_limit_mb(uint32_t mb) {
-    limit_mb = mb;
-    load_index();
-    if (!limit_mb) mx_cache_clear();
-    else make_room(0);
-    mx_cache_flush();
+void mx_cache_flush(void) {
+    mx_lock(&cache_lock);
+    flush_locked();
+    mx_unlock(&cache_lock);
 }
 
-uint32_t mx_cache_limit_mb(void) { return limit_mb; }
-uint64_t mx_cache_used_bytes(void) { load_index(); return used_bytes; }
-uint32_t mx_cache_count(void) { load_index(); return entry_count; }
-
-void mx_cache_clear(void) {
+static void clear_locked(void) {
     load_index();
     while (entry_count) drop(&entries[entry_count - 1]);
     used_bytes = 0;
     dirty = 1;
-    mx_cache_flush();
+    flush_locked();
+}
+
+void mx_cache_init(void) {
+    mx_lock(&cache_lock);
+    load_index();
+    mx_unlock(&cache_lock);
+}
+
+void mx_cache_set_limit_mb(uint32_t mb) {
+    mx_lock(&cache_lock);
+    limit_mb = mb;
+    load_index();
+    if (!limit_mb) clear_locked();
+    else make_room(0);
+    flush_locked();
+    mx_unlock(&cache_lock);
+}
+
+uint32_t mx_cache_limit_mb(void) { return limit_mb; }
+
+uint64_t mx_cache_used_bytes(void) {
+    mx_lock(&cache_lock);
+    load_index();
+    uint64_t n = used_bytes;
+    mx_unlock(&cache_lock);
+    return n;
+}
+
+uint32_t mx_cache_count(void) {
+    mx_lock(&cache_lock);
+    load_index();
+    uint32_t n = entry_count;
+    mx_unlock(&cache_lock);
+    return n;
+}
+
+void mx_cache_clear(void) {
+    mx_lock(&cache_lock);
+    clear_locked();
+    mx_unlock(&cache_lock);
 }
 
 /* ------------------------------------------------------------- policy */
@@ -356,49 +391,72 @@ int mx_cache_get(const char* url, char* body, size_t body_capacity, size_t* body
     if (!limit_mb || !cacheable_url(url))
         return mx_http_get(url, body, body_capacity, body_length, allow_insecure_tls, error,
                            error_capacity, info);
-    load_index();
-    entry_t* e = find(key_of(url));
+    uint64_t key = key_of(url);
     int64_t now = unix_now();
+    char etag[sizeof(entries[0].etag)];
+    char last_modified[sizeof(entries[0].last_modified)];
+    etag[0] = last_modified[0] = '\0';
+
+    mx_lock(&cache_lock);
+    load_index();
+    entry_t* e = find(key);
     if (e && e->expires && now && now < e->expires &&
         read_body(e, body, body_capacity, body_length)) {
         fill_info(e, url, info);
         *how = MX_CACHE_FRESH;
+        mx_unlock(&cache_lock);
         return 1;
     }
-    e = find(key_of(url));                      /* read_body may have dropped it */
-    if (e) mx_http_set_validators(e->etag, e->last_modified);
-    int ok = mx_http_get(url, body, body_capacity, body_length, allow_insecure_tls, error,
-                         error_capacity, info);
-    e = find(key_of(url));
-    if (ok && info->status == 304 && e) {
-        mx_http_info_t fresh = *info;
-        if (read_body(e, body, body_capacity, body_length)) {
-            set_freshness(e, &fresh, now);
-            fill_info(e, url, info);
-            info->elapsed_ms = fresh.elapsed_ms;
-            *how = MX_CACHE_REVALIDATED;
-            return 1;
+    e = find(key);                              /* read_body may have dropped it */
+    if (e) {
+        mx_copy(etag, sizeof(etag), e->etag);
+        mx_copy(last_modified, sizeof(last_modified), e->last_modified);
+    }
+    mx_unlock(&cache_lock);
+
+    /* The download runs unlocked: other threads use the cache meanwhile,
+     * so entries are looked up again afterwards. */
+    int ok = mx_http_get_ex(url, body, body_capacity, body_length, allow_insecure_tls, error,
+                            error_capacity, info, etag, last_modified);
+
+    mx_lock(&cache_lock);
+    e = find(key);
+    if (ok && info->status == 304) {
+        if (e) {
+            mx_http_info_t fresh = *info;
+            if (read_body(e, body, body_capacity, body_length)) {
+                set_freshness(e, &fresh, now);
+                fill_info(e, url, info);
+                info->elapsed_ms = fresh.elapsed_ms;
+                *how = MX_CACHE_REVALIDATED;
+                mx_unlock(&cache_lock);
+                return 1;
+            }
         }
         /* the copy is gone: ask again without validators */
+        mx_unlock(&cache_lock);
         ok = mx_http_get(url, body, body_capacity, body_length, allow_insecure_tls, error,
                          error_capacity, info);
+        mx_lock(&cache_lock);
+        e = find(key);
     }
     if (!ok) {
-        if (e && read_body(e, body, body_capacity, body_length)) {
+        int offline = e && read_body(e, body, body_capacity, body_length);
+        if (offline) {
             fill_info(e, url, info);
             *how = MX_CACHE_OFFLINE;
-            return 1;
         }
-        return 0;
+        mx_unlock(&cache_lock);
+        return offline;
     }
     /* a redirect is stored under the address it ended at, too */
     store(url, body, *body_length, info);
     if (info->final_url[0] && strcmp(info->final_url, url)) store(info->final_url, body, *body_length, info);
+    mx_unlock(&cache_lock);
     return 1;
 }
 
-void mx_cache_replace(const char* url, const void* data, size_t length) {
-    if (!limit_mb || !cacheable_url(url)) return;
+static void replace_locked(const char* url, const void* data, size_t length) {
     load_index();
     entry_t* e = find(key_of(url));
     if (!e) return;
@@ -414,4 +472,11 @@ void mx_cache_replace(const char* url, const void* data, size_t length) {
     used_bytes += length;
     mx_copy(e->content_type, sizeof(e->content_type), "image/x-mos-img");
     dirty = 1;
+}
+
+void mx_cache_replace(const char* url, const void* data, size_t length) {
+    if (!limit_mb || !cacheable_url(url)) return;
+    mx_lock(&cache_lock);
+    replace_locked(url, data, length);
+    mx_unlock(&cache_lock);
 }

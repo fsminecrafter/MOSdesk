@@ -13,25 +13,29 @@
 #define HTTP_URL_MAX 2048u
 #define HTTP_REDIRECT_RESULT 2
 
-/* Raw response: headers and body. Grows for large downloads (media) and
- * shrinks back to the page size afterwards. */
-static char* response;
-static size_t response_cap;
+/* Everything one request needs, allocated per mx_http_get() call: requests
+ * run on several threads at once (main.c's fetch workers), and these
+ * buffers are too big for a stack anyway. */
+typedef struct {
+    char* response;             /* raw response: headers and body */
+    size_t response_cap;
+    char host[128];
+    char path[2048];
+    char request[3072];         /* path, validators, headers */
+    char current_url[HTTP_URL_MAX];
+    char location[HTTP_URL_MAX];
+    char resolved[HTTP_URL_MAX];
+    char etag[128];             /* validators for the first request only */
+    char last_modified[64];
+} http_ctx;
 
-static int response_reserve(size_t body_capacity) {
+static int response_reserve(http_ctx* c, size_t body_capacity) {
     size_t need = body_capacity + HTTP_HEADER_MAX;
-    if (response_cap >= need) return 1;
-    free(response);
-    response = (char*)malloc(need);
-    response_cap = response ? need : 0;
-    return response != NULL;
-}
-
-static void response_trim(void) {
-    if (response_cap <= HTTP_RESPONSE_MAX) return;
-    free(response);
-    response = NULL;
-    response_cap = 0;
+    if (c->response_cap >= need) return 1;
+    free(c->response);
+    c->response = (char*)malloc(need);
+    c->response_cap = c->response ? need : 0;
+    return c->response != NULL;
 }
 
 static const char* too_large(size_t body_capacity) {
@@ -163,23 +167,71 @@ static int parse_url(const char* url, char* host, size_t host_capacity,
     return 1;
 }
 
+/* The kernel's network stack serves one call at a time: a call waits up
+ * to 250 ms for the one in progress and then answers SYS_ERR_BUSY. Several
+ * downloads run at once here (main.c's fetch threads), so "busy" means
+ * "try again later", never failure. (A TLS receive cannot use a short
+ * timeout to give the stack back sooner: the kernel reports a timeout as
+ * the connection closing and drops a half-read record.) */
+#define HTTP_BUSY_RETRY_MS 10
+
+static int net_busy(long result) { return result == (long)SYS_ERR_BUSY; }
+
 static long transport_send(int use_tls, long connection, const void* data,
                            uint32_t length) {
-    return use_tls ? mos_tls13_send(connection, data, length)
-                   : mos_tcp_send(connection, data, length);
+    long n;
+    long start = mos_uptime();
+    do {
+        n = use_tls ? mos_tls13_send(connection, data, length)
+                    : mos_tcp_send(connection, data, length);
+        if (!net_busy(n)) break;
+        mos_sleep(HTTP_BUSY_RETRY_MS);
+    } while (mos_uptime() - start < HTTP_IDLE_TIMEOUT_MS);
+    return n;
 }
 
+/* Bytes read, 0 when nothing came yet (or the stack was busy), or an error. */
 static long transport_recv(int use_tls, long connection, void* data,
                            uint32_t length, uint32_t timeout_ms) {
-    return use_tls ? mos_tls13_recv(connection, data, length, timeout_ms)
-                   : mos_tcp_recv(connection, data, length);
+    long n = use_tls ? mos_tls13_recv(connection, data, length, timeout_ms)
+                     : mos_tcp_recv(connection, data, length);
+    return net_busy(n) ? 0 : n;
 }
 
 static void transport_close(int use_tls, long connection) {
-    if (use_tls)
-        mos_tls13_close(connection);
-    else
-        mos_tcp_close(connection);
+    for (int tries = 0; tries < 100; tries++) {
+        long r = use_tls ? mos_tls13_close(connection) : mos_tcp_close(connection);
+        if (!net_busy(r)) return;
+        mos_sleep(HTTP_BUSY_RETRY_MS);
+    }
+}
+
+/* DNS and connecting, retried while the stack is busy, until `start` +
+ * `timeout_ms` (mos_uptime() time). */
+static uint32_t lookup_host(const char* host, long start, uint32_t timeout_ms) {
+    uint32_t ip = mos_ip_parse(host);
+    if (ip) return ip;
+    for (;;) {
+        long left = (long)timeout_ms - (mos_uptime() - start);
+        if (left <= 0) return 0;
+        long rc = mos_net_resolve(host, &ip, left > 5000 ? 5000u : (uint32_t)left);
+        if (rc == (long)SYS_SUCCESS) return ip;
+        if (!net_busy(rc)) return 0;
+        mos_sleep(HTTP_BUSY_RETRY_MS);
+    }
+}
+
+static long connect_host(int use_tls, uint32_t ip, uint16_t port, const char* host,
+                         long start, uint32_t timeout_ms) {
+    for (;;) {
+        long left = (long)timeout_ms - (mos_uptime() - start);
+        if (left <= 0) return 0;
+        uint32_t cap = use_tls ? 15000u : 5000u;
+        uint32_t t = left > (long)cap ? cap : (uint32_t)left;
+        long c = use_tls ? mos_tls13_connect(ip, port, host, t) : mos_tcp_connect(ip, port, t);
+        if (!net_busy(c)) return c;
+        mos_sleep(HTTP_BUSY_RETRY_MS);
+    }
 }
 
 static int transport_send_all(int use_tls, long connection, const char* data,
@@ -423,7 +475,7 @@ static int decode_chunked(const char* source, size_t length,
             *out_length = written;
             return 1;
         }
-        if (chunk_length > capacity - written ||
+        if (chunk_length >= capacity - written ||   /* room for the NUL */
             chunk_length + 2 > length - pos)
             return 0;
         memcpy(body + written, source + pos, chunk_length);
@@ -465,23 +517,14 @@ static void header_value(const char* headers, size_t length, const char* name,
     }
 }
 
-static char pending_etag[128];
-static char pending_last_modified[64];
-
-void mx_http_set_validators(const char* etag, const char* last_modified) {
-    strlcpy_safe(pending_etag, etag ? etag : "", sizeof(pending_etag));
-    strlcpy_safe(pending_last_modified, last_modified ? last_modified : "",
-                 sizeof(pending_last_modified));
-}
-
-static int http_get_once(const char* url, char* body, size_t body_capacity,
+static int http_get_once(http_ctx* c, const char* url, char* body, size_t body_capacity,
                          size_t* body_length, int allow_insecure_tls,
                          uint32_t timeout_ms, char* redirect,
                          size_t redirect_capacity, char* error,
                          size_t error_capacity, mx_http_info_t* info) {
-    char host[128];
-    char path[2048];
-    char request[3072];   /* path, validators, headers */
+    char* host = c->host;
+    char* path = c->path;
+    char* request = c->request;
     uint16_t port;
     int use_tls = 0;
     size_t response_length = 0;
@@ -490,10 +533,10 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
         set_error(error, error_capacity, "Invalid HTTP request buffer.");
         return 0;
     }
-    if (!parse_url(url, host, sizeof(host), path, sizeof(path), &port, &use_tls,
+    if (!parse_url(url, host, sizeof(c->host), path, sizeof(c->path), &port, &use_tls,
                    error, error_capacity))
         return 0;
-    if (!response_reserve(body_capacity)) {
+    if (!response_reserve(c, body_capacity)) {
         set_error(error, error_capacity, "Not enough memory for this download.");
         return 0;
     }
@@ -509,19 +552,13 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     }
 
     long request_start = mos_uptime();
-    uint32_t remaining = request_time_left(request_start, timeout_ms);
-    uint32_t ip = remaining ? mos_net_lookup(host,
-        capped_timeout(remaining, 5000u)) : 0;
+    uint32_t remaining;
+    uint32_t ip = lookup_host(host, request_start, timeout_ms);
     if (!ip) {
         set_error(error, error_capacity, "DNS lookup failed for this host.");
         return 0;
     }
-    remaining = request_time_left(request_start, timeout_ms);
-    uint32_t connect_timeout = capped_timeout(remaining,
-                                               use_tls ? 15000u : 5000u);
-    long connection = !connect_timeout ? 0 :
-        use_tls ? mos_tls13_connect(ip, port, host, connect_timeout)
-                : mos_tcp_connect(ip, port, connect_timeout);
+    long connection = connect_host(use_tls, ip, port, host, request_start, timeout_ms);
     if (connection <= 0) {
         set_error(error, error_capacity,
                   use_tls ? "HTTPS TLS 1.3 handshake failed."
@@ -530,19 +567,19 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     }
     size_t request_length = 0;
     int request_ok =
-        append_text(request, sizeof(request), &request_length, "GET ") &&
-        append_text(request, sizeof(request), &request_length, path) &&
-        append_text(request, sizeof(request), &request_length, " HTTP/1.0\r\nHost: ") &&
-        append_text(request, sizeof(request), &request_length, host) &&
+        append_text(request, sizeof(c->request), &request_length, "GET ") &&
+        append_text(request, sizeof(c->request), &request_length, path) &&
+        append_text(request, sizeof(c->request), &request_length, " HTTP/1.0\r\nHost: ") &&
+        append_text(request, sizeof(c->request), &request_length, host) &&
         ((use_tls && port == 443) || (!use_tls && port == 80) ||
-         append_port(request, sizeof(request), &request_length, port)) &&
-        (!pending_etag[0] ||
-         (append_text(request, sizeof(request), &request_length, "\r\nIf-None-Match: ") &&
-          append_text(request, sizeof(request), &request_length, pending_etag))) &&
-        (!pending_last_modified[0] ||
-         (append_text(request, sizeof(request), &request_length, "\r\nIf-Modified-Since: ") &&
-          append_text(request, sizeof(request), &request_length, pending_last_modified))) &&
-        append_text(request, sizeof(request), &request_length,
+         append_port(request, sizeof(c->request), &request_length, port)) &&
+        (!c->etag[0] ||
+         (append_text(request, sizeof(c->request), &request_length, "\r\nIf-None-Match: ") &&
+          append_text(request, sizeof(c->request), &request_length, c->etag))) &&
+        (!c->last_modified[0] ||
+         (append_text(request, sizeof(c->request), &request_length, "\r\nIf-Modified-Since: ") &&
+          append_text(request, sizeof(c->request), &request_length, c->last_modified))) &&
+        append_text(request, sizeof(c->request), &request_length,
             "\r\nUser-Agent: Mozilla/5.0 (Minimal-OS; x86_64) Mxplorer/0.3\r\n"
             "Accept: text/html,application/xhtml+xml,text/css,*/*;q=0.8\r\n"
             "Accept-Language: en-US,en;q=0.8\r\n"
@@ -556,12 +593,12 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
 
     long last_data = mos_uptime();
     int receive_failed = 0;
-    while (response_length < response_cap) {
+    while (response_length < c->response_cap) {
         remaining = request_time_left(request_start, timeout_ms);
         if (!remaining) break;
         long count = transport_recv(use_tls, connection,
-            response + response_length,
-            (uint32_t)(response_cap - response_length),
+            c->response + response_length,
+            (uint32_t)(c->response_cap - response_length),
             capped_timeout(remaining, HTTP_IDLE_TIMEOUT_MS));
         if (count < 0) {
             if (count == (long)SYS_ERR_NOTFOUND) break;
@@ -579,19 +616,19 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
         response_length += (size_t)count;
         last_data = mos_uptime();
         if (response_length >= HTTP_HEADER_MAX &&
-            !find_header_end(response, response_length)) {
+            !find_header_end(c->response, response_length)) {
             receive_failed = 1;
             break;
         }
-        char* header_end = find_header_end(response, response_length);
+        char* header_end = find_header_end(c->response, response_length);
         if (header_end) {
-            if (is_redirect_status(parse_status(response, response_length)))
+            if (is_redirect_status(parse_status(c->response, response_length)))
                 break;
-            size_t header_length = (size_t)(header_end - response);
+            size_t header_length = (size_t)(header_end - c->response);
             size_t content_length = 0;
             int has_content_length = 0;
             int chunked = 0;
-            parse_headers(response, header_length, &content_length,
+            parse_headers(c->response, header_length, &content_length,
                           &has_content_length, &chunked);
             size_t received_body = response_length - header_length - 4;
             if (has_content_length && !chunked &&
@@ -601,33 +638,33 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     }
     transport_close(use_tls, connection);
     if (receive_failed) {
-        set_error(error, error_capacity, "HTTP response could not be read.");
+        set_error(error, error_capacity, "HTTP c->response could not be read.");
         return 0;
     }
 
-    char* header_end = find_header_end(response, response_length);
+    char* header_end = find_header_end(c->response, response_length);
     if (!header_end) {
-        set_error(error, error_capacity, "HTTP response headers are incomplete.");
+        set_error(error, error_capacity, "HTTP c->response headers are incomplete.");
         return 0;
     }
-    size_t header_length = (size_t)(header_end - response);
-    int status = parse_status(response, response_length);
+    size_t header_length = (size_t)(header_end - c->response);
+    int status = parse_status(c->response, response_length);
     if (info) {
         info->status = status;
         info->header_bytes = header_length + 4;
-        header_value(response, header_length, "content-type", info->content_type,
+        header_value(c->response, header_length, "content-type", info->content_type,
                      sizeof(info->content_type));
-        header_value(response, header_length, "etag", info->etag, sizeof(info->etag));
-        header_value(response, header_length, "last-modified", info->last_modified,
+        header_value(c->response, header_length, "etag", info->etag, sizeof(info->etag));
+        header_value(c->response, header_length, "last-modified", info->last_modified,
                      sizeof(info->last_modified));
-        header_value(response, header_length, "cache-control", info->cache_control,
+        header_value(c->response, header_length, "cache-control", info->cache_control,
                      sizeof(info->cache_control));
     }
     if (is_redirect_status(status)) {
-        if (!redirect || !parse_location(response, header_length, redirect,
+        if (!redirect || !parse_location(c->response, header_length, redirect,
                                          redirect_capacity)) {
             set_error(error, error_capacity,
-                      "Redirect response has no valid Location header.");
+                      "Redirect c->response has no valid Location header.");
             return 0;
         }
         if (error_capacity) error[0] = '\0';
@@ -641,7 +678,7 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     size_t declared_length = 0;
     int has_content_length = 0;
     int chunked = 0;
-    parse_headers(response, header_length, &declared_length,
+    parse_headers(c->response, header_length, &declared_length,
                   &has_content_length, &chunked);
     size_t available = response_length - header_length - 4;
     const char* response_body = header_end + 4;
@@ -651,7 +688,7 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
             return 0;
         }
         if (available < declared_length) {
-            set_error(error, error_capacity, "HTTP response ended before the page was complete.");
+            set_error(error, error_capacity, "HTTP c->response ended before the page was complete.");
             return 0;
         }
         available = declared_length;
@@ -659,7 +696,7 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     if (chunked) {
         if (!decode_chunked(response_body, available, body, body_capacity,
                             body_length)) {
-            set_error(error, error_capacity, "Invalid or oversized chunked HTTP response.");
+            set_error(error, error_capacity, "Invalid or oversized chunked HTTP c->response.");
             return 0;
         }
     } else {
@@ -675,56 +712,69 @@ static int http_get_once(const char* url, char* body, size_t body_capacity,
     return 1;
 }
 
-int mx_http_get(const char* url, char* body, size_t body_capacity,
-                size_t* body_length, int allow_insecure_tls,
-                char* error, size_t error_capacity, mx_http_info_t* info) {
-    char current_url[HTTP_URL_MAX];
+int mx_http_get_ex(const char* url, char* body, size_t body_capacity,
+                   size_t* body_length, int allow_insecure_tls,
+                   char* error, size_t error_capacity, mx_http_info_t* info,
+                   const char* etag, const char* last_modified) {
     long started = mos_uptime();
     if (info) memset(info, 0, sizeof(*info));
-    if (!url || strlen(url) >= sizeof(current_url)) {
-        pending_etag[0] = pending_last_modified[0] = '\0';
-        if (body_length) *body_length = 0;
+    if (body_length) *body_length = 0;
+    if (!url || strlen(url) >= HTTP_URL_MAX) {
         set_error(error, error_capacity, "HTTP address is too long.");
         return 0;
     }
-    strlcpy_safe(current_url, url, sizeof(current_url));
+    http_ctx* c = (http_ctx*)calloc(1, sizeof(http_ctx));
+    if (!c) {
+        set_error(error, error_capacity, "Not enough memory for this download.");
+        return 0;
+    }
+    strlcpy_safe(c->current_url, url, sizeof(c->current_url));
+    strlcpy_safe(c->etag, etag ? etag : "", sizeof(c->etag));
+    strlcpy_safe(c->last_modified, last_modified ? last_modified : "", sizeof(c->last_modified));
 
     unsigned redirects = 0;
+    int result;
     for (;;) {
-        char location[HTTP_URL_MAX];
         /* large downloads (media) get more time */
         uint32_t total = body_capacity > MX_HTTP_BODY_MAX ? HTTP_MEDIA_TIMEOUT_MS
                                                           : HTTP_TOTAL_TIMEOUT_MS;
-        int result = http_get_once(current_url, body, body_capacity,
-                                   body_length, allow_insecure_tls,
-                                   redirects ? HTTP_REDIRECT_TIMEOUT_MS : total,
-                                   location, sizeof(location), error,
-                                   error_capacity, info);
+        result = http_get_once(c, c->current_url, body, body_capacity,
+                               body_length, allow_insecure_tls,
+                               redirects ? HTTP_REDIRECT_TIMEOUT_MS : total,
+                               c->location, sizeof(c->location), error,
+                               error_capacity, info);
         if (result != HTTP_REDIRECT_RESULT) {
-            pending_etag[0] = pending_last_modified[0] = '\0';
-            response_trim();
             if (info) {
-                strlcpy_safe(info->final_url, current_url, sizeof(info->final_url));
+                strlcpy_safe(info->final_url, c->current_url, sizeof(info->final_url));
                 info->redirects = (int)redirects;
                 info->elapsed_ms = mos_uptime() - started;
             }
-            return result;
+            break;
         }
         /* a redirect goes elsewhere: the validators were for this address */
-        pending_etag[0] = pending_last_modified[0] = '\0';
+        c->etag[0] = c->last_modified[0] = '\0';
         if (redirects >= HTTP_MAX_REDIRECTS) {
             set_error(error, error_capacity, "Too many HTTP redirects (maximum 5).");
-            response_trim();
-            return 0;
+            result = 0;
+            break;
         }
-        char resolved[HTTP_URL_MAX];
-        if (!resolve_location(current_url, location, resolved,
-                              sizeof(resolved))) {
+        if (!resolve_location(c->current_url, c->location, c->resolved,
+                              sizeof(c->resolved))) {
             set_error(error, error_capacity, "HTTP redirect URL is invalid or too long.");
-            response_trim();
-            return 0;
+            result = 0;
+            break;
         }
-        strlcpy_safe(current_url, resolved, sizeof(current_url));
+        strlcpy_safe(c->current_url, c->resolved, sizeof(c->current_url));
         redirects++;
     }
+    free(c->response);
+    free(c);
+    return result;
+}
+
+int mx_http_get(const char* url, char* body, size_t body_capacity,
+                size_t* body_length, int allow_insecure_tls,
+                char* error, size_t error_capacity, mx_http_info_t* info) {
+    return mx_http_get_ex(url, body, body_capacity, body_length, allow_insecure_tls,
+                          error, error_capacity, info, NULL, NULL);
 }
