@@ -141,6 +141,19 @@ typedef struct {
     uint32_t drawn_version;
     /* No translucent pixels in the current frame: it can be copied in. */
     bool opaque;
+    /* Shared frames (SYS_WINDOW_MAP_FRAME): the window's two buffers mapped
+     * read-only; `view` is the one last presented and is composited from
+     * directly, with no private copy (then `pixels` is NULL). */
+    const uint32_t* view;
+    uint8_t* map_base;
+    size_t map_len;
+    uint32_t map_stride;
+    uint32_t map_generation;
+    /* Changed since the window was last drawn (window coordinates), from
+     * the kernel's damage rectangle; valid only while `damage_w` > 0. */
+    uint32_t damage_x, damage_y, damage_w, damage_h;
+    /* The window was shown in the last repaint, at the size it has now. */
+    bool drawn_shown;
     uint32_t icon_sum;
     uint32_t icon_pixels[SYSCALL_WINDOW_ICON_PIXELS];
     /* The window as last listed, kept so it can still be drawn (as a
@@ -153,6 +166,10 @@ typedef struct {
     uint64_t anim_start;
     uint32_t anim_duration;
 } cached_window_t;
+
+/* What to composite for a window: the shared front buffer, or the copy
+ * of its frame. */
+#define ENTRY_PIXELS(e) ((e)->view ? (e)->view : (e)->pixels)
 
 typedef struct {
     char path[DESKTOP_APP_PATH_SIZE];
@@ -3652,6 +3669,8 @@ static cached_window_t* cache_for(uint32_t id) {
     return NULL;
 }
 
+static void release_mapping(cached_window_t* entry);
+
 static void remove_missing_cache(const syscall_window_info_t* windows,
                                  uint64_t count) {
     for (uint32_t i = 0; i < MAX_WINDOWS; i++) {
@@ -3667,16 +3686,122 @@ static void remove_missing_cache(const syscall_window_info_t* windows,
         if (!found) {
             /* A closing animation takes over the pixels. */
             if (!start_close_animation(entry)) wm_free(entry->pixels);
+            release_mapping(entry);
             memset(entry, 0, sizeof(*entry));
         }
     }
 }
 
+/* Unmaps the shared frames of a window (the ghost of a closing window has
+ * its own copy by then). */
+static void release_mapping(cached_window_t* entry) {
+    if (entry->map_base) mos_vm_unmap(entry->map_base, entry->map_len);
+    entry->map_base = NULL;
+    entry->map_len = 0;
+    entry->view = NULL;
+}
+
+static void note_damage(cached_window_t* entry, uint32_t x, uint32_t y,
+                        uint32_t w, uint32_t h) {
+    if (!w || !h) return;
+    if (!entry->damage_w) {
+        entry->damage_x = x; entry->damage_y = y;
+        entry->damage_w = w; entry->damage_h = h;
+        return;
+    }
+    uint32_t x2 = entry->damage_x + entry->damage_w;
+    uint32_t y2 = entry->damage_y + entry->damage_h;
+    if (x < entry->damage_x) entry->damage_x = x;
+    if (y < entry->damage_y) entry->damage_y = y;
+    if (x + w > x2) x2 = x + w;
+    if (y + h > y2) y2 = y + h;
+    entry->damage_w = x2 - entry->damage_x;
+    entry->damage_h = y2 - entry->damage_y;
+}
+
+/* Does every pixel of the rectangle have full alpha? */
+static bool rect_opaque(const uint32_t* pixels, uint32_t stride_px,
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    for (uint32_t row = y; row < y + h; row++) {
+        const uint32_t* line = pixels + (size_t)row * stride_px;
+        for (uint32_t col = x; col < x + w; col++)
+            if (line[col] >> 24 != 255u) return false;
+    }
+    return true;
+}
+
 static bool refresh_frame(cached_window_t* entry,
                           const syscall_window_info_t* info) {
-    if (entry->width != info->width || entry->height != info->height) {
-        if (info->width > SIZE_MAX / info->height / sizeof(uint32_t))
+    bool resized = entry->width != info->width || entry->height != info->height;
+    if (!resized && entry->frame_version == info->frame_version) return true;
+    if (info->width > SIZE_MAX / info->height / sizeof(uint32_t))
+        return false;
+
+    /* What changed, and whether the program shares its frames (a kernel
+     * without the call just uses the copy path below). */
+    syscall_window_shared_t state;
+    bool have_state = mos_window_take_damage(info->id, &state) == SYS_SUCCESS;
+    if (resized || !have_state || entry->frame_version == UINT32_MAX) {
+        entry->damage_w = 0;
+        note_damage(entry, 0, 0, info->width, info->height);
+    } else {
+        uint32_t dx = state.damage_x, dy = state.damage_y;
+        uint32_t dw = state.damage_width, dh = state.damage_height;
+        if (dx > info->width || dy > info->height ||
+            dw > info->width - dx || dh > info->height - dy) {
+            dx = 0; dy = 0; dw = info->width; dh = info->height;
+        }
+        note_damage(entry, dx, dy, dw, dh);
+    }
+
+    bool shared = have_state && state.buffer_count == SYSCALL_WINDOW_SHARED_BUFFERS;
+    if (shared && (!entry->map_base || entry->map_generation != state.generation)) {
+        syscall_window_shared_t mapped;
+        memset(&mapped, 0, sizeof(mapped));
+        if (mos_window_map_frame(info->id, &mapped) != SYS_SUCCESS) {
+            shared = false;                 /* out of memory, say: copy instead */
+        } else if (mapped.width != info->width || mapped.height != info->height) {
+            /* Resized again since the list was read: next frame. */
+            mos_vm_unmap((void*)(uintptr_t)mapped.address,
+                         (size_t)(mapped.buffer_stride * 2u));
             return false;
+        } else {
+            release_mapping(entry);
+            entry->map_base = (uint8_t*)(uintptr_t)mapped.address;
+            entry->map_len = (size_t)(mapped.buffer_stride * 2u);
+            entry->map_stride = (uint32_t)mapped.buffer_stride;
+            entry->map_generation = mapped.generation;
+            /* No private copy any more. */
+            wm_free(entry->pixels);
+            entry->pixels = NULL;
+            entry->damage_w = 0;
+            note_damage(entry, 0, 0, info->width, info->height);
+        }
+    }
+    if (shared) {
+        entry->width = info->width;
+        entry->height = info->height;
+        entry->view = (const uint32_t*)(entry->map_base +
+                      (size_t)(state.front < 2u ? state.front : 0u) * entry->map_stride);
+        /* Only the damaged part can have changed its alpha. */
+        if (entry->frame_version == UINT32_MAX || !entry->opaque) {
+            entry->opaque = rect_opaque(entry->view, info->width, 0, 0,
+                                        info->width, info->height);
+        } else {
+            entry->opaque = rect_opaque(entry->view, info->width, entry->damage_x,
+                                        entry->damage_y, entry->damage_w,
+                                        entry->damage_h);
+        }
+        entry->frame_version = info->frame_version;
+        return true;
+    }
+
+    /* Copy path: the kernel copies the whole frame out. */
+    if (entry->map_base) {
+        release_mapping(entry);
+        resized = true;
+    }
+    if (resized || !entry->pixels) {
         size_t bytes = (size_t)info->width * info->height * sizeof(uint32_t);
         uint32_t* pixels = wm_malloc(bytes);
         if (!pixels) return false;
@@ -3686,8 +3811,9 @@ static bool refresh_frame(cached_window_t* entry,
         entry->width = info->width;
         entry->height = info->height;
         entry->frame_version = UINT32_MAX;
+        entry->damage_w = 0;
+        note_damage(entry, 0, 0, info->width, info->height);
     }
-    if (entry->frame_version == info->frame_version) return true;
     syscall_window_frame_t frame = {
         .width = info->width,
         .height = info->height,
@@ -3852,7 +3978,7 @@ static void composite_borderless(const syscall_window_info_t* info,
                                  cached_window_t* entry) {
     int32_t x = (int32_t)info->x, y = (int32_t)info->y;
     rect_t bounds = draw_bounds();
-    if (!entry || !entry->pixels) {
+    if (!entry || !ENTRY_PIXELS(entry)) {
         fill_rect(x, y, (int32_t)info->width, (int32_t)info->height, 0xFF000000u);
         return;
     }
@@ -3863,7 +3989,7 @@ static void composite_borderless(const syscall_window_info_t* info,
     for (uint32_t py = 0; py < info->height; py++) {
         int32_t dy = y + (int32_t)py;
         if (dy < bounds.top || dy >= bounds.bottom) continue;
-        const uint32_t* source = entry->pixels + (size_t)py * info->width;
+        const uint32_t* source = ENTRY_PIXELS(entry) + (size_t)py * info->width;
         uint32_t* target = canvas + (size_t)dy * display.width + x;
         if (entry->opaque) {
             copy_pixels(target + first, source + first, (size_t)(last - first));
@@ -3902,7 +4028,7 @@ static void composite_window(const syscall_window_info_t* info,
         x + 1, y + (int32_t)TITLE_HEIGHT + 1, x + 1 + (int32_t)info->width,
         y + (int32_t)TITLE_HEIGHT + 1 + (int32_t)info->height -
             (int32_t)CORNER_RADIUS};
-    const int32_t* filled = entry && entry->pixels && entry->opaque
+    const int32_t* filled = entry && ENTRY_PIXELS(entry) && entry->opaque
         ? content : NULL;
     if (ui_style == MOSDESK_UI_STYLE_AERO) {
         /* Glass frame: the title bar plus a border a few pixels wide that
@@ -4006,7 +4132,7 @@ static void composite_window(const syscall_window_info_t* info,
     /* Glass backgrounds: a see-through window gets frosted glass behind
      * its content instead of the flat content colour. */
     bool modern_glass = !filled && window_background == MOSDESK_WINDOW_BG_GLASS &&
-                        entry && entry->pixels;
+                        entry && ENTRY_PIXELS(entry);
     const int32_t* behind = modern_glass ? content : filled;
     fill_rounded_rect_around(x, y, outer_width, outer_height, CORNER_RADIUS,
                              info->style.border, behind);
@@ -4034,7 +4160,7 @@ static void composite_window(const syscall_window_info_t* info,
               outer_width - (int32_t)CORNER_RADIUS * 2, 1, 0x1CFFFFFFu);
     }
 
-    if (entry && entry->pixels) {
+    if (entry && ENTRY_PIXELS(entry)) {
         int32_t content_x = x + 1;
         int32_t content_y = y + (int32_t)TITLE_HEIGHT + 1;
         rect_t bounds = draw_bounds();
@@ -4045,7 +4171,7 @@ static void composite_window(const syscall_window_info_t* info,
             int32_t dy = content_y + (int32_t)py;
             if (dy < bounds.top || dy >= bounds.bottom) continue;
             const uint32_t* source =
-                entry->pixels + (size_t)py * info->width;
+                ENTRY_PIXELS(entry) + (size_t)py * info->width;
             uint32_t* target = canvas + (size_t)dy * display.width +
                                content_x;
             if (py + CORNER_RADIUS < info->height) {
@@ -7390,14 +7516,28 @@ static bool window_shown(const syscall_window_info_t* info);
 static bool start_close_animation(cached_window_t* entry) {
     uint32_t effect = desktop_settings.anim_close;
     if (effect == MOSDESK_ANIM_NONE || auth_state != AUTH_NONE ||
-        !entry->pixels || !entry->last_info.id ||
+        !ENTRY_PIXELS(entry) || !entry->last_info.id ||
         !window_shown(&entry->last_info) ||
         entry->width != entry->last_info.width ||
         entry->height != entry->last_info.height)
         return false;
+    uint32_t* snapshot = NULL;
+    if (entry->view) {
+        /* The shared frames go away with the window: keep a copy. */
+        size_t bytes = (size_t)entry->width * entry->height * sizeof(uint32_t);
+        snapshot = wm_malloc(bytes);
+        if (!snapshot) return false;
+        memcpy(snapshot, entry->view, bytes);
+    }
     ghost_t* ghost = ghost_slot();
     ghost->active = true;
     ghost->window = *entry;
+    if (snapshot) {
+        ghost->window.pixels = snapshot;
+        ghost->window.view = NULL;
+        ghost->window.map_base = NULL;
+        ghost->window.map_len = 0;
+    }
     ghost->kind = ANIM_KIND_CLOSE;
     ghost->effect = effect;
     ghost->start = anim_now;
@@ -7409,17 +7549,20 @@ static bool start_close_animation(cached_window_t* entry) {
 static void start_minimize_animation(const syscall_window_info_t* info,
                                      cached_window_t* entry) {
     if (!interface_animations() || auth_state != AUTH_NONE || !entry ||
-        !entry->pixels || !window_shown(info) ||
+        !ENTRY_PIXELS(entry) || !window_shown(info) ||
         entry->width != info->width || entry->height != info->height)
         return;
     size_t bytes = (size_t)entry->width * entry->height * sizeof(uint32_t);
     uint32_t* copy = wm_malloc(bytes);
     if (!copy) return;
-    memcpy(copy, entry->pixels, bytes);
+    memcpy(copy, ENTRY_PIXELS(entry), bytes);
     ghost_t* ghost = ghost_slot();
     ghost->active = true;
     ghost->window = *entry;
     ghost->window.pixels = copy;
+    ghost->window.view = NULL;           /* the ghost owns a copy, not the mapping */
+    ghost->window.map_base = NULL;
+    ghost->window.map_len = 0;
     ghost->window.last_info = *info;
     ghost->window.last_focused = info->id == focused_id;
     ghost->kind = ANIM_KIND_MINIMIZE;
@@ -8211,8 +8354,18 @@ static void collect_damage(const syscall_window_info_t* windows,
         } else if (entry->drawn_version != entry->frame_version) {
             int32_t left = content_left(info);
             int32_t top = content_top(info);
-            damage_add((rect_t){left, top, left + (int32_t)info->width,
-                                top + (int32_t)info->height});
+            if (entry->drawn_shown && entry->damage_w &&
+                entry->damage_x + entry->damage_w <= info->width &&
+                entry->damage_y + entry->damage_h <= info->height) {
+                /* Only what the program said it changed. */
+                damage_add((rect_t){left + (int32_t)entry->damage_x,
+                                    top + (int32_t)entry->damage_y,
+                                    left + (int32_t)(entry->damage_x + entry->damage_w),
+                                    top + (int32_t)(entry->damage_y + entry->damage_h)});
+            } else {
+                damage_add((rect_t){left, top, left + (int32_t)info->width,
+                                    top + (int32_t)info->height});
+            }
         }
     }
     /* Animations repaint their whole area, now and once after they end. */
@@ -8259,6 +8412,8 @@ static void render(const syscall_window_info_t* windows, uint64_t count) {
             entry->drawn_width = windows[i].width;
             entry->drawn_height = windows[i].height;
             entry->drawn_version = entry->frame_version;
+            entry->drawn_shown = window_shown(&windows[i]);
+            entry->damage_w = entry->damage_h = 0;
         }
         memcpy(regions_drawn, regions, sizeof(regions_drawn));
         scene_signature = signature;
@@ -9277,6 +9432,7 @@ static void cleanup(void) {
     cursor_animation_pixels = NULL;
     for (uint32_t i = 0; i < MAX_WINDOWS; i++) {
         wm_free(cache[i].pixels);
+        release_mapping(&cache[i]);
         memset(&cache[i], 0, sizeof(cache[i]));
     }
 }
