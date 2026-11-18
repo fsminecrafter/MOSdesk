@@ -10368,6 +10368,36 @@ static void route_input(const syscall_input_event_t* input,
     }
 }
 
+/* A window that opens bigger than the screen (an app made for a larger
+ * display) is shrunk and moved so its whole frame is on screen. */
+static void fit_new_window(syscall_window_info_t* info) {
+    if (borderless(info) || (info->flags & (SYSCALL_WINDOW_FULLSCREEN |
+                                            SYSCALL_WINDOW_MAXIMIZED)))
+        return;
+    uint32_t work_height = display.height - TASKBAR_HEIGHT;
+    if (display.width <= 64u || work_height <= TITLE_HEIGHT + 64u) return;
+    uint32_t max_w = display.width - 2u;
+    uint32_t max_h = work_height - TITLE_HEIGHT - 2u;
+    uint32_t w = info->width < max_w ? info->width : max_w;
+    uint32_t h = info->height < max_h ? info->height : max_h;
+    int32_t x = info->x, y = info->y;
+    if (x + (int32_t)w + 2 > (int32_t)display.width)
+        x = (int32_t)display.width - (int32_t)w - 2;
+    if (y + (int32_t)(h + TITLE_HEIGHT) + 2 > (int32_t)work_height)
+        y = (int32_t)work_height - (int32_t)(h + TITLE_HEIGHT) - 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (w == info->width && h == info->height && x == info->x && y == info->y)
+        return;
+    if (mos_window_set_bounds(info->id, (uint32_t)x, (uint32_t)y, w, h) ==
+        SYS_SUCCESS) {
+        info->x = x;
+        info->y = y;
+        info->width = w;
+        info->height = h;
+    }
+}
+
 /* Called once a frame: sends the repeats a held key is due. */
 static void key_repeat_tick(void) {
     if (!repeat_key) return;
@@ -10515,6 +10545,7 @@ int main(void) {
             /* A window that has just appeared takes the keyboard focus. */
             if (entry && !entry->announced) {
                 entry->announced = true;
+                fit_new_window(&windows[i]);
                 if (windows[i].flags & SYSCALL_WINDOW_VISIBLE)
                     focus_window(&windows[i]);
             }
