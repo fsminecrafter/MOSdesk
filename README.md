@@ -17,6 +17,10 @@ https://github.com/user-attachments/assets/f69558d4-2eb4-4ade-a4f1-567f23482287
 - Keeps desktop shortcut positions across restarts, with optional grid snapping
 - Shows only Home and System on the desktop by itself; everything else comes from the user's Desktop folder. "Add to desktop" (right-click an app in the launcher or anything in Files) puts a `.lnk` shortcut there
 - Files can copy or move an item into any folder through a "Copy to... / Move to..." folder picker
+- Files has Back/Forward history, a Places sidebar, a clickable path, sortable Name / Kind / Size / Modified columns, type-to-filter, hidden files (Ctrl+H), cut/copy/paste and full keyboard control (arrows, Enter, F2, Delete, Ctrl+T terminal here, Ctrl+E open in Code); source files open in Code ([screenshot](docs/screenshots/files.png))
+- Held keys repeat in every window (mosWM sends the repeats; `SYSCALL_WINDOW_KEY_IS_REPEAT` tells them apart), and AltGr types the layout's third characters (`{ [ ] } \ @` on Nordic keyboards) in the terminal, Code and easyui text fields
+- Windows that open bigger than the screen are shrunk to fit
+- The terminal scrolls with the wheel, a draggable scrollbar, PgUp/PgDn and Shift+Up/Down, and keeps a scrolled-back view in place while output arrives
 - Offers a "2000s Aero" window style next to the modern one (Settings > Appearance > Window style): blurred, accent-tinted glass frames and panel, Windows 7 style caption buttons and a start orb; easyui apps follow it
 - Animates windows opening (Fade in, Blocks, Matrix) and closing (Fade out, Katana, Matrix), chosen in Settings > Animations along with the speed; a Preview button plays them. Minimizing shrinks windows into the panel, menus slide in, and hover highlights, switches and buttons fade and slide (Interface animations can be turned off)
 - easyui apps follow the window style and color theme: the Modern look is tinted by the theme, and under Liquid Glass apps are dark frosted glass with mosWM's blurred glass showing behind them
@@ -70,6 +74,7 @@ installed into `0:/programs` with a `mos_` prefix:
 | --- | --- | --- |
 | `mosdesk/apps/calc.c` | `0:/programs/mos_calc.run` | Calculator (easyui): whole calculations like `1+3+5/4` with the usual order of operations; make the window bigger for scientific keys (trig, logs, powers, roots, factorials) |
 | `mosdesk/apps/clock.c` | `0:/programs/mos_clock.run` | Analogue clock |
+| `mosdesk/apps/code/` | `0:/programs/mos_code.run` | Code editor (easyui), a small VS Code: tabs, folder sidebar, syntax colours (C/C++, Python, shell, Lua, JavaScript/JSON, Markdown, Makefile), find/replace, auto-indent, undo; run as `mos_code.run [file-or-folder ...]`; uses the bundled JetBrains Mono font ([screenshot](docs/screenshots/code.png)) |
 | `mosdesk/apps/cube.c` | `0:/programs/mos_cube.run` | 3D cube with FarcadeGL: built-in lighting or an FGSL shader (L / S keys) |
 | `mosdesk/apps/edit.c` | `0:/programs/mos_edit.run` | Text editor |
 | `mosdesk/apps/golf.c` | `0:/programs/mos_golf.run` | Mini golf |
