@@ -39,14 +39,24 @@
 #define SYSCALL_INPUT_MOUSE_BUTTON 3u
 #define SYSCALL_INPUT_MOUSE_MOVE 4u
 #define SYSCALL_INPUT_MOUSE_WHEEL 5u
+#define SYSCALL_INPUT_MOD_SHIFT (1u << 0)
+#define SYSCALL_INPUT_MOD_CTRL (1u << 1)
+#define SYSCALL_INPUT_MOD_ALT (1u << 2)
 typedef struct { uint32_t title_bar, title_text, close_button, minimize_button, maximize_button,
     close_icon, minimize_icon, maximize_icon, border, content_background; } syscall_window_style_t;
 typedef struct { uint32_t id, frame_version, flags; int32_t x, y; uint32_t width, height;
     char title[SYSCALL_WINDOW_MAX_TITLE]; syscall_window_style_t style; } syscall_window_info_t;
 typedef struct { uint32_t status; char pack[SYSCALL_CURSOR_PACK_PATH_SIZE]; } syscall_cursor_state_t;
 typedef struct { uint32_t width, height, pitch; uint32_t* pixels; } syscall_window_frame_t;
-typedef struct { uint32_t type; int32_t x, y, width, height; uint32_t buttons, key, mods, time_ms; int32_t wheel; } syscall_window_event_t;
+typedef struct { uint32_t type; int32_t x, y, width, height; uint32_t buttons, key, mods, time_ms; int32_t wheel; uint8_t reserved[3]; } syscall_window_event_t;
 typedef struct { uint32_t type, buttons, key, mods, time_ms; int32_t dx, dy, wheel; } syscall_input_event_t;
+#define SYSCALL_WINDOW_SHARED_BUFFERS 2u
+typedef struct { uint64_t address, buffer_stride; uint32_t width, height, pitch, buffer_count,
+    generation, front, frame_version, damage_x, damage_y, damage_width, damage_height; } syscall_window_shared_t;
+/* The host window server has no shared frames: mosWM takes the copy path. */
+static inline uint64_t mos_window_take_damage(uint32_t id, syscall_window_shared_t* s) { (void)id; (void)s; return (uint64_t)-1; }
+static inline uint64_t mos_window_map_frame(uint32_t id, syscall_window_shared_t* s) { (void)id; (void)s; return (uint64_t)-1; }
+static inline long mos_vm_unmap(void* a, size_t n) { (void)a; (void)n; return 0; }
 uint64_t mos_window_register_manager(void);
 uint64_t mos_window_list(syscall_window_info_t* w, uint64_t max);
 uint64_t mos_window_get_frame(uint32_t id, syscall_window_frame_t* f);

@@ -48,6 +48,8 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define MOSDESK_PLAYER_PATH "0:/programs/mos_player.run"
 #define MOSDESK_VIDEO_PATH "0:/programs/mos_video.run"
 #define MOSDESK_PHOTOS_PATH "0:/programs/mos_photos.run"
+#define MOSDESK_CODE_PATH "0:/programs/mos_code.run"
+#define MOSDESK_TERMINAL_PATH "0:/programs/mos_terminal.run"
 
 #define SYS_HEAP_ALLOC 1u
 #define SYS_HEAP_FREE 2u
@@ -67,7 +69,7 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define DESKTOP_APP_PATH_SIZE 192u
 #define DESKTOP_APP_NAME_SIZE 48u
 #define DESKTOP_DIR_ENTRIES 128u
-#define BROWSER_MAX_ENTRIES 128u
+#define BROWSER_MAX_ENTRIES 512u
 #define BROWSER_PATH_SIZE 192u
 #define BROWSER_ROW_HEIGHT 28u
 #define DESKTOP_ICON_SIZE SYSCALL_WINDOW_ICON_SIZE
@@ -89,7 +91,7 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define BROWSER_FOOTER_HEIGHT 26u
 #define BROWSER_TOOL_COUNT 5u
 #define CURSOR_PATCH_SIZE (CURSOR_MAX_SIZE * 2u)
-#define MENU_MAX_ITEMS 10u
+#define MENU_MAX_ITEMS 14u
 #define MENU_WIDTH 204
 #define MENU_ITEM_HEIGHT 30
 #define SHORTCUT_EXTENSION ".lnk"
@@ -219,7 +221,11 @@ typedef enum {
     MENU_ACTION_COPY_TO,
     MENU_ACTION_MOVE_TO,
     MENU_ACTION_SHUTDOWN,
-    MENU_ACTION_RESTART
+    MENU_ACTION_RESTART,
+    MENU_ACTION_CUT,
+    MENU_ACTION_OPEN_CODE,
+    MENU_ACTION_TERMINAL_HERE,
+    MENU_ACTION_TOGGLE_HIDDEN
 } menu_action_t;
 
 typedef struct {
@@ -290,6 +296,18 @@ static int32_t cursor_y;
 static int32_t mouse_remainder_x;
 static int32_t mouse_remainder_y;
 static uint32_t focused_id;
+/* Key repeat: the kernel sends one KEY_DOWN per press, so mosWM repeats a
+ * held key for the focused window itself (the first repeat after
+ * KEY_REPEAT_DELAY_MS, then one every KEY_REPEAT_RATE_MS). Repeated
+ * events are ordinary key-downs with reserved[0] set to 1, so programs
+ * that only want presses can skip them (SYSCALL_WINDOW_KEY_IS_REPEAT). */
+#define KEY_REPEAT_DELAY_MS 420u
+#define KEY_REPEAT_RATE_MS 33u
+#define REPEAT_DIALOG UINT32_MAX
+static uint8_t repeat_key;
+static uint8_t repeat_mods;
+static uint32_t repeat_window;
+static uint64_t repeat_next_ms;
 static uint32_t cursor_pixels[CURSOR_MAX_SIZE * CURSOR_MAX_SIZE];
 static uint32_t* cursor_animation_pixels;
 static uint32_t cursor_animation_frame_count;
@@ -600,6 +618,7 @@ static void log_message(const char* message);
 static void browser_close(void);
 static void browser_open(const char* path);
 static void browser_render(void);
+static void browser_key(uint8_t key, uint8_t mods);
 static void browser_mouse_down(int32_t x, int32_t y,
                                const syscall_window_info_t* info);
 static void activate_pending_click(uint32_t time_ms);
@@ -1891,6 +1910,7 @@ static bool path_is_protected(const char* path) {
     };
     for (uint32_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++)
         if (!strcmp(path, exact[i])) return true;
+    if (path[0] && path[1] == ':' && !strcmp(path + 2, "/")) return true;
     /* The user's home and its standard folders. */
     if (!strcmp(path, user_home)) return true;
     size_t home_length = strlen(user_home);
@@ -2077,13 +2097,20 @@ static moswm_file_icon_t icon_for_entry(uint32_t type, const char* name) {
         {".pkg", MOSWM_ICON_ARCHIVE}, {".zip", MOSWM_ICON_ARCHIVE},
         {".slib", MOSWM_ICON_ARCHIVE}, {".c", MOSWM_ICON_CODE},
         {".h", MOSWM_ICON_CODE}, {".sh", MOSWM_ICON_TERMINAL},
-        {".py", MOSWM_ICON_CODE}, {".service", MOSWM_ICON_SETTINGS},
+        {".py", MOSWM_ICON_CODE}, {".cpp", MOSWM_ICON_CODE},
+        {".hpp", MOSWM_ICON_CODE}, {".lua", MOSWM_ICON_CODE},
+        {".js", MOSWM_ICON_CODE}, {".json", MOSWM_ICON_CODE},
+        {".mk", MOSWM_ICON_CODE}, {".fgsl", MOSWM_ICON_CODE},
+        {".s", MOSWM_ICON_CODE}, {".asm", MOSWM_ICON_CODE},
+        {".service", MOSWM_ICON_SETTINGS},
         {".cfg", MOSWM_ICON_SETTINGS}, {".dat", MOSWM_ICON_SETTINGS},
         {".conf", MOSWM_ICON_SETTINGS},
         {".desc", MOSWM_ICON_SETTINGS}, {".cur", MOSWM_ICON_POINTER},
         {".ani", MOSWM_ICON_POINTER}, {SHORTCUT_EXTENSION, MOSWM_ICON_APP}
     };
     if (type == SYSCALL_DIRENT_TYPE_DIR) return MOSWM_ICON_FOLDER;
+    if (!strcmp(name, "Makefile") || !strcmp(name, "makefile"))
+        return MOSWM_ICON_CODE;
     for (uint32_t i = 0; i < sizeof(known) / sizeof(known[0]); i++)
         if (name_has_extension(name, known[i].extension))
             return known[i].icon;
@@ -2111,6 +2138,60 @@ static const char* kind_for_icon(moswm_file_icon_t icon) {
 
 /* ------------------------------------------------------------ File Browser */
 
+/* Layout, in Files content coordinates:
+ *   toolbar (back, forward, up, refresh, new folder, breadcrumb path)
+ *   places sidebar on the left when the window is wide enough
+ *   column header (Name / Kind / Size / Modified, click to sort)
+ *   the list, a scrollbar, and the status bar. */
+#define BROWSER_SIDEBAR_WIDTH 164
+#define BROWSER_COLUMNS_HEIGHT 26u
+#define BROWSER_HISTORY 16u
+#define BROWSER_MAX_PLACES 14u
+#define BROWSER_MAX_CRUMBS 12u
+#define BROWSER_FILTER_SIZE 48u
+
+enum { BROWSER_SORT_NAME, BROWSER_SORT_KIND, BROWSER_SORT_SIZE,
+       BROWSER_SORT_MODIFIED };
+
+typedef struct {
+    char label[24];
+    char path[BROWSER_PATH_SIZE];
+    moswm_file_icon_t icon;
+    bool section_before;        /* "Drives" heading above it */
+} browser_place_t;
+
+static uint16_t browser_view[BROWSER_MAX_ENTRIES];
+static uint32_t browser_view_count;
+static uint32_t browser_sizes[BROWSER_MAX_ENTRIES];     /* UINT32_MAX: none */
+static char browser_changed[BROWSER_MAX_ENTRIES][20];
+static char browser_back[BROWSER_HISTORY][BROWSER_PATH_SIZE];
+static char browser_forward[BROWSER_HISTORY][BROWSER_PATH_SIZE];
+static uint32_t browser_back_count, browser_forward_count;
+static browser_place_t browser_places[BROWSER_MAX_PLACES];
+static uint32_t browser_place_count;
+static uint32_t browser_place_hover = UINT32_MAX;
+static int32_t browser_crumb_x[BROWSER_MAX_CRUMBS];
+static int32_t browser_crumb_w[BROWSER_MAX_CRUMBS];
+static uint32_t browser_crumb_len[BROWSER_MAX_CRUMBS];  /* path prefix */
+static uint32_t browser_crumb_count;
+static uint32_t browser_crumb_hover = UINT32_MAX;
+static uint32_t browser_column_hover = UINT32_MAX;
+static uint32_t browser_sort = BROWSER_SORT_NAME;
+static bool browser_sort_descending;
+static bool browser_show_hidden;
+static char browser_filter[BROWSER_FILTER_SIZE];
+static bool browser_clipboard_cut;
+static bool browser_scroll_dragging;
+static int32_t browser_scroll_grab;
+
+static bool browser_focused(void) {
+    return browser_window_id && focused_id == browser_window_id;
+}
+
+static const syscall_dirent_t* browser_entry(uint32_t view_index) {
+    return &browser_entries[browser_view[view_index]];
+}
+
 static void browser_note(const char* message, bool is_error) {
     size_t length = strlen(message);
     if (length >= sizeof(browser_message))
@@ -2121,11 +2202,24 @@ static void browser_note(const char* message, bool is_error) {
     browser_generation++;
 }
 
+static int32_t browser_sidebar_width(void) {
+    return browser_width >= 560u ? BROWSER_SIDEBAR_WIDTH : 0;
+}
+
+static int32_t browser_list_top(void) {
+    return (int32_t)(BROWSER_HEADER_HEIGHT + BROWSER_COLUMNS_HEIGHT);
+}
+
 static uint32_t browser_visible_rows(uint32_t height) {
-    return height > BROWSER_HEADER_HEIGHT + BROWSER_FOOTER_HEIGHT
-        ? (height - BROWSER_HEADER_HEIGHT - BROWSER_FOOTER_HEIGHT) /
-              BROWSER_ROW_HEIGHT
+    uint32_t top = BROWSER_HEADER_HEIGHT + BROWSER_COLUMNS_HEIGHT;
+    return height > top + BROWSER_FOOTER_HEIGHT + 4u
+        ? (height - top - BROWSER_FOOTER_HEIGHT - 4u) / BROWSER_ROW_HEIGHT
         : 0u;
+}
+
+static uint32_t browser_max_scroll(void) {
+    uint32_t rows = browser_visible_rows(browser_height);
+    return browser_view_count > rows ? browser_view_count - rows : 0u;
 }
 
 static int compare_names(const char* a, const char* b) {
@@ -2137,8 +2231,109 @@ static int compare_names(const char* a, const char* b) {
     }
 }
 
+/* Case-insensitive "does name contain needle". */
+static bool name_contains(const char* name, const char* needle) {
+    if (!needle[0]) return true;
+    for (; *name; name++) {
+        const char* a = name;
+        const char* b = needle;
+        while (*a && *b) {
+            char ca = *a >= 'A' && *a <= 'Z' ? (char)(*a + 32) : *a;
+            char cb = *b >= 'A' && *b <= 'Z' ? (char)(*b + 32) : *b;
+            if (ca != cb) break;
+            a++;
+            b++;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
+static const char* name_extension(const char* name) {
+    const char* dot = NULL;
+    for (const char* p = name; *p; p++)
+        if (*p == '.') dot = p;
+    return dot && dot != name ? dot : "";
+}
+
+/* Folders first, then by the chosen column; ties by name. */
+static int browser_compare(uint32_t a, uint32_t b) {
+    const syscall_dirent_t* ea = &browser_entries[a];
+    const syscall_dirent_t* eb = &browser_entries[b];
+    bool da = ea->type == SYSCALL_DIRENT_TYPE_DIR;
+    bool db = eb->type == SYSCALL_DIRENT_TYPE_DIR;
+    if (da != db) return da ? -1 : 1;
+    int order = 0;
+    if (browser_sort == BROWSER_SORT_KIND) {
+        order = compare_names(name_extension(ea->name),
+                              name_extension(eb->name));
+    } else if (browser_sort == BROWSER_SORT_SIZE) {
+        uint32_t sa = browser_sizes[a] == UINT32_MAX ? 0u : browser_sizes[a];
+        uint32_t sb = browser_sizes[b] == UINT32_MAX ? 0u : browser_sizes[b];
+        order = sa < sb ? -1 : sa > sb ? 1 : 0;
+    } else if (browser_sort == BROWSER_SORT_MODIFIED) {
+        order = strcmp(browser_changed[a], browser_changed[b]);
+    }
+    if (!order) order = compare_names(ea->name, eb->name);
+    return browser_sort_descending ? -order : order;
+}
+
+/* Rebuilds the shown list from the folder listing: hidden entries and the
+ * type-to-filter text, then the sort order. Keeps the selected entry. */
+static void browser_rebuild_view(void) {
+    uint32_t keep = browser_selected < browser_view_count
+        ? browser_view[browser_selected] : UINT32_MAX;
+    browser_view_count = 0;
+    for (uint32_t i = 0; i < browser_entry_count; i++) {
+        if (browser_entries[i].hidden && !browser_show_hidden) continue;
+        if (!name_contains(browser_entries[i].name, browser_filter)) continue;
+        browser_view[browser_view_count++] = (uint16_t)i;
+    }
+    for (uint32_t i = 1; i < browser_view_count; i++) {
+        uint16_t moving = browser_view[i];
+        uint32_t slot = i;
+        while (slot > 0 && browser_compare(browser_view[slot - 1u], moving) > 0) {
+            browser_view[slot] = browser_view[slot - 1u];
+            slot--;
+        }
+        browser_view[slot] = moving;
+    }
+    browser_selected = UINT32_MAX;
+    for (uint32_t i = 0; i < browser_view_count && keep != UINT32_MAX; i++)
+        if (browser_view[i] == keep) browser_selected = i;
+    if (browser_filter[0] && browser_selected == UINT32_MAX &&
+        browser_view_count)
+        browser_selected = 0;
+    if (browser_scroll > browser_max_scroll())
+        browser_scroll = browser_max_scroll();
+    browser_generation++;
+}
+
+/* Keeps the selected row on screen. */
+static void browser_reveal_selected(void) {
+    uint32_t rows = browser_visible_rows(browser_height);
+    if (browser_selected == UINT32_MAX || !rows) return;
+    if (browser_selected < browser_scroll) browser_scroll = browser_selected;
+    if (browser_selected >= browser_scroll + rows)
+        browser_scroll = browser_selected - rows + 1u;
+    browser_generation++;
+}
+
+/* Copies "YYYY-MM-DD HH:MM" out of a metadata date, whatever separators it
+ * uses; other text is kept as it is, cut to fit. */
+static void short_date(char* output, size_t capacity, const char* date) {
+    size_t used = 0;
+    for (const char* p = date; *p && used + 1u < capacity && used < 16u; p++) {
+        char c = *p == 'T' ? ' ' : *p;
+        if (c < 32 || c > 126) break;
+        output[used++] = c;
+    }
+    output[used] = '\0';
+}
+
 static void browser_refresh_directory(void) {
     browser_entry_count = 0;
+    browser_view_count = 0;
     browser_selected = UINT32_MAX;
     browser_scroll = 0;
     browser_generation++;
@@ -2149,39 +2344,35 @@ static void browser_refresh_directory(void) {
         browser_note("Unable to list this folder", true);
         return;
     }
-    uint32_t count = result > BROWSER_MAX_ENTRIES
+    browser_entry_count = result > BROWSER_MAX_ENTRIES
         ? BROWSER_MAX_ENTRIES : (uint32_t)result;
-    for (uint32_t i = 0; i < count; i++) {
-        if (browser_entries[i].hidden) continue;
-        if (browser_entry_count != i)
-            browser_entries[browser_entry_count] = browser_entries[i];
-        browser_entry_count++;
-    }
-    /* Folders first, then by name. */
-    for (uint32_t i = 1; i < browser_entry_count; i++) {
-        syscall_dirent_t moving = browser_entries[i];
-        bool moving_dir = moving.type == SYSCALL_DIRENT_TYPE_DIR;
-        uint32_t slot = i;
-        while (slot > 0) {
-            const syscall_dirent_t* before = &browser_entries[slot - 1u];
-            bool before_dir = before->type == SYSCALL_DIRENT_TYPE_DIR;
-            if (before_dir != moving_dir ? before_dir
-                    : compare_names(before->name, moving.name) <= 0)
-                break;
-            browser_entries[slot] = *before;
-            slot--;
+    for (uint32_t i = 0; i < browser_entry_count; i++) {
+        browser_sizes[i] = UINT32_MAX;
+        browser_changed[i][0] = '\0';
+        if (browser_entries[i].type == SYSCALL_DIRENT_TYPE_DIR) continue;
+        char path[BROWSER_PATH_SIZE];
+        syscall_file_metadata_t metadata;
+        memset(&metadata, 0, sizeof(metadata));
+        if (path_join(path, sizeof(path), browser_path,
+                      browser_entries[i].name) &&
+            mos_syscall3(SYS_GET_METADATA, (uint64_t)(uintptr_t)path,
+                (uint64_t)(uintptr_t)&metadata, 0) == SYS_SUCCESS) {
+            browser_sizes[i] = metadata.data_length;
+            short_date(browser_changed[i], sizeof(browser_changed[i]),
+                       metadata.last_changed);
         }
-        browser_entries[slot] = moving;
     }
     browser_message[0] = '\0';
+    browser_rebuild_view();
+    if (result > BROWSER_MAX_ENTRIES)
+        browser_note("Only the first 512 items are shown", false);
 }
 
 static void browser_select_name(const char* name) {
-    for (uint32_t i = 0; i < browser_entry_count; i++) {
-        if (strcmp(browser_entries[i].name, name)) continue;
+    for (uint32_t i = 0; i < browser_view_count; i++) {
+        if (strcmp(browser_entry(i)->name, name)) continue;
         browser_selected = i;
-        uint32_t rows = browser_visible_rows(browser_height);
-        if (rows && i >= rows) browser_scroll = i - rows + 1u;
+        browser_reveal_selected();
         break;
     }
     browser_generation++;
@@ -2195,8 +2386,12 @@ static void browser_close(void) {
     browser_width = 0;
     browser_height = 0;
     browser_entry_count = 0;
+    browser_view_count = 0;
     browser_selected = UINT32_MAX;
     browser_drawn_signature = 0;
+    browser_back_count = browser_forward_count = 0;
+    browser_filter[0] = '\0';
+    browser_scroll_dragging = false;
     last_click_valid = false;
 }
 
@@ -2220,18 +2415,80 @@ static void set_wallpaper_image(const char* path) {
                  !wallpaper_source);
 }
 
+static void browser_add_place(const char* label, const char* path,
+                              moswm_file_icon_t icon, bool section_before) {
+    if (browser_place_count >= BROWSER_MAX_PLACES ||
+        strlen(path) >= BROWSER_PATH_SIZE || !fs_is_directory(path))
+        return;
+    browser_place_t* place = &browser_places[browser_place_count++];
+    size_t length = strlen(label);
+    if (length >= sizeof(place->label)) length = sizeof(place->label) - 1u;
+    memcpy(place->label, label, length);
+    place->label[length] = '\0';
+    strcpy(place->path, path);
+    place->icon = icon;
+    place->section_before = section_before;
+}
+
+/* The sidebar: the home folder and its standard folders that exist, then
+ * the system drive, its programs and any other drive that answers. */
+static void browser_find_places(void) {
+    static const struct {
+        const char* name;
+        moswm_file_icon_t icon;
+    } standard[] = {
+        {"Desktop", MOSWM_ICON_DESKTOP}, {"Documents", MOSWM_ICON_DOCUMENT},
+        {"Downloads", MOSWM_ICON_ARCHIVE}, {"Pictures", MOSWM_ICON_IMAGE},
+        {"Music", MOSWM_ICON_AUDIO}, {"Videos", MOSWM_ICON_VIDEO},
+        {"Projects", MOSWM_ICON_CODE}
+    };
+    browser_place_count = 0;
+    browser_add_place("Home", user_home, MOSWM_ICON_HOME, false);
+    for (uint32_t i = 0; i < sizeof(standard) / sizeof(standard[0]); i++) {
+        char path[BROWSER_PATH_SIZE];
+        if (path_join(path, sizeof(path), user_home, standard[i].name))
+            browser_add_place(standard[i].name, path, standard[i].icon,
+                              false);
+    }
+    browser_add_place("System (0:)", "0:/", MOSWM_ICON_COMPUTER, true);
+    browser_add_place("Programs", "0:/programs", MOSWM_ICON_APP, false);
+    for (char drive = '1'; drive <= '3'; drive++) {
+        char path[4] = {drive, ':', '/', '\0'};
+        char label[12] = "Disk (x:)";
+        label[6] = drive;
+        browser_add_place(label, path, MOSWM_ICON_DRIVE, false);
+    }
+}
+
+static void history_push(char stack[][BROWSER_PATH_SIZE], uint32_t* count,
+                         const char* path) {
+    if (*count == BROWSER_HISTORY) {
+        for (uint32_t i = 1; i < BROWSER_HISTORY; i++)
+            strcpy(stack[i - 1u], stack[i]);
+        (*count)--;
+    }
+    strcpy(stack[(*count)++], path);
+}
+
 static void browser_open(const char* path) {
     if (!path || strlen(path) >= sizeof(browser_path) ||
         mos_syscall3(SYS_IS_DIR, (uint64_t)(uintptr_t)path, 0, 0) != 1u) {
         strcpy(status_message, "Folder is unavailable");
         return;
     }
+    /* Going somewhere new from an open window can be undone with Back. */
+    if (browser_window_id && strcmp(browser_path, path)) {
+        history_push(browser_back, &browser_back_count, browser_path);
+        browser_forward_count = 0;
+    }
     memcpy(browser_path, path, strlen(path) + 1u);
+    browser_filter[0] = '\0';
     browser_refresh_directory();
+    browser_find_places();
     if (!browser_window_id) {
-        uint32_t width = display.width > 700u ? 660u : display.width - 36u;
-        uint32_t height = display.height > TASKBAR_HEIGHT + 540u
-            ? 500u : display.height - TASKBAR_HEIGHT - 36u;
+        uint32_t width = display.width > 860u ? 820u : display.width - 36u;
+        uint32_t height = display.height > TASKBAR_HEIGHT + 580u
+            ? 540u : display.height - TASKBAR_HEIGHT - 36u;
         if (width < 240u) width = display.width - 36u;
         if (height < 96u) height = 96u;
         uint32_t x = (display.width - width) / 2u;
@@ -2245,6 +2502,7 @@ static void browser_open(const char* path) {
         browser_width = width;
         browser_height = height;
         browser_drawn_signature = 0;
+        browser_back_count = browser_forward_count = 0;
         browser_pixels = (uint32_t*)wm_malloc(
             (size_t)width * height * sizeof(uint32_t));
         if (!browser_pixels) {
@@ -2285,8 +2543,43 @@ static void browser_open(const char* path) {
     }
 }
 
+/* Back and Forward: open a remembered folder without recording it again. */
+static void browser_history_go(bool forward) {
+    char (*from)[BROWSER_PATH_SIZE] = forward ? browser_forward : browser_back;
+    uint32_t* from_count = forward ? &browser_forward_count
+                                   : &browser_back_count;
+    while (*from_count) {
+        char target[BROWSER_PATH_SIZE];
+        strcpy(target, from[--*from_count]);
+        if (!fs_is_directory(target)) continue;     /* deleted since */
+        char previous[BROWSER_PATH_SIZE];
+        strcpy(previous, browser_path);
+        if (forward) history_push(browser_back, &browser_back_count, previous);
+        else history_push(browser_forward, &browser_forward_count, previous);
+        strcpy(browser_path, target);
+        browser_filter[0] = '\0';
+        browser_refresh_directory();
+        /* Coming back up out of a folder selects it. */
+        if (path_has_prefix(previous, target) && strcmp(previous, target)) {
+            const char* rest = previous + strlen(target);
+            if (*rest == '/') rest++;
+            char name[SYSCALL_DIRENT_NAME_SIZE];
+            size_t n = 0;
+            while (rest[n] && rest[n] != '/' && n + 1u < sizeof(name)) {
+                name[n] = rest[n];
+                n++;
+            }
+            name[n] = '\0';
+            browser_select_name(name);
+        }
+        return;
+    }
+}
+
 static void browser_go_up(void) {
-    if (!strcmp(browser_path, "0:/")) return;
+    if (!strcmp(browser_path, "0:/") ||
+        (browser_path[1] == ':' && !strcmp(browser_path + 2, "/")))
+        return;
     char previous[SYSCALL_DIRENT_NAME_SIZE];
     const char* name = path_name(browser_path);
     size_t name_length = strlen(name);
@@ -2296,8 +2589,7 @@ static void browser_go_up(void) {
     char parent[BROWSER_PATH_SIZE];
     if (!path_parent(parent, sizeof(parent), browser_path))
         strcpy(parent, "0:/");
-    strcpy(browser_path, parent);
-    browser_refresh_directory();
+    browser_open(parent);
     browser_select_name(previous);
 }
 
@@ -2315,8 +2607,123 @@ static void format_count(char* output, uint32_t count, const char* noun) {
     output[used] = '\0';
 }
 
+/* "12 KB", "3.4 MB", "980 B". */
+static void format_size(char* output, uint32_t bytes) {
+    static const char* const units[] = {" B", " KB", " MB", " GB"};
+    uint32_t unit = 0;
+    uint64_t tenths = (uint64_t)bytes * 10u;
+    while (tenths >= 10240u && unit < 3u) {
+        tenths /= 1024u;
+        unit++;
+    }
+    char digits[16];
+    uint32_t n = 0;
+    uint64_t whole = tenths / 10u;
+    do {
+        digits[n++] = (char)('0' + whole % 10u);
+        whole /= 10u;
+    } while (whole);
+    uint32_t used = 0;
+    while (n) output[used++] = digits[--n];
+    if (unit && tenths < 100u) {
+        output[used++] = '.';
+        output[used++] = (char)('0' + tenths % 10u);
+    }
+    strcpy(output + used, units[unit]);
+}
+
 static int32_t browser_tool_x(uint32_t index) {
-    return 8 + (int32_t)index * 36;
+    /* back, forward, up | refresh, new folder */
+    return 8 + (int32_t)index * 34 + (index >= 3u ? 10 : 0);
+}
+
+static bool browser_tool_enabled(uint32_t index) {
+    if (index == 0u) return browser_back_count != 0u;
+    if (index == 1u) return browser_forward_count != 0u;
+    if (index == 2u) return strcmp(browser_path + 1, ":/") != 0;
+    return true;
+}
+
+/* A two-pixel chevron pointing left or right, centred on (cx, cy). */
+static void draw_chevron(int32_t cx, int32_t cy, bool right, uint32_t color) {
+    for (int32_t t = 0; t < 2; t++) {
+        int32_t tip = right ? cx + 3 - t : cx - 3 + t;
+        int32_t tail = right ? cx - 3 - t : cx + 3 + t;
+        draw_wallpaper_line(tail, cy - 6, tip, cy, color);
+        draw_wallpaper_line(tip, cy, tail, cy + 6, color);
+    }
+}
+
+/* Column positions for a list area [left, right). Hidden columns get 0. */
+typedef struct {
+    int32_t name, kind, size, changed, right;
+} browser_columns_t;
+
+static browser_columns_t browser_columns(void) {
+    browser_columns_t c;
+    bool scrollable = browser_view_count >
+                      browser_visible_rows(browser_height);
+    c.right = (int32_t)browser_width - (scrollable ? 18 : 8);
+    c.name = browser_sidebar_width() + 8;
+    int32_t room = c.right - c.name;
+    int32_t x = c.right;
+    c.changed = room >= 620 ? (x -= 132) : 0;
+    c.size = room >= 360 ? (x -= 78) : 0;
+    c.kind = room >= 470 ? (x -= 104) : 0;
+    return c;
+}
+
+/* Lays out the clickable path in the toolbar, last folders first. */
+static void browser_layout_crumbs(int32_t field_x, int32_t field_width) {
+    uint32_t starts[BROWSER_MAX_CRUMBS], lengths[BROWSER_MAX_CRUMBS];
+    uint32_t count = 0;
+    size_t length = strlen(browser_path);
+    /* "0:" is the first crumb, then every folder name. */
+    uint32_t i = 0;
+    while (i < length && count < BROWSER_MAX_CRUMBS) {
+        uint32_t start = i;
+        while (i < length && browser_path[i] != '/') i++;
+        if (i > start) {
+            starts[count] = start;
+            lengths[count] = i - start;
+            count++;
+        }
+        i++;
+    }
+    browser_crumb_count = 0;
+    int32_t x = field_x + 30;
+    int32_t limit = field_x + field_width - 8;
+    /* Drop leading crumbs until the rest fits. */
+    uint32_t first = 0;
+    for (;;) {
+        int32_t total = 0;
+        for (uint32_t c = first; c < count; c++) {
+            char name[SYSCALL_DIRENT_NAME_SIZE];
+            uint32_t n = lengths[c] < sizeof(name) - 1u ? lengths[c]
+                                                        : sizeof(name) - 1u;
+            memcpy(name, browser_path + starts[c], n);
+            name[n] = '\0';
+            total += (int32_t)moswm_text_width(name, 1u) + 22;
+        }
+        if (x + total <= limit || first + 1u >= count) break;
+        first++;
+    }
+    if (first) x += 18;                     /* room for "..." */
+    for (uint32_t c = first; c < count; c++) {
+        char name[SYSCALL_DIRENT_NAME_SIZE];
+        uint32_t n = lengths[c] < sizeof(name) - 1u ? lengths[c]
+                                                    : sizeof(name) - 1u;
+        memcpy(name, browser_path + starts[c], n);
+        name[n] = '\0';
+        int32_t w = (int32_t)moswm_text_width(name, 1u) + 12;
+        if (x + w > limit) w = limit - x;
+        if (w < 16) break;
+        uint32_t k = browser_crumb_count++;
+        browser_crumb_x[k] = x;
+        browser_crumb_w[k] = w;
+        browser_crumb_len[k] = starts[c] + lengths[c];
+        x += w + 10;
+    }
 }
 
 /* Repaints the Files window only when something it shows has changed. */
@@ -2341,8 +2748,7 @@ static void browser_render(void) {
         browser_height = info.height;
     }
     uint32_t visible_rows = browser_visible_rows(browser_height);
-    uint32_t max_scroll = browser_entry_count > visible_rows
-        ? browser_entry_count - visible_rows : 0u;
+    uint32_t max_scroll = browser_max_scroll();
     if (browser_scroll > max_scroll) browser_scroll = max_scroll;
 
     uint64_t signature = 0xCBF29CE484222325ull;
@@ -2353,6 +2759,10 @@ static void browser_render(void) {
                                     browser_scroll);
     signature = hash_u64(signature, ((uint64_t)browser_hover << 32) |
                                     browser_tool_hover);
+    signature = hash_u64(signature, ((uint64_t)browser_place_hover << 32) |
+                                    browser_crumb_hover);
+    signature = hash_u64(signature, ((uint64_t)browser_column_hover << 32) |
+                                    (browser_focused() ? 1u : 0u));
     signature = hash_u64(signature, accent_color);
     signature = hash_text(signature, clipboard_path);
     if (signature == browser_drawn_signature) return;
@@ -2367,103 +2777,246 @@ static void browser_render(void) {
     int32_t width = (int32_t)browser_width;
     int32_t height = (int32_t)browser_height;
     uint32_t accent = 0xFF000000u | (accent_color & 0x00FFFFFFu);
-    fill_rect(0, 0, width, height, 0xFFF7F9FAu);
+    uint32_t accent_soft = 0x30000000u | (accent & 0x00FFFFFFu);
+    fill_rect(0, 0, width, height, 0xFFFBFCFDu);
 
-    /* Toolbar: icon buttons and the current location. */
-    fill_rect(0, 0, width, (int32_t)BROWSER_HEADER_HEIGHT, 0xFFE9EDF0u);
-    fill_rect(0, (int32_t)BROWSER_HEADER_HEIGHT - 1, width, 1, 0xFFD2D9DEu);
-    static const moswm_file_icon_t tools[BROWSER_TOOL_COUNT] = {
-        MOSWM_ICON_HOME, MOSWM_ICON_COMPUTER, MOSWM_ICON_UP,
-        MOSWM_ICON_REFRESH, MOSWM_ICON_NEWFOLDER
-    };
+    /* Toolbar: navigation buttons and the clickable path. */
+    fill_rect(0, 0, width, (int32_t)BROWSER_HEADER_HEIGHT, 0xFFEEF2F5u);
+    fill_rect(0, (int32_t)BROWSER_HEADER_HEIGHT - 1, width, 1, 0xFFD5DCE1u);
     for (uint32_t i = 0; i < BROWSER_TOOL_COUNT; i++) {
         int32_t x = browser_tool_x(i);
-        if (browser_tool_hover == i)
-            fill_rounded_rect(x, 9, 32, 32, 6, 0xFFD4E4EFu);
-        moswm_draw_file_icon_sized(browser_pixels, browser_width,
-            browser_height, x + 5, 14, tools[i], 22u);
+        bool enabled = browser_tool_enabled(i);
+        if (browser_tool_hover == i && enabled)
+            fill_rounded_rect(x, 9, 32, 32, 6, 0xFFD9E5EEu);
+        if (i < 2u) {
+            draw_chevron(x + 16, 25, i == 1u,
+                         enabled ? 0xFF3A4A55u : 0xFFB9C3CAu);
+        } else {
+            static const moswm_file_icon_t icons[3] = {
+                MOSWM_ICON_UP, MOSWM_ICON_REFRESH, MOSWM_ICON_NEWFOLDER
+            };
+            moswm_draw_file_icon_sized(browser_pixels, browser_width,
+                browser_height, x + 5, 14, icons[i - 2u], 22u);
+            if (!enabled)
+                fill_rect(x + 4, 13, 24, 24, 0xB0EEF2F5u);
+        }
     }
-    int32_t field_x = browser_tool_x(BROWSER_TOOL_COUNT) + 6;
+    fill_rect(browser_tool_x(3) - 7, 15, 1, 20, 0xFFD0D8DEu);
+    int32_t field_x = browser_tool_x(BROWSER_TOOL_COUNT) + 4;
     int32_t field_width = width - field_x - 10;
+    browser_crumb_count = 0;
     if (field_width > 60) {
-        fill_rounded_rect(field_x, 10, field_width, 30, 6, 0xFFC9D3DAu);
-        fill_rounded_rect(field_x + 1, 11, field_width - 2, 28, 5,
+        fill_rounded_rect(field_x, 10, field_width, 30, 7, 0xFFCDD6DCu);
+        fill_rounded_rect(field_x + 1, 11, field_width - 2, 28, 6,
                           0xFFFFFFFFu);
         moswm_draw_file_icon_sized(browser_pixels, browser_width,
             browser_height, field_x + 8, 16, MOSWM_ICON_FOLDER, 18u);
-        char shown[BROWSER_PATH_SIZE];
-        fit_text_px(shown, sizeof(shown), browser_path, field_width - 46, 1u);
-        wm_text(field_x + 34, 21, shown, 0xFF34434Cu, 0, 1u);
+        browser_layout_crumbs(field_x, field_width);
+        if (browser_crumb_count && browser_crumb_x[0] > field_x + 34)
+            wm_text(field_x + 32, 21, "...", 0xFF7A8A95u, 0, 1u);
+        for (uint32_t c = 0; c < browser_crumb_count; c++) {
+            int32_t x = browser_crumb_x[c];
+            bool last = c + 1u == browser_crumb_count;
+            if (browser_crumb_hover == c)
+                fill_rounded_rect(x, 14, browser_crumb_w[c], 22, 5,
+                                  0xFFE3ECF2u);
+            char name[SYSCALL_DIRENT_NAME_SIZE];
+            uint32_t end = browser_crumb_len[c];
+            uint32_t start = end;
+            while (start > 0 && browser_path[start - 1u] != '/') start--;
+            uint32_t n = end - start < sizeof(name) - 1u
+                ? end - start : (uint32_t)sizeof(name) - 1u;
+            memcpy(name, browser_path + start, n);
+            name[n] = '\0';
+            char shown[SYSCALL_DIRENT_NAME_SIZE];
+            fit_text_px(shown, sizeof(shown), name, browser_crumb_w[c] - 10,
+                        1u);
+            wm_text(x + 6, 21, shown, last ? 0xFF1E2C35u : 0xFF51626Du, 0,
+                    1u);
+            if (!last)
+                wm_text(x + browser_crumb_w[c] + 1, 21, "/", 0xFFA4B1BAu,
+                        0, 1u);
+        }
+    }
+
+    /* Places. */
+    int32_t sidebar = browser_sidebar_width();
+    int32_t footer_y = height - (int32_t)BROWSER_FOOTER_HEIGHT;
+    if (sidebar) {
+        fill_rect(0, (int32_t)BROWSER_HEADER_HEIGHT, sidebar,
+                  footer_y - (int32_t)BROWSER_HEADER_HEIGHT, 0xFFF1F4F6u);
+        fill_rect(sidebar - 1, (int32_t)BROWSER_HEADER_HEIGHT, 1,
+                  footer_y - (int32_t)BROWSER_HEADER_HEIGHT, 0xFFDDE3E7u);
+        int32_t y = (int32_t)BROWSER_HEADER_HEIGHT + 10;
+        wm_text(14, y, "PLACES", 0xFF8796A0u, 0, 1u);
+        y += 20;
+        for (uint32_t i = 0; i < browser_place_count; i++) {
+            const browser_place_t* place = &browser_places[i];
+            if (place->section_before) {
+                y += 8;
+                wm_text(14, y, "DRIVES", 0xFF8796A0u, 0, 1u);
+                y += 20;
+            }
+            if (y + 26 > footer_y) break;
+            bool here = !strcmp(place->path, browser_path);
+            if (here) {
+                fill_rounded_rect(6, y, sidebar - 12, 26, 6, accent_soft);
+                fill_rect(6, y + 6, 3, 14, accent);
+            } else if (browser_place_hover == i) {
+                fill_rounded_rect(6, y, sidebar - 12, 26, 6, 0xFFE2E9EEu);
+            }
+            moswm_draw_file_icon_sized(browser_pixels, browser_width,
+                browser_height, 16, y + 4, place->icon, 18u);
+            char label[32];
+            fit_text_px(label, sizeof(label), place->label, sidebar - 54, 1u);
+            wm_text(42, y + 6, label, here ? 0xFF15232Bu : 0xFF3A4A55u, 0,
+                    1u);
+            y += 28;
+        }
+    }
+
+    /* Column header. */
+    browser_columns_t col = browser_columns();
+    int32_t header_y = (int32_t)BROWSER_HEADER_HEIGHT;
+    fill_rect(sidebar, header_y + (int32_t)BROWSER_COLUMNS_HEIGHT - 1,
+              width - sidebar, 1, 0xFFE4E9EDu);
+    {
+        static const char* const titles[4] = {"Name", "Kind", "Size",
+                                              "Modified"};
+        int32_t xs[4] = {col.name, col.kind, col.size, col.changed};
+        for (uint32_t c = 0; c < 4u; c++) {
+            if (c && !xs[c]) continue;
+            int32_t x = xs[c];
+            if (browser_column_hover == c)
+                fill_rounded_rect(x - 4, header_y + 3,
+                                  (int32_t)moswm_text_width(titles[c], 1u) + 24,
+                                  20, 4, 0xFFEAF0F4u);
+            uint32_t color = browser_sort == c ? 0xFF2B3A44u : 0xFF7A8A95u;
+            wm_text(c ? x : x + 32, header_y + 7, titles[c], color, 0, 1u);
+            if (browser_sort == c) {
+                int32_t ax = (c ? x : x + 32) +
+                             (int32_t)moswm_text_width(titles[c], 1u) + 6;
+                int32_t ay = header_y + 13;
+                for (int32_t k = 0; k < 4; k++) {
+                    int32_t row = browser_sort_descending ? ay + 2 - k
+                                                          : ay - 2 + k;
+                    fill_rect(ax + 3 - k, row, 1 + 2 * k, 1, color);
+                }
+            }
+        }
     }
 
     /* Entries. */
-    bool show_kind = browser_width >= 430u;
-    bool scrollable = browser_entry_count > visible_rows;
-    int32_t list_right = width - (scrollable ? 18 : 8);
+    bool scrollable = browser_view_count > visible_rows;
+    int32_t list_top = browser_list_top();
+    int32_t row_left = sidebar + 6;
     for (uint32_t row = 0; row < visible_rows; row++) {
         uint32_t index = browser_scroll + row;
-        if (index >= browser_entry_count) break;
-        const syscall_dirent_t* entry = &browser_entries[index];
-        int32_t y = (int32_t)BROWSER_HEADER_HEIGHT + 4 +
-                    (int32_t)row * (int32_t)BROWSER_ROW_HEIGHT;
+        if (index >= browser_view_count) break;
+        uint32_t raw = browser_view[index];
+        const syscall_dirent_t* entry = &browser_entries[raw];
+        int32_t y = list_top + 2 + (int32_t)row * (int32_t)BROWSER_ROW_HEIGHT;
         if (browser_selected == index) {
-            fill_rounded_rect(8, y, list_right - 8,
-                              (int32_t)BROWSER_ROW_HEIGHT - 2, 5,
-                              0x38000000u | (accent & 0x00FFFFFFu));
-            fill_rect(8, y + 5, 3, (int32_t)BROWSER_ROW_HEIGHT - 12, accent);
+            fill_rounded_rect(row_left, y, col.right - row_left,
+                              (int32_t)BROWSER_ROW_HEIGHT - 2, 6,
+                              browser_focused() ? accent_soft : 0xFFE4E9EDu);
         } else if (browser_hover == index) {
-            fill_rounded_rect(8, y, list_right - 8,
-                              (int32_t)BROWSER_ROW_HEIGHT - 2, 5,
-                              0xFFE7EDF1u);
+            fill_rounded_rect(row_left, y, col.right - row_left,
+                              (int32_t)BROWSER_ROW_HEIGHT - 2, 6,
+                              0xFFEEF3F6u);
+        } else if (row & 1u) {
+            fill_rect(row_left, y, col.right - row_left,
+                      (int32_t)BROWSER_ROW_HEIGHT - 2, 0xFFF6F8FAu);
         }
         moswm_file_icon_t icon = icon_for_entry(entry->type, entry->name);
         moswm_draw_file_icon_sized(browser_pixels, browser_width,
-            browser_height, 18, y + 3, icon, 20u);
+            browser_height, col.name + 2, y + 3, icon, 20u);
+        int32_t name_right = col.kind ? col.kind : col.size ? col.size
+                           : col.changed ? col.changed : col.right;
         char label[SYSCALL_DIRENT_NAME_SIZE];
         fit_text_px(label, sizeof(label), entry->name,
-                    list_right - 56 - (show_kind ? 110 : 0), 1u);
-        wm_text(48, y + 9, label, 0xFF273640u, 0, 1u);
-        if (show_kind)
-            wm_text(list_right - 104, y + 9,
+                    name_right - col.name - 44, 1u);
+        wm_text(col.name + 32, y + 8, label,
+                entry->hidden ? 0xFF8C9BA5u : 0xFF22313Bu, 0, 1u);
+        if (col.kind)
+            wm_text(col.kind, y + 8,
                     name_has_extension(entry->name, SHORTCUT_EXTENSION)
                         ? "Shortcut" : kind_for_icon(icon),
-                    0xFF7A8A95u, 0, 1u);
+                    0xFF73838Eu, 0, 1u);
+        if (col.size && browser_sizes[raw] != UINT32_MAX) {
+            char size[20];
+            format_size(size, browser_sizes[raw]);
+            wm_text(col.size, y + 8, size, 0xFF73838Eu, 0, 1u);
+        }
+        if (col.changed && browser_changed[raw][0])
+            wm_text(col.changed, y + 8, browser_changed[raw], 0xFF73838Eu, 0,
+                    1u);
     }
-    if (!browser_entry_count && visible_rows)
-        wm_text(20, (int32_t)BROWSER_HEADER_HEIGHT + 18,
-                "This folder is empty", 0xFF7A8A95u, 0, 1u);
+    if (!browser_view_count && visible_rows)
+        wm_text(sidebar + 20, list_top + 18,
+                browser_filter[0] ? "Nothing here matches the filter"
+                                  : "This folder is empty",
+                0xFF7A8A95u, 0, 1u);
     if (scrollable && visible_rows) {
-        int32_t track_y = (int32_t)BROWSER_HEADER_HEIGHT + 6;
-        int32_t track_height = (int32_t)(visible_rows * BROWSER_ROW_HEIGHT) - 8;
+        int32_t track_y = list_top + 4;
+        int32_t track_height = (int32_t)(visible_rows * BROWSER_ROW_HEIGHT) - 6;
         int32_t thumb_height = track_height * (int32_t)visible_rows /
-                               (int32_t)browser_entry_count;
+                               (int32_t)browser_view_count;
         if (thumb_height < 24) thumb_height = 24;
         int32_t thumb_y = track_y + (track_height - thumb_height) *
             (int32_t)browser_scroll / (int32_t)(max_scroll ? max_scroll : 1u);
-        fill_rounded_rect(width - 12, track_y, 6, track_height, 3,
-                          0xFFE3E9EDu);
-        fill_rounded_rect(width - 12, thumb_y, 6, thumb_height, 3,
-                          0xFFA9B8C3u);
+        fill_rounded_rect(width - 13, track_y, 8, track_height, 4,
+                          0xFFE8EDF0u);
+        fill_rounded_rect(width - 13, thumb_y, 8, thumb_height, 4,
+                          browser_scroll_dragging ? 0xFF8798A4u
+                                                  : 0xFFADBBC5u);
     }
 
-    /* Status bar. */
-    int32_t footer_y = height - (int32_t)BROWSER_FOOTER_HEIGHT;
+    /* Status bar: counts, the filter, notes and the selected item's size. */
     fill_rect(0, footer_y, width, (int32_t)BROWSER_FOOTER_HEIGHT,
-              0xFFE9EDF0u);
-    fill_rect(0, footer_y, width, 1, 0xFFD2D9DEu);
+              0xFFEEF2F5u);
+    fill_rect(0, footer_y, width, 1, 0xFFD5DCE1u);
+    char left[96];
+    left[0] = '\0';
     if (browser_message[0]) {
-        wm_text(12, footer_y + 9, browser_message,
-                browser_message_is_error ? 0xFFB43A32u : 0xFF4D5E69u, 0, 1u);
+        strcpy(left, browser_message);
+    } else if (browser_filter[0]) {
+        char count[32];
+        format_count(count, browser_view_count,
+                     browser_view_count == 1u ? "match for \"" : "matches for \"");
+        size_t used = strlen(count);
+        memcpy(left, count, used + 1u);
+        size_t f = strlen(browser_filter);
+        if (used + f + 20u < sizeof(left)) {
+            memcpy(left + used, browser_filter, f);
+            strcpy(left + used + f, "\" - Esc clears");
+        }
     } else {
-        char summary[32];
-        format_count(summary, browser_entry_count,
-                     browser_entry_count == 1u ? "item" : "items");
-        wm_text(12, footer_y + 9, summary, 0xFF667680u, 0, 1u);
+        format_count(left, browser_view_count,
+                     browser_view_count == 1u ? "item" : "items");
+        if (browser_selected < browser_view_count) {
+            uint32_t raw = browser_view[browser_selected];
+            if (browser_sizes[raw] != UINT32_MAX) {
+                char size[20];
+                format_size(size, browser_sizes[raw]);
+                size_t used = strlen(left);
+                strcpy(left + used, ", selected ");
+                strcpy(left + strlen(left), size);
+            }
+        }
     }
-    if (clipboard_path[0] && browser_width >= 430u) {
-        const char* note = "Copied - right-click to paste";
+    wm_text(12, footer_y + 8, left,
+            browser_message[0] && browser_message_is_error ? 0xFFB43A32u
+                                                           : 0xFF56666Fu,
+            0, 1u);
+    if (browser_width >= 470u) {
+        const char* note = clipboard_path[0]
+            ? (browser_clipboard_cut ? "Cut - Ctrl+V moves it here"
+                                     : "Copied - Ctrl+V pastes")
+            : browser_show_hidden ? "Showing hidden files (Ctrl+H)"
+                                  : "Type to filter";
         wm_text(width - 12 - (int32_t)moswm_text_width(note, 1u),
-                footer_y + 9, note, 0xFF7A8A95u, 0, 1u);
+                footer_y + 8, note, 0xFF8796A0u, 0, 1u);
     }
 
     canvas = screen_canvas;
@@ -2497,24 +3050,102 @@ static void open_dialog(dialog_kind_t kind, const char* path,
 }
 
 static uint32_t browser_tool_at(int32_t x, int32_t y) {
-    if (y < 9 || y >= 41 || x < 8) return UINT32_MAX;
-    uint32_t index = (uint32_t)(x - 8) / 36u;
-    if (index >= BROWSER_TOOL_COUNT || x >= browser_tool_x(index) + 32)
+    if (y < 9 || y >= 41) return UINT32_MAX;
+    for (uint32_t i = 0; i < BROWSER_TOOL_COUNT; i++)
+        if (x >= browser_tool_x(i) && x < browser_tool_x(i) + 32)
+            return i;
+    return UINT32_MAX;
+}
+
+static uint32_t browser_crumb_at(int32_t x, int32_t y) {
+    if (y < 12 || y >= 38) return UINT32_MAX;
+    for (uint32_t c = 0; c < browser_crumb_count; c++)
+        if (x >= browser_crumb_x[c] && x < browser_crumb_x[c] + browser_crumb_w[c])
+            return c;
+    return UINT32_MAX;
+}
+
+static uint32_t browser_place_at(int32_t x, int32_t y) {
+    int32_t sidebar = browser_sidebar_width();
+    if (!sidebar || x < 6 || x >= sidebar - 6) return UINT32_MAX;
+    int32_t py = (int32_t)BROWSER_HEADER_HEIGHT + 30;
+    for (uint32_t i = 0; i < browser_place_count; i++) {
+        if (browser_places[i].section_before) py += 28;
+        if (y >= py && y < py + 26) return i;
+        py += 28;
+    }
+    return UINT32_MAX;
+}
+
+static uint32_t browser_column_at(int32_t x, int32_t y) {
+    int32_t top = (int32_t)BROWSER_HEADER_HEIGHT;
+    if (y < top || y >= top + (int32_t)BROWSER_COLUMNS_HEIGHT ||
+        x < browser_sidebar_width())
         return UINT32_MAX;
-    return index;
+    browser_columns_t col = browser_columns();
+    if (col.changed && x >= col.changed - 4) return BROWSER_SORT_MODIFIED;
+    if (col.size && x >= col.size - 4) return BROWSER_SORT_SIZE;
+    if (col.kind && x >= col.kind - 4) return BROWSER_SORT_KIND;
+    return BROWSER_SORT_NAME;
+}
+
+static bool browser_on_scrollbar(int32_t x, int32_t y) {
+    uint32_t rows = browser_visible_rows(browser_height);
+    return browser_view_count > rows && x >= (int32_t)browser_width - 16 &&
+           y >= browser_list_top() &&
+           y < browser_list_top() + (int32_t)(rows * BROWSER_ROW_HEIGHT);
+}
+
+/* Moves the scrollbar thumb so its grab point is under y. */
+static void browser_scroll_to_y(int32_t y) {
+    uint32_t rows = browser_visible_rows(browser_height);
+    uint32_t max_scroll = browser_max_scroll();
+    if (!rows || !max_scroll) return;
+    int32_t track_height = (int32_t)(rows * BROWSER_ROW_HEIGHT) - 6;
+    int32_t thumb_height = track_height * (int32_t)rows /
+                           (int32_t)browser_view_count;
+    if (thumb_height < 24) thumb_height = 24;
+    int32_t travel = track_height - thumb_height;
+    if (travel <= 0) return;
+    int32_t at = y - (browser_list_top() + 4) - browser_scroll_grab;
+    if (at < 0) at = 0;
+    if (at > travel) at = travel;
+    uint32_t next = (uint32_t)(((int64_t)at * max_scroll + travel / 2) / travel);
+    if (next != browser_scroll) {
+        browser_scroll = next;
+        browser_generation++;
+    }
 }
 
 /* Row under a point in Files content coordinates, or UINT32_MAX. */
 static uint32_t browser_row_at(int32_t x, int32_t y) {
-    (void)x;
-    int32_t top = (int32_t)BROWSER_HEADER_HEIGHT + 4;
-    if (y < top) return UINT32_MAX;
+    int32_t top = browser_list_top() + 2;
+    if (y < top || x < browser_sidebar_width() ||
+        x >= (int32_t)browser_width - 16)
+        return UINT32_MAX;
     uint32_t row = (uint32_t)(y - top) / BROWSER_ROW_HEIGHT;
     uint32_t index = browser_scroll + row;
     if (row >= browser_visible_rows(browser_height) ||
-        index >= browser_entry_count)
+        index >= browser_view_count)
         return UINT32_MAX;
     return index;
+}
+
+static bool browser_selected_path(char* output, size_t capacity) {
+    return browser_selected < browser_view_count &&
+           path_join(output, capacity, browser_path,
+                     browser_entry(browser_selected)->name);
+}
+
+static void browser_set_sort(uint32_t column) {
+    if (browser_sort == column) browser_sort_descending = !browser_sort_descending;
+    else {
+        browser_sort = column;
+        browser_sort_descending = column == BROWSER_SORT_SIZE ||
+                                  column == BROWSER_SORT_MODIFIED;
+    }
+    browser_rebuild_view();
+    browser_reveal_selected();
 }
 
 static void browser_mouse_down(int32_t x, int32_t y,
@@ -2522,15 +3153,56 @@ static void browser_mouse_down(int32_t x, int32_t y,
     (void)info;
     if (y < (int32_t)BROWSER_HEADER_HEIGHT) {
         last_click_valid = false;
+        uint32_t crumb = browser_crumb_at(x, y);
+        if (crumb != UINT32_MAX) {
+            char target[BROWSER_PATH_SIZE];
+            uint32_t n = browser_crumb_len[crumb];
+            memcpy(target, browser_path, n);
+            target[n] = '\0';
+            if (n == 2u) strcpy(target + 2, "/");    /* "0:" -> "0:/" */
+            browser_open(target);
+            return;
+        }
         uint32_t tool = browser_tool_at(x, y);
-        if (tool == 0u) browser_open(user_home);
-        else if (tool == 1u) browser_open("0:/");
+        if (tool == UINT32_MAX || !browser_tool_enabled(tool)) return;
+        if (tool == 0u) browser_history_go(false);
+        else if (tool == 1u) browser_history_go(true);
         else if (tool == 2u) browser_go_up();
         else if (tool == 3u) browser_refresh_directory();
         else if (tool == 4u)
             open_dialog(DIALOG_NEW_FOLDER, browser_path, "New folder");
         return;
     }
+    uint32_t place = browser_place_at(x, y);
+    if (place != UINT32_MAX) {
+        last_click_valid = false;
+        browser_open(browser_places[place].path);
+        return;
+    }
+    uint32_t column = browser_column_at(x, y);
+    if (column != UINT32_MAX) {
+        last_click_valid = false;
+        browser_set_sort(column);
+        return;
+    }
+    if (browser_on_scrollbar(x, y)) {
+        last_click_valid = false;
+        uint32_t rows = browser_visible_rows(browser_height);
+        int32_t track_height = (int32_t)(rows * BROWSER_ROW_HEIGHT) - 6;
+        int32_t thumb_height = track_height * (int32_t)rows /
+                               (int32_t)browser_view_count;
+        if (thumb_height < 24) thumb_height = 24;
+        uint32_t max_scroll = browser_max_scroll();
+        int32_t thumb_y = browser_list_top() + 4 +
+            (track_height - thumb_height) * (int32_t)browser_scroll /
+            (int32_t)(max_scroll ? max_scroll : 1u);
+        browser_scroll_grab = y >= thumb_y && y < thumb_y + thumb_height
+            ? y - thumb_y : thumb_height / 2;
+        browser_scroll_dragging = true;
+        browser_scroll_to_y(y);
+        return;
+    }
+    if (x < browser_sidebar_width()) return;
     uint32_t index = browser_row_at(x, y);
     if (index == UINT32_MAX) {
         if (browser_selected != UINT32_MAX) browser_generation++;
@@ -2542,7 +3214,7 @@ static void browser_mouse_down(int32_t x, int32_t y,
     browser_generation++;
     char entry_path[BROWSER_PATH_SIZE];
     if (!path_join(entry_path, sizeof(entry_path), browser_path,
-                   browser_entries[index].name)) {
+                   browser_entry(index)->name)) {
         browser_note("Folder path is too long", true);
         return;
     }
@@ -2558,6 +3230,34 @@ static bool is_text_name(const char* name) {
     };
     for (uint32_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++)
         if (name_has_extension(name, extensions[i])) return true;
+    return false;
+}
+
+/* Source files, which open in Code when it is installed. */
+static bool is_code_name(const char* name) {
+    static const char* const extensions[] = {
+        ".c", ".h", ".cpp", ".hpp", ".cc", ".py", ".sh", ".lua", ".js",
+        ".json", ".mk", ".s", ".asm", ".ld", ".fgsl", ".glsl", ".rs",
+        ".java", ".css", ".html"
+    };
+    for (uint32_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++)
+        if (name_has_extension(name, extensions[i])) return true;
+    const char* base = path_name(name);
+    return !strcmp(base, "Makefile") || !strcmp(base, "makefile");
+}
+
+/* Starts an installed program with one path argument. */
+static bool run_with_path(const char* program, const char* path,
+                          const char* what) {
+    const char* arguments[1] = {path};
+    if ((int64_t)mos_syscall3(SYS_EXEC, (uint64_t)(uintptr_t)program,
+            (uint64_t)(uintptr_t)arguments, 1u) >= 0)
+        return true;
+    char message[64] = "Unable to open ";
+    size_t used = strlen(message);
+    size_t n = strlen(what);
+    if (used + n < sizeof(message)) memcpy(message + used, what, n + 1u);
+    browser_note(message, true);
     return false;
 }
 
@@ -2629,6 +3329,11 @@ static void open_file(const char* path, bool executable, bool in_files) {
                 (uint64_t)(uintptr_t)MOSDESK_PLAYER_PATH,
                 (uint64_t)(uintptr_t)arguments, 1u) < 0)
             open_note(in_files, "Unable to open the audio player", true);
+        return;
+    }
+    if (is_code_name(name) && fs_exists(MOSDESK_CODE_PATH)) {
+        if (!run_with_path(MOSDESK_CODE_PATH, path, "Code") && !in_files)
+            strcpy(status_message, "Unable to open Code");
         return;
     }
     if (is_text_name(name) && fs_exists(MOSDESK_EDITOR_PATH)) {
@@ -5892,10 +6597,19 @@ static void menu_show_for_item(click_action_t target, const char* path) {
         user_desktop[0])
         menu_add(MENU_ACTION_ADD_TO_DESKTOP, "Add to desktop",
                  MOSWM_ICON_DESKTOP, false, true);
+    bool folder = fs_is_directory(path);
+    if ((folder || is_code_name(path) || is_text_name(path)) &&
+        fs_exists(MOSDESK_CODE_PATH))
+        menu_add(MENU_ACTION_OPEN_CODE, "Open in Code", MOSWM_ICON_CODE,
+                 false, true);
+    if (folder && fs_exists(MOSDESK_TERMINAL_PATH))
+        menu_add(MENU_ACTION_TERMINAL_HERE, "Open in Terminal",
+                 MOSWM_ICON_TERMINAL, false, true);
     if (target == CLICK_ACTION_APPLICATION ||
         target == CLICK_ACTION_BROWSER_ENTRY ||
         target == CLICK_ACTION_DESKTOP_FILE) {
-        menu_add(MENU_ACTION_COPY, "Copy", MOSWM_ICON_COPY, true, true);
+        menu_add(MENU_ACTION_CUT, "Cut", MOSWM_ICON_PASTE, true, editable);
+        menu_add(MENU_ACTION_COPY, "Copy", MOSWM_ICON_COPY, false, true);
         menu_add(MENU_ACTION_COPY_TO, "Copy to...", MOSWM_ICON_COPY, false,
                  true);
         menu_add(MENU_ACTION_MOVE_TO, "Move to...", MOSWM_ICON_FOLDER, false,
@@ -5916,6 +6630,15 @@ static void menu_show_for_folder(const char* directory) {
     menu_add(MENU_ACTION_NEW_FOLDER, "New folder", MOSWM_ICON_NEWFOLDER,
              false, true);
     menu_add(MENU_ACTION_REFRESH, "Refresh", MOSWM_ICON_REFRESH, true, true);
+    if (fs_exists(MOSDESK_TERMINAL_PATH))
+        menu_add(MENU_ACTION_TERMINAL_HERE, "Open in Terminal",
+                 MOSWM_ICON_TERMINAL, false, true);
+    if (fs_exists(MOSDESK_CODE_PATH))
+        menu_add(MENU_ACTION_OPEN_CODE, "Open folder in Code",
+                 MOSWM_ICON_CODE, false, true);
+    menu_add(MENU_ACTION_TOGGLE_HIDDEN,
+             browser_show_hidden ? "Hide hidden files" : "Show hidden files",
+             MOSWM_ICON_INFO, true, true);
     menu_show(CLICK_ACTION_NONE, directory);
 }
 
@@ -6617,6 +7340,27 @@ static void paste_into(const char* directory) {
         browser_note("The copied item no longer exists", true);
     } else if (path_has_prefix(directory, clipboard_path)) {
         browser_note("A folder cannot be pasted into itself", true);
+    } else if (browser_clipboard_cut) {
+        char parent[BROWSER_PATH_SIZE];
+        if (!path_parent(parent, sizeof(parent), clipboard_path))
+            parent[0] = '\0';
+        if (!strcmp(parent, directory)) {
+            browser_note("It is already in this folder", false);
+        } else if (path_is_protected(clipboard_path)) {
+            browser_note("This item cannot be moved", true);
+        } else if (!path_join(target, sizeof(target), directory, name) ||
+                   fs_exists(target)) {
+            browser_note("That name is already used here", true);
+        } else if (!fs_rename(clipboard_path, target)) {
+            browser_note("Unable to move the item here", true);
+        } else {
+            /* parent still names the folder it came from. */
+            clipboard_path[0] = '\0';
+            browser_clipboard_cut = false;
+            if (parent[0]) after_file_change(parent, NULL);
+            after_file_change(directory, path_name(target));
+            browser_note("Moved", false);
+        }
     } else if (!unique_copy_path(target, sizeof(target), directory, name)) {
         browser_note("Unable to choose a name for the copy", true);
     } else if (!fs_copy_tree(clipboard_path, target, 0)) {
@@ -6632,7 +7376,8 @@ static void run_menu_action(menu_action_t action) {
     char parent[BROWSER_PATH_SIZE];
     switch (action) {
         case MENU_ACTION_OPEN:
-            open_path(menu_target, menu_path);
+            if (menu_target == CLICK_ACTION_NONE) open_file(menu_path, false, true);
+            else open_path(menu_target, menu_path);
             break;
         case MENU_ACTION_SHOW_IN_FILES:
             if (path_parent(parent, sizeof(parent), menu_path)) {
@@ -6645,7 +7390,23 @@ static void run_menu_action(menu_action_t action) {
             break;
         case MENU_ACTION_COPY:
             strcpy(clipboard_path, menu_path);
+            browser_clipboard_cut = false;
             browser_note("Copied", false);
+            break;
+        case MENU_ACTION_CUT:
+            strcpy(clipboard_path, menu_path);
+            browser_clipboard_cut = true;
+            browser_note("Cut - paste it where it should go", false);
+            break;
+        case MENU_ACTION_OPEN_CODE:
+            run_with_path(MOSDESK_CODE_PATH, menu_path, "Code");
+            break;
+        case MENU_ACTION_TERMINAL_HERE:
+            run_with_path(MOSDESK_TERMINAL_PATH, menu_path, "Terminal");
+            break;
+        case MENU_ACTION_TOGGLE_HIDDEN:
+            browser_show_hidden = !browser_show_hidden;
+            browser_rebuild_view();
             break;
         case MENU_ACTION_PASTE:
             paste_into(menu_path);
@@ -6697,6 +7458,142 @@ static void run_menu_action(menu_action_t action) {
         default:
             break;
     }
+}
+
+/* Keys while Files has the focus (held keys repeat). */
+static void browser_key(uint8_t key, uint8_t mods) {
+    bool ctrl = (mods & SYSCALL_INPUT_MOD_CTRL) != 0;
+    bool alt = (mods & SYSCALL_INPUT_MOD_ALT) != 0;
+    bool shift = (mods & SYSCALL_INPUT_MOD_SHIFT) != 0;
+    uint32_t rows = browser_visible_rows(browser_height);
+    uint32_t page = rows > 1u ? rows - 1u : 1u;
+    char path[BROWSER_PATH_SIZE];
+    bool have = browser_selected_path(path, sizeof(path));
+    if (key != 0x3Fu) browser_message[0] = '\0';
+    if (alt) {
+        if (key == 80u) browser_history_go(false);          /* Left */
+        else if (key == 79u) browser_history_go(true);      /* Right */
+        else if (key == 82u) browser_go_up();               /* Up */
+        return;
+    }
+    if (ctrl) {
+        switch (key) {
+            case 6u:                                        /* C */
+            case 27u:                                       /* X */
+                if (!have) return;
+                if (key == 27u && path_is_protected(path)) {
+                    browser_note("This item cannot be moved", true);
+                    return;
+                }
+                strcpy(clipboard_path, path);
+                browser_clipboard_cut = key == 27u;
+                browser_note(key == 27u ? "Cut - paste it where it should go"
+                                        : "Copied", false);
+                return;
+            case 25u: paste_into(browser_path); return;     /* V */
+            case 17u:                                       /* N */
+                open_dialog(DIALOG_NEW_FOLDER, browser_path, "New folder");
+                return;
+            case 11u:                                       /* H */
+                browser_show_hidden = !browser_show_hidden;
+                browser_rebuild_view();
+                return;
+            case 21u: browser_refresh_directory(); return;  /* R */
+            case 23u:                                       /* T */
+                if (fs_exists(MOSDESK_TERMINAL_PATH))
+                    run_with_path(MOSDESK_TERMINAL_PATH, browser_path,
+                                  "Terminal");
+                return;
+            case 8u:                                        /* E: Code */
+                if (fs_exists(MOSDESK_CODE_PATH))
+                    run_with_path(MOSDESK_CODE_PATH,
+                                  have ? path : browser_path, "Code");
+                return;
+            case 26u: browser_close(); return;              /* W */
+            case 4u:                                        /* A: first */
+                if (browser_view_count) browser_selected = 0;
+                browser_reveal_selected();
+                return;
+            default: return;
+        }
+    }
+    uint32_t count = browser_view_count;
+    uint32_t sel = browser_selected;
+    switch (key) {
+        case 81u:                                           /* Down */
+            browser_selected = sel == UINT32_MAX ? 0u
+                : sel + 1u < count ? sel + 1u : sel;
+            break;
+        case 82u:                                           /* Up */
+            browser_selected = sel == UINT32_MAX ? (count ? count - 1u : 0u)
+                : sel ? sel - 1u : 0u;
+            break;
+        case 78u:                                           /* PgDn */
+            browser_selected = sel == UINT32_MAX ? 0u
+                : sel + page < count ? sel + page : (count ? count - 1u : 0u);
+            break;
+        case 75u:                                           /* PgUp */
+            browser_selected = sel == UINT32_MAX || sel < page ? 0u
+                                                               : sel - page;
+            break;
+        case 74u: browser_selected = 0u; break;             /* Home */
+        case 77u: browser_selected = count ? count - 1u : 0u; break;
+        case 40u: case 88u:                                 /* Enter */
+            if (have) {
+                bool executable = browser_entry(sel)->type ==
+                                  SYSCALL_DIRENT_TYPE_EXECUTABLE;
+                open_file(path, executable, true);
+            }
+            return;
+        case 42u:                                           /* Backspace */
+            if (browser_filter[0]) {
+                browser_filter[strlen(browser_filter) - 1u] = '\0';
+                browser_rebuild_view();
+                browser_reveal_selected();
+            } else {
+                browser_go_up();
+            }
+            return;
+        case 41u:                                           /* Esc */
+            if (browser_filter[0]) {
+                browser_filter[0] = '\0';
+                browser_rebuild_view();
+                browser_reveal_selected();
+            } else {
+                browser_selected = UINT32_MAX;
+                browser_generation++;
+            }
+            return;
+        case 0x3Bu:                                         /* F2 */
+            if (have && !path_is_protected(path))
+                open_dialog(DIALOG_RENAME, path, path_name(path));
+            return;
+        case 76u:                                           /* Delete */
+            if (have && !path_is_protected(path))
+                open_dialog(DIALOG_DELETE, path, "");
+            return;
+        case 0x3Eu: browser_refresh_directory(); return;    /* F5 */
+        default: {
+            /* Anything that types a character filters the list. */
+            char c = (char)mos_syscall3(SYS_USB, SYS_USB_KEY_TO_ASCII, key,
+                                        mosdesk_usb_modifiers(mods));
+            (void)shift;
+            size_t n = strlen(browser_filter);
+            if (c > 32 && c < 127 && n + 1u < sizeof(browser_filter)) {
+                browser_filter[n] = c;
+                browser_filter[n + 1u] = '\0';
+                browser_rebuild_view();
+                browser_reveal_selected();
+            } else if (c == ' ' && n && n + 1u < sizeof(browser_filter)) {
+                browser_filter[n] = ' ';
+                browser_filter[n + 1u] = '\0';
+                browser_rebuild_view();
+            }
+            return;
+        }
+    }
+    if (!count) browser_selected = UINT32_MAX;
+    browser_reveal_selected();
 }
 
 static void auth_dialog_bounds(int32_t* x, int32_t* y,
@@ -8919,15 +9816,22 @@ static void on_right_down(syscall_window_info_t* windows, uint64_t count) {
         if (info->id != browser_window_id) return;
         int32_t x = cursor_x - (int32_t)info->x - 1;
         int32_t y = cursor_y - (int32_t)info->y - (int32_t)TITLE_HEIGHT - 1;
-        if (y < (int32_t)BROWSER_HEADER_HEIGHT ||
+        if (y < browser_list_top() ||
             y >= (int32_t)browser_height - (int32_t)BROWSER_FOOTER_HEIGHT)
             return;
+        uint32_t place = browser_place_at(x, y);
+        if (place != UINT32_MAX) {
+            menu_show_for_item(CLICK_ACTION_NONE,
+                               browser_places[place].path);
+            return;
+        }
+        if (x < browser_sidebar_width()) return;
         uint32_t index = browser_row_at(x, y);
         char entry_path[BROWSER_PATH_SIZE];
         if (index == UINT32_MAX) {
             menu_show_for_folder(browser_path);
         } else if (path_join(entry_path, sizeof(entry_path), browser_path,
-                             browser_entries[index].name)) {
+                             browser_entry(index)->name)) {
             browser_selected = index;
             browser_generation++;
             menu_show_for_item(CLICK_ACTION_BROWSER_ENTRY, entry_path);
@@ -9016,6 +9920,16 @@ static void update_hover_state(syscall_window_info_t* windows,
     menu_hover = UINT32_MAX;
     browser_hover = UINT32_MAX;
     browser_tool_hover = UINT32_MAX;
+    browser_place_hover = UINT32_MAX;
+    browser_crumb_hover = UINT32_MAX;
+    browser_column_hover = UINT32_MAX;
+    if (browser_scroll_dragging && browser_window_id) {
+        syscall_window_info_t info;
+        if (mos_window_get_info(browser_window_id, &info) == SYS_SUCCESS)
+            browser_scroll_to_y(cursor_y - (int32_t)info.y -
+                                (int32_t)TITLE_HEIGHT - 1);
+        return;
+    }
     caption_hover_button = 0;
     caption_hover_window = 0;
     if (auth_state == AUTH_NONE && dialog_kind == DIALOG_PICK_FOLDER)
@@ -9065,6 +9979,9 @@ static void update_hover_state(syscall_window_info_t* windows,
     int32_t y = cursor_y - (int32_t)info->y - (int32_t)TITLE_HEIGHT - 1;
     if (y < 0) return;
     browser_tool_hover = browser_tool_at(x, y);
+    browser_crumb_hover = browser_crumb_at(x, y);
+    browser_place_hover = browser_place_at(x, y);
+    browser_column_hover = browser_column_at(x, y);
     if (y < (int32_t)browser_height - (int32_t)BROWSER_FOOTER_HEIGHT)
         browser_hover = browser_row_at(x, y);
 }
@@ -9072,6 +9989,10 @@ static void update_hover_state(syscall_window_info_t* windows,
 static void on_mouse_up(syscall_window_info_t* windows, uint64_t count,
                         uint32_t time_ms) {
     launcher_dragging = false;
+    if (browser_scroll_dragging) {
+        browser_scroll_dragging = false;
+        browser_generation++;
+    }
     if (sound_dragging) {
         sound_dragging = false;
         sound_save();
@@ -9218,6 +10139,29 @@ static bool route_locked_mouse(const syscall_input_event_t* input,
     return false;
 }
 
+/* Gives a key to the focused window: Files is drawn by mosWM itself, every
+ * other window gets a window event. */
+static void deliver_key(uint8_t key, bool down, uint8_t mods,
+                        uint32_t time_ms, bool repeat) {
+    if (!focused_id) return;
+    if (focused_id == browser_window_id) {
+        if (down) browser_key(key, mods);
+        return;
+    }
+    syscall_window_event_t event = {
+        .type = SYSCALL_WINDOW_EVENT_KEY,
+        .key = key,
+        .buttons = down,
+        .mods = mods,
+        .time_ms = time_ms
+    };
+    event.reserved[0] = repeat ? 1u : 0u;
+    if (mos_window_post_event(focused_id, &event) == SYS_ERR_BUSY) {
+        /* A full queue drops repeats quietly; real presses are reported. */
+        if (!repeat) strcpy(status_message, "Window event queue is full");
+    }
+}
+
 static void route_input(const syscall_input_event_t* input,
                         syscall_window_info_t* windows, uint64_t count) {
     if (input->type == SYSCALL_INPUT_MOUSE_MOVE) debug_mouse_events++;
@@ -9360,9 +10304,7 @@ static void route_input(const syscall_input_event_t* input,
         syscall_window_info_t* under =
             window_at(windows, count, cursor_x, cursor_y);
         if (under && under->id == browser_window_id) {
-            uint32_t visible_rows = browser_visible_rows(browser_height);
-            uint32_t max_scroll = browser_entry_count > visible_rows
-                ? browser_entry_count - visible_rows : 0u;
+            uint32_t max_scroll = browser_max_scroll();
             uint32_t step = max_scroll < 3u ? max_scroll : 3u;
             if (input->wheel < 0)
                 browser_scroll = browser_scroll + step > max_scroll
@@ -9388,6 +10330,18 @@ static void route_input(const syscall_input_event_t* input,
     } else if (input->type == SYSCALL_INPUT_KEY_DOWN ||
                input->type == SYSCALL_INPUT_KEY_UP) {
         if (dialog_kind != DIALOG_NONE) {
+            /* Dialog text fields repeat a held key too (Backspace). */
+            if (input->key >= 0xE0u) {
+                repeat_mods = input->mods;
+            } else if (input->type == SYSCALL_INPUT_KEY_DOWN) {
+                repeat_key = input->key;
+                repeat_mods = input->mods;
+                repeat_window = REPEAT_DIALOG;
+                repeat_next_ms = mos_syscall1(SYS_UPTIME, 0) +
+                                 KEY_REPEAT_DELAY_MS;
+            } else if (input->key == repeat_key) {
+                repeat_key = 0;
+            }
             if (input->type == SYSCALL_INPUT_KEY_DOWN) dialog_key(input);
             return;
         }
@@ -9397,16 +10351,77 @@ static void route_input(const syscall_input_event_t* input,
             return;
         }
         if (!focused_id) return;
-        syscall_window_event_t event = {
-            .type = SYSCALL_WINDOW_EVENT_KEY,
-            .key = input->key,
-            .buttons = input->type == SYSCALL_INPUT_KEY_DOWN,
-            .mods = input->mods,
-            .time_ms = input->time_ms
-        };
-        if (mos_window_post_event(focused_id, &event) == SYS_ERR_BUSY)
-            strcpy(status_message, "Window event queue is full");
+        bool down = input->type == SYSCALL_INPUT_KEY_DOWN;
+        /* Modifiers (HID 0xE0..0xE7) never repeat, but they change what a
+         * held key types (Shift released while 'a' repeats). */
+        if (input->key >= 0xE0u) {
+            repeat_mods = input->mods;
+        } else if (down) {
+            repeat_key = input->key;
+            repeat_mods = input->mods;
+            repeat_window = focused_id;
+            repeat_next_ms = mos_syscall1(SYS_UPTIME, 0) + KEY_REPEAT_DELAY_MS;
+        } else if (input->key == repeat_key) {
+            repeat_key = 0;
+        }
+        deliver_key(input->key, down, input->mods, input->time_ms, false);
     }
+}
+
+/* A window that opens bigger than the screen (an app made for a larger
+ * display) is shrunk and moved so its whole frame is on screen. */
+static void fit_new_window(syscall_window_info_t* info) {
+    if (borderless(info) || (info->flags & (SYSCALL_WINDOW_FULLSCREEN |
+                                            SYSCALL_WINDOW_MAXIMIZED)))
+        return;
+    uint32_t work_height = display.height - TASKBAR_HEIGHT;
+    if (display.width <= 64u || work_height <= TITLE_HEIGHT + 64u) return;
+    uint32_t max_w = display.width - 2u;
+    uint32_t max_h = work_height - TITLE_HEIGHT - 2u;
+    uint32_t w = info->width < max_w ? info->width : max_w;
+    uint32_t h = info->height < max_h ? info->height : max_h;
+    int32_t x = info->x, y = info->y;
+    if (x + (int32_t)w + 2 > (int32_t)display.width)
+        x = (int32_t)display.width - (int32_t)w - 2;
+    if (y + (int32_t)(h + TITLE_HEIGHT) + 2 > (int32_t)work_height)
+        y = (int32_t)work_height - (int32_t)(h + TITLE_HEIGHT) - 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (w == info->width && h == info->height && x == info->x && y == info->y)
+        return;
+    if (mos_window_set_bounds(info->id, (uint32_t)x, (uint32_t)y, w, h) ==
+        SYS_SUCCESS) {
+        info->x = x;
+        info->y = y;
+        info->width = w;
+        info->height = h;
+    }
+}
+
+/* Called once a frame: sends the repeats a held key is due. */
+static void key_repeat_tick(void) {
+    if (!repeat_key) return;
+    bool to_dialog = repeat_window == REPEAT_DIALOG;
+    if (to_dialog != (dialog_kind != DIALOG_NONE) ||
+        (!to_dialog && repeat_window != focused_id) ||
+        menu_open || auth_state != AUTH_NONE) {
+        repeat_key = 0;
+        return;
+    }
+    uint64_t now = mos_syscall1(SYS_UPTIME, 0);
+    if (now < repeat_next_ms) return;
+    /* A slow frame sends one repeat, not a burst. */
+    repeat_next_ms = now - repeat_next_ms > KEY_REPEAT_RATE_MS * 4u
+        ? now + KEY_REPEAT_RATE_MS : repeat_next_ms + KEY_REPEAT_RATE_MS;
+    if (to_dialog) {
+        syscall_input_event_t input = {
+            .type = SYSCALL_INPUT_KEY_DOWN, .key = repeat_key,
+            .mods = repeat_mods, .time_ms = (uint32_t)now
+        };
+        dialog_key(&input);
+        return;
+    }
+    deliver_key(repeat_key, true, repeat_mods, (uint32_t)now, true);
 }
 
 static void cleanup(void) {
@@ -9530,6 +10545,7 @@ int main(void) {
             /* A window that has just appeared takes the keyboard focus. */
             if (entry && !entry->announced) {
                 entry->announced = true;
+                fit_new_window(&windows[i]);
                 if (windows[i].flags & SYSCALL_WINDOW_VISIBLE)
                     focus_window(&windows[i]);
             }
@@ -9546,6 +10562,7 @@ int main(void) {
         } else if (event_count != SYS_ERR_AGAIN) {
             strcpy(status_message, "Input read failed");
         }
+        key_repeat_tick();
         debug_lap(PROFILE_INPUT);
         update_cursor_appearance(windows, count);
         update_hover(windows, count);

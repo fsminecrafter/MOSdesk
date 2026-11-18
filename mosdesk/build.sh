@@ -81,7 +81,9 @@ fi
 cp "$SCRIPT_DIR/fonts/arial.font" "$INSTALL/fonts/arial.font"
 cp "$SCRIPT_DIR/fonts/roboto.font" "$INSTALL/fonts/roboto.font"
 cp "$SCRIPT_DIR/fonts/default.font" "$INSTALL/fonts/default.font"
-for font in Inter-Regular.otf Inter-Medium.otf Inter-LICENSE.txt; do
+# JetBrains Mono is the code font of mos_code.run (0:/programs/mosdesk/fonts/).
+for font in Inter-Regular.otf Inter-Medium.otf Inter-LICENSE.txt \
+    JetBrainsMono-Regular.ttf JetBrainsMono-LICENSE.txt; do
     cp "$SCRIPT_DIR/fonts/$font" "$INSTALL/fonts/$font"
 done
 cp "$DIST/mosdesk.run" "$INSTALL/mosdesk.run"

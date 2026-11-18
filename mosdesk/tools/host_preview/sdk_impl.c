@@ -80,6 +80,17 @@ uint64_t mos_syscall3(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
         if (!strcmp(p, "0:/programs/mosWM"))   { strcpy(e[0].name, "mosWM.run");   e[0].type = SYSCALL_DIRENT_TYPE_EXECUTABLE; return 1; }
         return (uint64_t)-1;
     }
+    case SYS_GET_METADATA: {
+        /* Size and a fixed date from the host file. */
+        struct stat st; syscall_file_metadata_t* m = (syscall_file_metadata_t*)(uintptr_t)b;
+        if (stat((const char*)(uintptr_t)a, &st) != 0) return (uint64_t)-1;
+        memset(m, 0, sizeof(*m));
+        m->data_length = (uint32_t)st.st_size;
+        snprintf(m->last_changed, sizeof m->last_changed, "2026-11-%02d 1%d:%02d:00",
+                 (int)(st.st_size % 17) + 1, (int)(st.st_size % 9), (int)(st.st_size % 60));
+        strcpy(m->filetype, "binary"); strcpy(m->fileformat, "bin");
+        return 0;
+    }
     case SYS_EXISTS: { struct stat st; return stat((const char*)(uintptr_t)a, &st) == 0 ? 1u : 0u; }
     case SYS_RMDIR: return rmdir((const char*)(uintptr_t)a) == 0 ? 0 : (uint64_t)-1;
     case SYS_IS_DIR: { struct stat st; return stat((const char*)(uintptr_t)a, &st) == 0 && S_ISDIR(st.st_mode); }

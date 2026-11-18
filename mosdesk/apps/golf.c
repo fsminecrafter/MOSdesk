@@ -2784,6 +2784,9 @@ static void mouse_event(const syscall_window_event_t* event) {
 static void key_event(const syscall_window_event_t* event) {
     if (!event->buttons) return;
     if (editor_mode) { editor_key(event); return; }
+    /* A held key repeats (mosWM): only aiming takes repeats, so holding
+     * Space does not start and fire a shot by itself. */
+    if (event->reserved[0] && event->key != KEY_LEFT && event->key != KEY_RIGHT) return;
     if (event->key == KEY_T) { toggle_scorecard(); return; }
     if (scorecard_open) return;
     if (event->key == KEY_E) { toggle_editor(); return; }
