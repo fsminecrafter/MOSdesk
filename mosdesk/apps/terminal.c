@@ -18,8 +18,13 @@
  * answers a y/N question instead. `root -k` forgets it, `root -v` renews it.
  *
  * Keys: Enter runs, Up/Down walk the history, Left/Right/Home/End/Delete
- * edit the line, Tab completes a file name, PgUp/PgDn scroll, Ctrl+L
- * clears, Ctrl+C drops the line.
+ * edit the line, Tab completes a file name, Ctrl+L clears, Ctrl+C drops
+ * the line. Held keys repeat.
+ *
+ * Scrolling: the mouse wheel, the scrollbar (drag it, or click above or
+ * below the thumb), PgUp/PgDn, Shift+Up/Down one line, Ctrl+Home/End the
+ * oldest and newest lines. New output keeps a scrolled-back view where it
+ * is; typing returns to the newest lines.
  */
 #include "easyui.h"
 #include "stdlib.h"
@@ -78,6 +83,8 @@ typedef struct { char text[LINE_MAX]; uint32_t color; } line_t;
 static line_t* lines;
 static int line_first, line_count;   /* ring buffer */
 static int scroll_back;              /* lines scrolled up from the bottom */
+static int sb_dragging, sb_grab;     /* scrollbar drag, grab offset in px */
+#define SB_W 10
 static int canvas;
 static uint32_t color_text = 0xFFE3E9EEu, color_dim = 0xFF8A9AA6u,
                 color_error = 0xFFFF8A80u, color_ok = 0xFF8BD8A0u,
@@ -125,6 +132,7 @@ static int text_limit(void) {
 /* Appends text, starting new lines at '\n' and where the window is full. */
 static void out(const char* text) {
     static int at_line_start = 1;
+    int before = line_count, first_before = line_first;
     line_t* line = at_line_start || !line_count ? NULL : line_at(line_count - 1);
     for (const char* p = text; *p; p++) {
         if (!line) { line = new_line(); at_line_start = 0; }
@@ -140,7 +148,14 @@ static void out(const char* text) {
             line->text[1] = '\0';
         }
     }
-    scroll_back = 0;
+    /* Someone reading older lines keeps their place: the view moves up by
+     * the lines just added (a full ring drops its oldest lines instead). */
+    if (scroll_back) {
+        int added = line_count - before;
+        if (line_count == MAX_LINES)
+            added += (line_first - first_before + MAX_LINES) % MAX_LINES;
+        scroll_back += added;
+    }
     easyui.redraw();
 }
 
@@ -1185,6 +1200,21 @@ static void on_key(int v) {
         }
         return;
     }
+    int visible = (easyui.getheight(canvas) - 2 * PAD) / LH - 1;
+    int page = visible > 1 ? visible - 1 : 1;
+    /* Scrolling keys never touch the line being typed. */
+    if (key == K_PGUP || key == K_PGDN || (shift && (key == K_UP || key == K_DOWN)) ||
+        (ctrl && (key == K_HOME || key == K_END))) {
+        if (key == K_PGUP) scroll_back += page;
+        else if (key == K_PGDN) scroll_back -= page;
+        else if (key == K_UP) scroll_back += 1;
+        else if (key == K_DOWN) scroll_back -= 1;
+        else if (key == K_HOME) scroll_back = line_count;
+        else scroll_back = 0;
+        if (scroll_back < 0) scroll_back = 0;
+        easyui.redraw();
+        return;
+    }
     if (ctrl) {
         if (key == K_L) cmd_clear(0, NULL);
         else if (key == K_C) {
@@ -1220,7 +1250,6 @@ static void on_key(int v) {
         easyui.redraw();
         return;
     }
-    int visible = easyui.getheight(canvas) / LH - 1;
     switch (key) {
         case K_ENTER: case K_KPENTER: {
             char typed[INPUT_MAX];
@@ -1254,11 +1283,6 @@ static void on_key(int v) {
             if (history_pos < history_count - 1) set_input(history[++history_pos]);
             else { history_pos = history_count; set_input(""); }
             break;
-        case K_PGUP: scroll_back += visible > 1 ? visible - 1 : 1; break;
-        case K_PGDN:
-            scroll_back -= visible > 1 ? visible - 1 : 1;
-            if (scroll_back < 0) scroll_back = 0;
-            break;
         case K_TAB: complete(); break;
         case K_ESC: set_input(""); break;
         default: {
@@ -1273,7 +1297,95 @@ static void on_key(int v) {
             break;
         }
     }
-    if (key != K_PGUP && key != K_PGDN) scroll_back = 0;
+    scroll_back = 0;
+    easyui.redraw();
+}
+
+/* Scrollbar geometry (window coordinates); 0 when everything fits. */
+typedef struct { int x, y, w, h, thumb_y, thumb_h, rows, max_scroll; } sbar_t;
+
+static int sbar_get(sbar_t* sb) {
+    int cx = easyui.getx(canvas), cy = easyui.gety(canvas);
+    int cw = easyui.getwidth(canvas), ch = easyui.getheight(canvas);
+    sb->rows = (ch - 2 * PAD) / LH;
+    sb->max_scroll = line_count + 1 - sb->rows;
+    if (sb->max_scroll <= 0 || sb->rows <= 0) { sb->max_scroll = 0; return 0; }
+    if (scroll_back > sb->max_scroll) scroll_back = sb->max_scroll;
+    sb->w = SB_W;
+    sb->x = cx + cw - SB_W - 3;
+    sb->y = cy + 4;
+    sb->h = ch - 8;
+    sb->thumb_h = sb->h * sb->rows / (line_count + 1);
+    if (sb->thumb_h < 24) sb->thumb_h = 24;
+    if (sb->thumb_h > sb->h) sb->thumb_h = sb->h;
+    sb->thumb_y = sb->y + (sb->h - sb->thumb_h) * (sb->max_scroll - scroll_back) /
+                  sb->max_scroll;
+    return 1;
+}
+
+/* Puts the thumb's grab point under window y. */
+static void sbar_drag_to(int my) {
+    sbar_t sb;
+    if (!sbar_get(&sb)) return;
+    int travel = sb.h - sb.thumb_h;
+    if (travel <= 0) return;
+    int at = my - sb.y - sb_grab;
+    if (at < 0) at = 0;
+    if (at > travel) at = travel;
+    int from_top = (at * sb.max_scroll + travel / 2) / travel;
+    scroll_back = sb.max_scroll - from_top;
+    easyui.redraw();
+}
+
+/* The "newest lines" button shown while scrolled back. */
+static int newest_button(int* x, int* y, int* w, int* h) {
+    if (!scroll_back) return 0;
+    int cx = easyui.getx(canvas), cy = easyui.gety(canvas);
+    int cw = easyui.getwidth(canvas), ch = easyui.getheight(canvas);
+    *w = easyui.textwidth("Jump to newest (End)", TS) + 24;
+    *h = LH + 8;
+    *x = cx + cw - *w - SB_W - 14;
+    *y = cy + ch - *h - 8;
+    return 1;
+}
+
+static void on_press(int v) {
+    (void)v;
+    int mx, my, buttons;
+    easyui.mouse(&mx, &my, &buttons);
+    if (!(buttons & 1)) return;          /* Space/Enter also "press" a canvas */
+    int bx, by, bw, bh;
+    if (newest_button(&bx, &by, &bw, &bh) && mx >= bx && mx < bx + bw &&
+        my >= by && my < by + bh) {
+        scroll_back = 0;
+        easyui.redraw();
+        return;
+    }
+    sbar_t sb;
+    if (!sbar_get(&sb) || mx < sb.x - 3 || my < sb.y || my >= sb.y + sb.h) return;
+    if (my >= sb.thumb_y && my < sb.thumb_y + sb.thumb_h) {
+        sb_grab = my - sb.thumb_y;
+    } else {
+        /* A click in the track jumps the thumb there and keeps dragging. */
+        sb_grab = sb.thumb_h / 2;
+    }
+    sb_dragging = 1;
+    sbar_drag_to(my);
+}
+
+static void on_frame(int v) {
+    (void)v;
+    if (!sb_dragging) return;
+    int mx, my, buttons;
+    easyui.mouse(&mx, &my, &buttons);
+    if (!(buttons & 1)) { sb_dragging = 0; easyui.redraw(); return; }
+    if (my >= 0) sbar_drag_to(my);
+}
+
+static void on_wheel(int v) {
+    /* Three lines a notch; up (+1) shows older lines. */
+    scroll_back += v > 0 ? 3 : -3;
+    if (scroll_back < 0) scroll_back = 0;
     easyui.redraw();
 }
 
@@ -1327,9 +1439,18 @@ static void on_draw(int v) {
             easyui.fillrect(cx + PAD + prompt_w + easyui.textwidth(before, TS),
                             y + 1, 2, LH - 3, color_prompt);
         }
-    } else if (scroll_back) {
-        easyui.drawtext(cx + cw - PAD - easyui.textwidth("PgDn for the newest lines", TS),
-                        cy + ch - LH - 2, "PgDn for the newest lines", color_dim, TS);
+    }
+    sbar_t sb;
+    if (sbar_get(&sb)) {
+        easyui.fillroundrect(sb.x, sb.y, sb.w, sb.h, sb.w / 2, 0x18FFFFFFu);
+        easyui.fillroundrect(sb.x + 1, sb.thumb_y, sb.w - 2, sb.thumb_h, (sb.w - 2) / 2,
+                             sb_dragging ? 0xA0FFFFFFu : 0x58FFFFFFu);
+    }
+    int bx, by, bw, bh;
+    if (newest_button(&bx, &by, &bw, &bh)) {
+        easyui.fillroundrect(bx, by, bw, bh, bh / 2, 0xF02A3138u);
+        easyui.fillroundrect(bx + 1, by + 1, bw - 2, bh - 2, bh / 2 - 1, 0xF0353E47u);
+        easyui.drawtext(bx + 12, by + 4, "Jump to newest (End)", color_prompt, TS);
     }
 }
 
@@ -1351,6 +1472,9 @@ int main(int argc, char** argv) {
     }
     canvas = easyui.createcanvas(0, 0, 720, 440);
     easyui.recallfunc(canvas, ONDRAW, on_draw);
+    easyui.recallfunc(canvas, ONWHEEL, on_wheel);
+    easyui.recallfunc(canvas, ONPRESS, on_press);
+    easyui.recallfunc(EASYUI_WINDOW, ONFRAME, on_frame);
     easyui.recallfunc(EASYUI_WINDOW, ONKEY, on_key);
     easyui.recallfunc(EASYUI_WINDOW, ONRESIZE, on_resize);
     easyui.recallfunc(EASYUI_WINDOW, ONCLOSE, on_close);
