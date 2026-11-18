@@ -1186,7 +1186,10 @@ static void set_input(const char* text) {
 }
 
 static void on_key(int v) {
-    int key = v & 0xFF, mods = (v >> 8) & 7;
+    int key = v & 0xFF, mods = (v >> 8) & 15;
+    /* HID modifier byte for the kernel's layout: Shift, and AltGr (bit 3)
+     * for { [ ] } \\ @ on Nordic and German keyboards. */
+    int usb_mods = ((mods & 1) ? 2 : 0) | ((mods & 8) ? 0x40 : 0);
     int shift = mods & 1, ctrl = (mods >> 1) & 1;
     caret_on = 1;
     if (root_running) {
@@ -1240,7 +1243,7 @@ static void on_key(int v) {
             input_caret = input_len;
         } else {
             char c = (char)mos_syscall(SYS_USB, SYS_USB_KEY_TO_ASCII, key,
-                                       shift ? 2 : 0);
+                                       usb_mods);
             if (c >= 32 && c < 127 && input_len + 1 < 64) {
                 input[input_len++] = c;
                 input[input_len] = '\0';
@@ -1287,7 +1290,7 @@ static void on_key(int v) {
         case K_ESC: set_input(""); break;
         default: {
             char c = (char)mos_syscall(SYS_USB, SYS_USB_KEY_TO_ASCII, key,
-                                       shift ? 2 /* left shift */ : 0);
+                                       usb_mods);
             if (c >= 32 && c < 127 && input_len + 1 < INPUT_MAX) {
                 memmove(input + input_caret + 1, input + input_caret,
                         (size_t)(input_len - input_caret + 1));
