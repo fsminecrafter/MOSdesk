@@ -17,6 +17,12 @@
  *   Open / Save / Save As (Ctrl+O / Ctrl+S / Ctrl+Shift+S), mouse selection,
  *   double-click word, scrollbars, wheel and Shift+wheel.
  *   Ctrl+= / Ctrl+- change the font size.
+ *   Word completion from the open files (Ctrl+Space, or by itself after
+ *   three letters; Tab/Enter take one), the word under the caret marked
+ *   where else it appears, Go to file (Ctrl+P, fuzzy over the folder),
+ *   the command palette (Ctrl+Shift+P: save all, sort lines, upper/lower
+ *   case, trim trailing whitespace, line endings ...), and the last
+ *   session's files and folder reopened when Code starts without files.
  *
  * Notes
  *   - Code is drawn in JetBrains Mono (0:/programs/mosdesk/fonts/); if the
@@ -104,7 +110,7 @@ int   memcmp(const void* a, const void* b, unsigned long n);
 
 /* USB HID usage codes (what easyui's ONKEY delivers) */
 enum { K_A = 4, K_B = 5, K_C = 6, K_D = 7, K_F = 9, K_G = 10, K_H = 11, K_K = 14, K_L = 15, K_N = 17,
-       K_O = 18, K_S = 22, K_V = 25, K_W = 26, K_X = 27, K_Y = 28, K_Z = 29, K_1 = 30, K_0 = 39,
+       K_O = 18, K_P = 19, K_S = 22, K_V = 25, K_W = 26, K_X = 27, K_Y = 28, K_Z = 29, K_1 = 30, K_0 = 39,
        K_ENTER = 40, K_ESC = 41, K_BACKSPACE = 42, K_TAB = 43, K_SPACE = 44, K_MINUS = 45, K_EQUAL = 46,
        K_LBRACKET = 47, K_RBRACKET = 48, K_SLASH = 56, K_F3 = 60, K_F5 = 62, K_HOME = 74, K_PGUP = 75,
        K_DELETE = 76, K_END = 77, K_PGDN = 78, K_RIGHT = 79, K_LEFT = 80, K_DOWN = 81, K_UP = 82,
@@ -1087,7 +1093,7 @@ static void apply_font(void) {
 /* ===========================================================================
  *  UI state: text fields, find, layout
  * =========================================================================== */
-enum { F_EDITOR = 0, F_FIND, F_REPL, F_GOTO };
+enum { F_EDITOR = 0, F_FIND, F_REPL, F_GOTO, F_PAL };
 typedef struct { char buf[160]; int len, caret, all; } Field;
 static Field fFind, fRepl, fGoto;
 static int focus = F_EDITOR, findOpen, replOpen, gotoOpen, matchCase;
@@ -1393,10 +1399,12 @@ static void update_title(void) {
 }
 
 static void dlg_open(int kind, Doc* d) { dlgKind = kind; dlgDoc = d; dlgSel = 0; easyui.redraw(); }
+static void session_save(void);
 static void continue_quit(void) {
     int i;
     for (i = 0; i < ntabs; i++)
         if (tabs[i]->modified && !tabs[i]->discard) { tab_activate(i); quitting = 1; dlg_open(DLG_QUIT, tabs[i]); return; }
+    session_save();
     easyui.quit();
 }
 static void close_tab_request(int i) {
@@ -1405,7 +1413,10 @@ static void close_tab_request(int i) {
     tab_remove(i);
 }
 
+static int trimOnSave;
+static int trim_trailing(Doc* d);
 static int do_save_to(Doc* d, const char* path) {
+    if (trimOnSave) trim_trailing(d);
     if (doc_write(d, path)) {
         if (d->untitled || strcmp(d->path, path) != 0) { doc_set_path(d, path); tree_refresh(); }
         d->modified = 0; d->saveMark = d->ecur; d->merge = 0;
@@ -1556,6 +1567,9 @@ static int hsb_thumb(int* tx, int* tw) {
     return 1;
 }
 
+static void draw_occurrences(int line, int y, int x0);
+static void draw_completion(void);
+static void draw_palette(void);
 static void draw_editor(void) {
     Doc* d = D;
     const easyui_theme_t* th = easyui.theme();
@@ -1588,6 +1602,7 @@ static void draw_editor(void) {
                 R(x0 + x1 * CW, y + 1, (x2 - x1) * CW, LH - 2, matches[m] == sel_a(d) && mlen == sel_b(d) - sel_a(d) ? curc : matchc);
             }
         }
+        draw_occurrences(i, y, x0);
         /* selection */
         if (has_sel(d) && sel_a(d) <= e && sel_b(d) > a) {
             int sa = imax(sel_a(d), a) - a, sb = imin(sel_b(d), e) - a;
@@ -1899,6 +1914,8 @@ static void on_canvas_draw(int v) {
     draw_tabs();
     draw_status();
     draw_overlays();
+    draw_completion();
+    draw_palette();
     draw_dialog();
     update_title();
 }
@@ -2004,6 +2021,8 @@ static void find_changed(void) {
     if (nmatches && fFind.len) { int k = match_lower(sel_a(D)); select_match(k >= nmatches ? 0 : k); }
 }
 
+static int pal_click(int x, int y);
+static int comp_click(int x, int y);
 static void on_press(int v) {
     int x, y, b, i, bottom;
     (void)v;
@@ -2014,6 +2033,7 @@ static void on_press(int v) {
         for (i = 0; i < 3; i++) if (in_rect(x, y, r[i])) { dlg_choose(i); return; }
         return;
     }
+    if (pal_click(x, y) || comp_click(x, y)) return;
     overlay_geom();
     if (findOpen && in_rect(x, y, fr[FG_BAR])) {
         if (in_rect(x, y, fr[FG_FIND])) field_click(&fFind, fr[FG_FIND], x);
@@ -2117,11 +2137,15 @@ static void on_move(int x, int y, int b) {
     if (h != hoverId) { hoverId = h; easyui.redraw(); }
 }
 
+static int pal_wheel(int v);
+static int compOpen;
 static void on_wheel(int v) {
     int x, y, b;
     easyui.mouse(&x, &y, &b);
     calc_layout();
     if (dlgKind) return;
+    if (pal_wheel(v)) return;
+    compOpen = 0;
     if (g_mods & M_CTRL) {                                    /* Ctrl+wheel: font size */
         int z = iclamp(zoomIdx + (v > 0 ? 1 : -1), 0, 2);
         if (z != zoomIdx) { zoomIdx = z; apply_font(); reveal(); }
@@ -2131,6 +2155,480 @@ static void on_wheel(int v) {
     if (g_mods & M_SHIFT) { D->scrollX -= v * CW * 8; clamp_scroll(); return; }
     D->targetY = iclamp(D->targetY - v * LH * 3, 0, max_scroll_y());
     start_scroll_anim();
+}
+
+/* ===========================================================================
+ *  Word completion, quick open, command palette, session
+ * =========================================================================== */
+
+/* ---- word completion (Ctrl+Space, or by itself after 3 letters) ----
+ * Candidates are the words of the open documents that start with the word
+ * before the caret; Up/Down choose, Tab or Enter take one, Esc closes. */
+#define COMP_MAX 64
+#define COMP_SHOW 8
+static int compOpen, compSel, compScroll, compN, compStart;   /* compStart: offset where the prefix starts */
+static char compWord[COMP_MAX][48];
+static int trimOnSave;                                        /* palette: trim trailing spaces on save */
+
+static int comp_have(const char* w, int n) {
+    int i;
+    for (i = 0; i < compN; i++) if ((int)strlen(compWord[i]) == n && !memcmp(compWord[i], w, (size_t)n)) return 1;
+    return 0;
+}
+static void comp_collect(const Doc* d, const char* pre, int pl, int skipAt) {
+    int p = 0;
+    while (p < d->len && compN < COMP_MAX) {
+        int s, e;
+        while (p < d->len && !is_word((unsigned char)d->text[p])) p++;
+        s = p;
+        while (p < d->len && is_word((unsigned char)d->text[p])) p++;
+        e = p;
+        if (s == skipAt || e - s <= pl || e - s >= 48) continue;
+        if (d->text[s] >= '0' && d->text[s] <= '9') continue;
+        if (memcmp(d->text + s, pre, (size_t)pl) != 0) continue;
+        if (comp_have(d->text + s, e - s)) continue;
+        memcpy(compWord[compN], d->text + s, (size_t)(e - s));
+        compWord[compN][e - s] = 0;
+        compN++;
+    }
+}
+static void comp_sort(void) {                                 /* shorter first, then alphabetical */
+    int i, j;
+    for (i = 1; i < compN; i++) {
+        char t[48]; int lt;
+        strlcpy_safe(t, compWord[i], sizeof t); lt = (int)strlen(t);
+        for (j = i - 1; j >= 0; j--) {
+            int lj = (int)strlen(compWord[j]);
+            if (lj < lt || (lj == lt && strcmp(compWord[j], t) <= 0)) break;
+            memcpy(compWord[j + 1], compWord[j], sizeof compWord[0]);
+        }
+        strlcpy_safe(compWord[j + 1], t, sizeof compWord[0]);
+    }
+}
+/* Recomputes the list for the word before the caret; closes it when there is none. */
+static void comp_update(int minLen) {
+    Doc* d = D; char pre[48]; int s = word_start(d, d->caret), pl = d->caret - s, i;
+    compN = 0;
+    if (has_sel(d) || pl < minLen || pl >= 47 || (d->caret < d->len && is_word((unsigned char)d->text[d->caret]))) { compOpen = 0; return; }
+    memcpy(pre, d->text + s, (size_t)pl); pre[pl] = 0;
+    comp_collect(d, pre, pl, s);
+    for (i = 0; i < ntabs && compN < COMP_MAX; i++) if (tabs[i] != d) comp_collect(tabs[i], pre, pl, -1);
+    if (!compN) { compOpen = 0; return; }
+    comp_sort();
+    compStart = s; compOpen = 1; compSel = 0; compScroll = 0;
+}
+static void comp_accept(void) {
+    Doc* d = D; const char* w = compWord[compSel]; int pl = d->caret - compStart, n = (int)strlen(w);
+    compOpen = 0;
+    if (pl < 0 || pl > n) return;
+    d->merge = 0;
+    insert_text(w + pl, n - pl, 0);
+}
+/* Keys while the list is open: 1 if the key was used. */
+static int comp_key(int key) {
+    if (!compOpen) return 0;
+    if (key == K_DOWN) { compSel = (compSel + 1) % compN; }
+    else if (key == K_UP) { compSel = (compSel + compN - 1) % compN; }
+    else if (key == K_TAB || key == K_ENTER || key == K_KPENTER) { comp_accept(); return 1; }
+    else if (key == K_ESC) { compOpen = 0; return 1; }
+    else return 0;
+    if (compSel < compScroll) compScroll = compSel;
+    if (compSel >= compScroll + COMP_SHOW) compScroll = compSel - COMP_SHOW + 1;
+    return 1;
+}
+static void comp_rect(int r[4]) {
+    Doc* d = D; int l = line_of(d, compStart), w = 0, i, rows = imin(compN, COMP_SHOW);
+    for (i = 0; i < compN; i++) w = imax(w, (int)strlen(compWord[i]));
+    r[2] = imax(160, w * CW + 24); r[3] = rows * LH + 6;
+    r[0] = L.tx + 6 - d->scrollX + cell_of(d, l, compStart - d->ls[l]) * CW - 6;
+    r[1] = L.ey + (l + 1) * LH - d->scrollY + 2;
+    if (r[1] + r[3] > L.ey + L.tvh) r[1] = L.ey + l * LH - d->scrollY - r[3] - 2;   /* above the line when there is no room */
+    if (r[0] + r[2] > L.ex + L.ew - SCROLL_W) r[0] = L.ex + L.ew - SCROLL_W - r[2];
+    if (r[0] < L.tx) r[0] = L.tx;
+}
+static void draw_completion(void) {
+    int r[4], i, rows, pl;
+    if (!compOpen || focus != F_EDITOR) return;
+    comp_rect(r); rows = imin(compN, COMP_SHOW); pl = D->caret - compStart;
+    R(r[0] + 2, r[1] + 3, r[2], r[3], 0x50000000);
+    R(r[0], r[1], r[2], r[3], C_PANEL);
+    easyui.drawrect(r[0], r[1], r[2], r[3], 0xFF3B3D43);
+    for (i = 0; i < rows; i++) {
+        int k = compScroll + i, y = r[1] + 3 + i * LH;
+        char head[48];
+        if (k == compSel) R(r[0] + 2, y, r[2] - 4, LH, with_alpha(g_accent, 0x60));
+        strlcpy_safe(head, compWord[k], sizeof head); head[imin(pl, 47)] = 0;
+        code_text(r[0] + 10, y + text_off(), compWord[k], C_TEXT);
+        code_text(r[0] + 10, y + text_off(), head, g_accent);             /* the typed part in the accent colour */
+    }
+    if (compN > COMP_SHOW) {
+        int th = imax(10, r[3] * COMP_SHOW / compN), ty = r[1] + (r[3] - th) * compScroll / (compN - COMP_SHOW);
+        R(r[0] + r[2] - 4, ty, 2, th, 0xFF5A5E66);
+    }
+}
+static int comp_click(int x, int y) {
+    int r[4];
+    if (!compOpen) return 0;
+    comp_rect(r);
+    if (!in_rect(x, y, r)) { compOpen = 0; return 0; }
+    compSel = iclamp(compScroll + (y - r[1] - 3) / LH, 0, compN - 1);
+    comp_accept();
+    return 1;
+}
+
+/* ---- the word under the caret, highlighted where else it appears ---- */
+static int occ_word(const Doc* d, int* s, int* n) {
+    int a, b;
+    if (has_sel(d)) {                                            /* a selected whole word */
+        a = sel_a(d); b = sel_b(d);
+        if (b - a < 2 || b - a > 64 || word_start(d, a) != a || word_end(d, a) != b) return 0;
+    } else {
+        a = word_start(d, d->caret); b = word_end(d, d->caret);
+        if (b - a < 2 || b - a > 64) return 0;
+    }
+    if (d->text[a] >= '0' && d->text[a] <= '9') return 0;
+    *s = a; *n = b - a;
+    return 1;
+}
+static void draw_occurrences(int line, int y, int x0) {
+    static int ws = -1, wn, wver = -1; static Doc* wdoc; static int wcaret = -1;
+    Doc* d = D; int a = d->ls[line], e = line_end_(d, line), p;
+    if (findOpen) return;
+    if (wdoc != d || wver != d->ver || wcaret != d->caret) {
+        wdoc = d; wver = d->ver; wcaret = d->caret;
+        if (!occ_word(d, &ws, &wn)) ws = -1;
+    }
+    if (ws < 0) return;
+    for (p = a; p + wn <= e; p++) {
+        int x1, x2;
+        if (memcmp(d->text + p, d->text + ws, (size_t)wn) != 0) continue;
+        if ((p > a && is_word((unsigned char)d->text[p - 1])) || (p + wn < d->len && is_word((unsigned char)d->text[p + wn]))) continue;
+        x1 = cell_of(d, line, p - a); x2 = cell_of(d, line, p - a + wn);
+        R(x0 + x1 * CW, y + 1, (x2 - x1) * CW, LH - 2, p == ws ? 0x28FFFFFF : 0x30FFFFFF);
+        easyui.drawrect(x0 + x1 * CW, y + 1, (x2 - x1) * CW, LH - 2, 0x40FFFFFF);
+        p += wn - 1;
+    }
+}
+
+/* ---- quick open (Ctrl+P) and the command palette (Ctrl+Shift+P) ----
+ * One list overlay: a filter field and the items that match it (letters in
+ * order, closer together and at word starts first). */
+#define QO_FILES 3000
+#define PAL_SHOW 12
+enum { PAL_NONE, PAL_FILES, PAL_COMMANDS };
+static int palMode, palSel, palScroll;
+static Field fPal;
+static char (*qoPath)[PATH_MAX_]; static int qoCount;           /* files under the sidebar folder */
+static int palItems[QO_FILES], palScores[QO_FILES], palN;
+
+typedef struct { const char* name; const char* keys; int id; } Cmd;
+enum { CMD_NEW = 1, CMD_OPEN, CMD_OPEN_FOLDER, CMD_SAVE, CMD_SAVE_AS, CMD_SAVE_ALL, CMD_CLOSE, CMD_FIND, CMD_REPLACE,
+       CMD_GOTO, CMD_SIDEBAR, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_ZOOM_RESET, CMD_COMMENT, CMD_DUPLICATE, CMD_DELETE_LINE,
+       CMD_UPPER, CMD_LOWER, CMD_TRIM, CMD_TRIM_TOGGLE, CMD_SORT, CMD_CRLF, CMD_REFRESH, CMD_QUICK_OPEN, CMD_COMPLETE };
+static const Cmd k_cmds[] = {
+    { "New file", "Ctrl+N", CMD_NEW }, { "Open file...", "Ctrl+O", CMD_OPEN },
+    { "Open folder...", "Ctrl+Shift+O", CMD_OPEN_FOLDER }, { "Go to file...", "Ctrl+P", CMD_QUICK_OPEN },
+    { "Save", "Ctrl+S", CMD_SAVE }, { "Save as...", "Ctrl+Shift+S", CMD_SAVE_AS }, { "Save all", "", CMD_SAVE_ALL },
+    { "Close tab", "Ctrl+W", CMD_CLOSE }, { "Find", "Ctrl+F", CMD_FIND }, { "Replace", "Ctrl+H", CMD_REPLACE },
+    { "Go to line...", "Ctrl+G", CMD_GOTO }, { "Toggle sidebar", "Ctrl+B", CMD_SIDEBAR },
+    { "Complete word", "Ctrl+Space", CMD_COMPLETE },
+    { "Zoom in", "Ctrl+=", CMD_ZOOM_IN }, { "Zoom out", "Ctrl+-", CMD_ZOOM_OUT }, { "Reset zoom", "Ctrl+0", CMD_ZOOM_RESET },
+    { "Toggle comment", "Ctrl+/", CMD_COMMENT }, { "Duplicate line", "Ctrl+D", CMD_DUPLICATE },
+    { "Delete line", "Ctrl+Shift+K", CMD_DELETE_LINE }, { "Selection to upper case", "", CMD_UPPER },
+    { "Selection to lower case", "", CMD_LOWER }, { "Sort selected lines", "", CMD_SORT },
+    { "Trim trailing whitespace", "", CMD_TRIM }, { "Trim trailing whitespace on save: on/off", "", CMD_TRIM_TOGGLE },
+    { "Line endings: LF / CRLF", "", CMD_CRLF }, { "Refresh folder", "F5", CMD_REFRESH },
+};
+#define NCMDS ((int)(sizeof k_cmds / sizeof k_cmds[0]))
+
+/* Fuzzy score of `s` for the filter, -1 when the letters are not all there in order. */
+static int fuzzy(const char* s, const char* q) {
+    int score = 0, last = -2, i = 0, j;
+    if (!*q) return 0;
+    for (j = 0; q[j]; j++) {
+        int c = fold((unsigned char)q[j]);
+        if (c == ' ') continue;
+        while (s[i] && fold((unsigned char)s[i]) != c) i++;
+        if (!s[i]) return -1;
+        score += 10;
+        if (i == last + 1) score += 15;                                       /* next to the previous letter */
+        if (i == 0 || s[i - 1] == '/' || s[i - 1] == '_' || s[i - 1] == ' ' || s[i - 1] == '.' || s[i - 1] == '-') score += 20;
+        last = i++;
+    }
+    return score - (int)strlen(s) / 4;
+}
+static void qo_walk(const char* dir, int depth) {
+    syscall_dirent_t* ents; long n, i;
+    if (depth > 8 || qoCount >= QO_FILES) return;
+    ents = (syscall_dirent_t*)malloc(sizeof(syscall_dirent_t) * DIR_MAX);
+    if (!ents) return;
+    n = mos_listdir(dir, ents, DIR_MAX);
+    if (n > DIR_MAX) n = DIR_MAX;
+    for (i = 0; i < n && qoCount < QO_FILES; i++) {
+        char p[PATH_MAX_];
+        if (ents[i].hidden || !ents[i].name[0]) continue;
+        ents[i].name[SYSCALL_DIRENT_NAME_SIZE - 1] = 0;
+        strlcpy_safe(p, dir, sizeof p);
+        if (p[strlen(p) - 1] != '/') cat(p, sizeof p, "/");
+        cat(p, sizeof p, ents[i].name);
+        if (ents[i].type == SYSCALL_DIRENT_TYPE_DIR) qo_walk(p, depth + 1);
+        else strlcpy_safe(qoPath[qoCount++], p, PATH_MAX_);
+    }
+    free(ents);
+}
+static const char* pal_text(int item) {                                    /* what an item is matched and shown by */
+    if (palMode == PAL_COMMANDS) return k_cmds[item].name;
+    {
+        const char* p = qoPath[item]; size_t n = strlen(treeRoot);
+        if (!strncmp(p, treeRoot, n)) { p += n; if (*p == '/') p++; }
+        return p;
+    }
+}
+static void pal_filter(void) {
+    int total = palMode == PAL_COMMANDS ? NCMDS : qoCount, i, j;
+    palN = 0;
+    for (i = 0; i < total && palN < QO_FILES; i++) {
+        int s = fuzzy(pal_text(i), fPal.buf);
+        if (s < 0) continue;
+        if (palMode == PAL_FILES && fPal.len) s += fuzzy(base_name(qoPath[i]), fPal.buf) > 0 ? 40 : 0;   /* the file name itself */
+        j = palN++;
+        while (j > 0 && (fPal.len ? palScores[j - 1] < s : 0)) { palItems[j] = palItems[j - 1]; palScores[j] = palScores[j - 1]; j--; }
+        palItems[j] = i; palScores[j] = s;
+    }
+    palSel = 0; palScroll = 0;
+}
+static void pal_open(int mode) {
+    palMode = mode; field_set(&fPal, ""); compOpen = 0; focus = F_PAL;
+    if (mode == PAL_FILES) {
+        if (!qoPath) qoPath = (char(*)[PATH_MAX_])malloc((size_t)QO_FILES * PATH_MAX_);
+        if (!qoPath) { palMode = PAL_NONE; set_msg("Out of memory", 1); return; }
+        qoCount = 0;
+        qo_walk(treeRoot, 0);
+    }
+    pal_filter();
+}
+static void pal_rect(int r[4]) {
+    r[2] = imin(620, L.W - 40); r[0] = (L.W - r[2]) / 2; r[1] = TAB_H + 8;
+    r[3] = 44 + imax(1, imin(palN, PAL_SHOW)) * ROW_H + 8;
+}
+
+static void change_case(int upper) {
+    Doc* d = D; int a = sel_a(d), b = sel_b(d), i; char* t;
+    if (a == b) { set_msg("Select some text first", 1); return; }
+    t = (char*)malloc((size_t)(b - a));
+    if (!t) return;
+    for (i = 0; i < b - a; i++) {
+        char c = d->text[a + i];
+        if (upper && c >= 'a' && c <= 'z') c = (char)(c - 32);
+        if (!upper && c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        t[i] = c;
+    }
+    doc_edit(d, a, b - a, t, b - a, d->caret, d->anchor, 0);
+    free(t);
+}
+/* Removes spaces and tabs at line ends; returns how many bytes went. */
+static int trim_trailing(Doc* d) {
+    int l, removed = 0, caret = d->caret, anchor = d->anchor;
+    for (l = d->nl - 1; l >= 0; l--) {
+        int a = d->ls[l], e = line_end_(d, l), s = e;
+        while (s > a && (d->text[s - 1] == ' ' || d->text[s - 1] == '\t')) s--;
+        if (s == e) continue;
+        if (caret > s) caret = caret >= e ? caret - (e - s) : s;
+        if (anchor > s) anchor = anchor >= e ? anchor - (e - s) : s;
+        doc_edit(d, s, e - s, "", 0, caret, anchor, 0);
+        removed += e - s;
+    }
+    return removed;
+}
+static int cmp_lines(const char* a, int an, const char* b, int bn) {
+    int i, n = imin(an, bn);
+    for (i = 0; i < n; i++) if (a[i] != b[i]) return (unsigned char)a[i] - (unsigned char)b[i];
+    return an - bn;
+}
+static void sort_lines(void) {
+    Doc* d = D; int l0 = line_of(d, sel_a(d)), l1 = line_of(d, sel_b(d)), n, i, j, a, e, o = 0;
+    int* st; int* ln; char* out;
+    if (has_sel(d) && sel_b(d) == d->ls[l1] && l1 > l0) l1--;
+    n = l1 - l0 + 1;
+    if (n < 2) { set_msg("Select the lines to sort", 1); return; }
+    a = d->ls[l0]; e = line_end_(d, l1);
+    st = (int*)malloc(sizeof(int) * (size_t)n); ln = (int*)malloc(sizeof(int) * (size_t)n); out = (char*)malloc((size_t)(e - a + 1));
+    if (!st || !ln || !out) { free(st); free(ln); free(out); return; }
+    for (i = 0; i < n; i++) { st[i] = d->ls[l0 + i]; ln[i] = line_end_(d, l0 + i) - st[i]; }
+    for (i = 1; i < n; i++) {
+        int s = st[i], k = ln[i];
+        for (j = i - 1; j >= 0 && cmp_lines(d->text + st[j], ln[j], d->text + s, k) > 0; j--) { st[j + 1] = st[j]; ln[j + 1] = ln[j]; }
+        st[j + 1] = s; ln[j + 1] = k;
+    }
+    for (i = 0; i < n; i++) { memcpy(out + o, d->text + st[i], (size_t)ln[i]); o += ln[i]; if (i + 1 < n) out[o++] = '\n'; }
+    doc_edit(d, a, e - a, out, o, a + o, a, 0);
+    free(st); free(ln); free(out);
+}
+
+static void run_command(int id) {
+    int i, n;
+    switch (id) {
+        case CMD_NEW: new_tab(); break;
+        case CMD_OPEN: easyui.pickfile("Open file", dialog_folder(), 0, on_open_done); break;
+        case CMD_OPEN_FOLDER: easyui.pickfolder("Open folder", dialog_folder(), on_folder_done); break;
+        case CMD_QUICK_OPEN: pal_open(PAL_FILES); return;
+        case CMD_SAVE: save_doc(D); break;
+        case CMD_SAVE_AS: start_save_as(D); break;
+        case CMD_SAVE_ALL:
+            for (i = n = 0; i < ntabs; i++) if (tabs[i]->modified && !tabs[i]->untitled && do_save_to(tabs[i], tabs[i]->path)) n++;
+            { char m[48] = "Saved "; cat_num(m, sizeof m, n); cat(m, sizeof m, n == 1 ? " file" : " files"); set_msg(m, 0); }
+            break;
+        case CMD_CLOSE: close_tab_request(cur); break;
+        case CMD_FIND: open_find(0); break;
+        case CMD_REPLACE: open_find(1); break;
+        case CMD_GOTO: open_goto(); break;
+        case CMD_SIDEBAR: sbOn = !sbOn; break;
+        case CMD_COMPLETE: comp_update(1); if (!compOpen) set_msg("No completions", 0); break;
+        case CMD_ZOOM_IN: if (zoomIdx < 2) { zoomIdx++; apply_font(); reveal(); } break;
+        case CMD_ZOOM_OUT: if (zoomIdx > 0) { zoomIdx--; apply_font(); reveal(); } break;
+        case CMD_ZOOM_RESET: zoomIdx = 1; apply_font(); reveal(); break;
+        case CMD_COMMENT: block_edit(BLK_COMMENT); break;
+        case CMD_DUPLICATE: duplicate_lines(); break;
+        case CMD_DELETE_LINE: delete_lines(); break;
+        case CMD_UPPER: change_case(1); break;
+        case CMD_LOWER: change_case(0); break;
+        case CMD_SORT: sort_lines(); break;
+        case CMD_TRIM: {
+            char m[48] = "Removed "; cat_num(m, sizeof m, trim_trailing(D)); cat(m, sizeof m, " trailing spaces"); set_msg(m, 0);
+            break;
+        }
+        case CMD_TRIM_TOGGLE: trimOnSave = !trimOnSave; set_msg(trimOnSave ? "Trailing whitespace is trimmed on save" : "Trailing whitespace is kept on save", 0); break;
+        case CMD_CRLF: D->crlf = !D->crlf; D->modified = 1; set_msg(D->crlf ? "Line endings: CRLF (saved on the next save)" : "Line endings: LF (saved on the next save)", 0); break;
+        case CMD_REFRESH: tree_refresh(); set_msg("Folder refreshed", 0); break;
+        default: break;
+    }
+    after_edit();
+}
+static void pal_choose(void) {
+    int mode = palMode, item;
+    if (palSel < 0 || palSel >= palN) { palMode = PAL_NONE; return; }
+    item = palItems[palSel];
+    palMode = PAL_NONE;
+    focus = F_EDITOR;
+    if (mode == PAL_FILES) open_file(qoPath[item]);
+    else run_command(k_cmds[item].id);
+}
+static void pal_key(int key, int mods) {
+    if (key == K_ESC) { palMode = PAL_NONE; return; }
+    if (key == K_ENTER || key == K_KPENTER) { pal_choose(); return; }
+    if (key == K_DOWN || key == K_UP || key == K_PGDN || key == K_PGUP) {
+        int step = key == K_DOWN ? 1 : key == K_UP ? -1 : key == K_PGDN ? PAL_SHOW : -PAL_SHOW;
+        if (palN) palSel = iclamp(palSel + step, 0, palN - 1);
+        if (palSel < palScroll) palScroll = palSel;
+        if (palSel >= palScroll + PAL_SHOW) palScroll = palSel - PAL_SHOW + 1;
+        return;
+    }
+    if (field_key(&fPal, key, mods)) pal_filter();
+}
+static void draw_palette(void) {
+    int r[4], i, fr2[4], rows;
+    if (palMode == PAL_NONE) return;
+    pal_rect(r); rows = imin(palN, PAL_SHOW);
+    R(0, 0, L.W, L.H, 0x30000000);
+    R(r[0] + 3, r[1] + 4, r[2], r[3], 0x60000000);
+    R(r[0], r[1], r[2], r[3], C_PANEL);
+    easyui.drawrect(r[0], r[1], r[2], r[3], 0xFF3B3D43);
+    fr2[0] = r[0] + 8; fr2[1] = r[1] + 8; fr2[2] = r[2] - 16; fr2[3] = 28;
+    draw_field(fr2, &fPal, F_PAL, palMode == PAL_FILES ? "Go to file (type part of its name)" : "Run a command");
+    if (!palN) T(r[0] + 16, r[1] + 48, palMode == PAL_FILES && !qoCount ? "No files in this folder" : "Nothing matches", C_MUTED);
+    for (i = 0; i < rows; i++) {
+        int k = palScroll + i, item = palItems[k], y = r[1] + 44 + i * ROW_H;
+        char t[200];
+        if (k == palSel) R(r[0] + 4, y, r[2] - 8, ROW_H, with_alpha(g_accent, 0x60));
+        if (palMode == PAL_FILES) {
+            const char* rel = pal_text(item); const char* bn = base_name(qoPath[item]);
+            int bw;
+            fit(t, sizeof t, bn, r[2] / 2 - 24, 0);
+            T(r[0] + 14, y + (ROW_H - UI_H) / 2, t, C_TEXT);
+            bw = TW(t);
+            fit(t, sizeof t, rel, r[2] - bw - 48, 1);
+            T(r[0] + 26 + bw, y + (ROW_H - UI_H) / 2, t, C_MUTED);
+        } else {
+            T(r[0] + 14, y + (ROW_H - UI_H) / 2, k_cmds[item].name, C_TEXT);
+            if (k_cmds[item].keys[0]) T(r[0] + r[2] - 14 - TW(k_cmds[item].keys), y + (ROW_H - UI_H) / 2, k_cmds[item].keys, C_MUTED);
+        }
+    }
+    if (palN > PAL_SHOW) {
+        int track = PAL_SHOW * ROW_H, th = imax(16, track * PAL_SHOW / palN), ty = r[1] + 44 + (track - th) * palScroll / (palN - PAL_SHOW);
+        R(r[0] + r[2] - 6, ty, 3, th, 0xFF5A5E66);
+    }
+}
+static int pal_click(int x, int y) {
+    int r[4];
+    if (palMode == PAL_NONE) return 0;
+    pal_rect(r);
+    if (!in_rect(x, y, r)) { palMode = PAL_NONE; focus = F_EDITOR; return 1; }
+    if (y >= r[1] + 44) {
+        int k = palScroll + (y - r[1] - 44) / ROW_H;
+        if (k >= 0 && k < palN && k < palScroll + PAL_SHOW) { palSel = k; pal_choose(); }
+    }
+    return 1;
+}
+static int pal_wheel(int v) {
+    if (palMode == PAL_NONE) return 0;
+    palScroll = iclamp(palScroll - v * 3, 0, imax(0, palN - PAL_SHOW));
+    return 1;
+}
+
+/* ---- session: the open files and the folder, reopened next time ---- */
+static void session_path(char* out, int cap) {
+#ifdef CODE_HAS_MOSDESK
+    mosdesk_settings_t s = mosdesk_settings_load();
+    char home[PATH_MAX_];
+    if (mosdesk_user_path(home, sizeof home, s.username, NULL) && mos_is_dir(home) == 1) {
+        strlcpy_safe(out, home, (size_t)cap);
+        if (out[strlen(out) - 1] != '/') cat(out, cap, "/");
+        cat(out, cap, ".code_session");
+        return;
+    }
+#endif
+    strlcpy_safe(out, "0:/.code_session", (size_t)cap);
+}
+static void session_save(void) {
+    char p[PATH_MAX_], buf[MAX_TABS * (PATH_MAX_ + 2) + PATH_MAX_ + 64]; int i, o = 0; long fd;
+    buf[0] = 0;
+    cat(buf, sizeof buf, "root "); cat(buf, sizeof buf, treeRoot); cat(buf, sizeof buf, "\n");
+    cat(buf, sizeof buf, "current "); cat_num(buf, sizeof buf, cur); cat(buf, sizeof buf, "\n");
+    if (trimOnSave) cat(buf, sizeof buf, "trim 1\n");
+    for (i = 0; i < ntabs; i++)
+        if (!tabs[i]->untitled && tabs[i]->path[0]) { cat(buf, sizeof buf, "file "); cat(buf, sizeof buf, tabs[i]->path); cat(buf, sizeof buf, "\n"); }
+    o = (int)strlen(buf);
+    session_path(p, sizeof p);
+    if (mos_exists(p) == 1) mos_delete(p);
+    if (mos_create(p, "text", "txt") < 0) return;
+    fd = mos_open(p, SYS_O_RDWR);
+    if (fd <= 0) return;
+    mos_fwrite(fd, buf, (size_t)o);
+    mos_close(fd);
+}
+/* Reopens the files of the last session; returns 1 if it did. */
+static int session_restore(char* root, int rootCap) {
+    char p[PATH_MAX_], buf[MAX_TABS * (PATH_MAX_ + 2) + PATH_MAX_ + 64]; long fd, n = 0, got; int want = 0, opened = 0;
+    char* line;
+    session_path(p, sizeof p);
+    if (mos_exists(p) != 1) return 0;
+    fd = mos_open(p, SYS_O_RDONLY);
+    if (fd <= 0) return 0;
+    while (n < (long)sizeof buf - 1 && (got = mos_read(fd, buf + n, sizeof buf - 1 - (size_t)n)) > 0) n += got;
+    mos_close(fd);
+    buf[n] = 0;
+    line = buf;
+    while (*line) {
+        char* e = line; while (*e && *e != '\n') e++;
+        if (*e) *e++ = 0;
+        if (!strncmp(line, "root ", 5) && mos_is_dir(line + 5) == 1) strlcpy_safe(root, line + 5, (size_t)rootCap);
+        else if (!strncmp(line, "current ", 8)) want = atoi(line + 8);
+        else if (!strncmp(line, "trim 1", 6)) trimOnSave = 1;
+        else if (!strncmp(line, "file ", 5) && mos_exists(line + 5) == 1 && open_file(line + 5)) opened++;
+        line = e;
+    }
+    if (opened) cur = iclamp(want, 0, ntabs - 1);
+    return opened > 0;
 }
 
 /* ---- keys ---- */
@@ -2228,7 +2726,10 @@ static void on_key(int value) {
     if (key >= 0xE0) return;                                 /* a modifier key on its own */
     caretOn = 1;
     if (dlgKind) { dlg_key(key, mods); return; }
+    if (palMode != PAL_NONE) { pal_key(key, mods); return; }
     if (ctrl && !(mods & M_ALT)) {
+        if (key == K_P && !g_repeat) { pal_open(shift ? PAL_COMMANDS : PAL_FILES); return; }
+        if (key == K_SPACE) { focus = F_EDITOR; comp_update(1); if (!compOpen) set_msg("No completions", 0); return; }
         if (g_repeat && (key == K_W || key == K_N || key == K_O || key == K_S || key == K_B || key == K_F || key == K_H || key == K_G)) return;
         switch (key) {
             case K_TAB: next_tab(shift ? -1 : 1); return;
@@ -2256,7 +2757,17 @@ static void on_key(int value) {
     if (key == K_ESC && (findOpen || gotoOpen)) { close_overlays(); return; }
     if (focus != F_EDITOR && ((focus == F_GOTO && gotoOpen) || (findOpen && (focus == F_FIND || focus == F_REPL)))) { field_focus_key(key, mods); return; }
     focus = F_EDITOR;
+    if (comp_key(key)) return;
     editor_key(key, mods);
+    /* The completion list follows the word being typed. */
+    if (!ctrl && !(mods & M_ALT)) {
+        int c = key_char(key, mods);
+        if (compOpen && (key == K_BACKSPACE || (c && is_word(c)))) comp_update(1);
+        else if (c && is_word(c) && !g_repeat) comp_update(3);
+        else compOpen = 0;
+    } else {
+        compOpen = 0;
+    }
 }
 
 static int tab_hook(int value) {
@@ -2313,6 +2824,7 @@ int main(int argc, char** argv) {
         open_file(p);
         if (!haveRoot) { dir_of(p, root, sizeof root); haveRoot = 1; }
     }
+    if (argc <= 1 && session_restore(root, sizeof root)) haveRoot = root[0] != 0;
     if (!haveRoot) {
 #ifdef CODE_HAS_MOSDESK
         mosdesk_settings_t s = mosdesk_settings_load();
