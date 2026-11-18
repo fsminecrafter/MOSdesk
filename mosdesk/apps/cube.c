@@ -147,7 +147,8 @@ int main(void) {
         syscall_window_event_t ev;
         while (mos_window_next_event(window, &ev) == SYS_SUCCESS) {
             if (ev.type == SYSCALL_WINDOW_EVENT_CLOSE_REQUEST) g_quit = 1;
-            if (ev.type == SYSCALL_WINDOW_EVENT_KEY && ev.buttons /* key down */) {
+            /* Presses only: a held key's repeats (reserved[0]) would toggle again. */
+            if (ev.type == SYSCALL_WINDOW_EVENT_KEY && ev.buttons && !ev.reserved[0]) {
                 if (ev.key == KEY_ESCAPE) g_quit = 1;
                 else if (ev.key == KEY_W) g_wire = !g_wire;
                 else if (ev.key == KEY_S && shader) g_mode = MODE_SHADER;
