@@ -5,7 +5,10 @@
  * (SYS_TASK_LIST), sortable by any column; End task ends the selected one
  * (SYS_TASK_END, after a confirmation). Kernel tasks can be shown too, but
  * not ended.
- * Performance: CPU use over the last minute, per core, and memory.
+ * Performance: a list on the left (CPU, Memory, GPU 0, each with a small
+ * graph) and the one picked on the right: CPU use over the last minute
+ * and per core; memory; the graphics card's engines (3D, Copy, Video
+ * Decode, Video Encode) and its dedicated memory (SYS_TASK_GPU).
  *
  * Keys: Up/Down select, Delete ends the selected program, Tab switches
  * page, Ctrl+K shows or hides kernel tasks, F5 refreshes now.
@@ -33,6 +36,24 @@ static char* tm_strncpy(char* d, const char* s, size_t n) {
 #define strcat tm_strcat
 #define strncat tm_strncat
 #define strncpy tm_strncpy
+
+/* SYS_TASK_GPU, for SDKs from before it (the kernel refuses it then, and the GPU page says so). */
+#ifndef SYS_TASK_GPU
+#define SYS_TASK_GPU 3u
+#define SYS_GPU_ENGINES 4u
+#define SYS_GPU_STATS_ENGINES 1u
+#define SYS_GPU_STATS_HW_3D 2u
+typedef struct {
+    uint32_t size, flags;
+    char name[64];
+    char renderer[32];
+    uint64_t vram_total, vram_used;
+    uint64_t now_ns;
+    uint64_t engine_busy_ns[SYS_GPU_ENGINES];
+    uint64_t engine_jobs[SYS_GPU_ENGINES];
+    uint64_t cpu_render_ns;
+} syscall_gpu_stats_t;
+#endif
 
 #define MAX_TASKS 256
 #define HISTORY   60
@@ -120,6 +141,16 @@ static uint64_t prev_sample_ms;
 static uint8_t cpu_hist[HISTORY], mem_hist[HISTORY];
 static int hist_count;
 static uint32_t cores;
+
+/* The graphics card: engine use (3D, Copy, Video Decode, Video Encode, then FarcadeGL drawn on the CPU) and
+ * dedicated memory, per refresh. */
+enum { GE_3D, GE_COPY, GE_DECODE, GE_ENCODE, GE_CPU, GE_COUNT };
+static const char* const ge_name[GE_COUNT] = { "3D", "Copy", "Video Decode", "Video Encode", "FarcadeGL on the CPU" };
+static uint8_t gpu_hist[GE_COUNT][HISTORY], vram_hist[HISTORY], gpu_top_hist[HISTORY];
+static syscall_gpu_stats_t gpu_now, gpu_prev;
+static int gpu_ok, gpu_have_prev;
+static uint32_t gpu_jobs_per_s;
+static int perf_view;               // 0 CPU, 1 memory, 2 GPU
 
 /* ------------------------------------------------------------ drawing */
 
@@ -310,6 +341,42 @@ static void refresh(uint64_t now) {
     }
     cpu_hist[hist_count] = (uint8_t)(cpu > 100 ? 100 : cpu);
     mem_hist[hist_count] = (uint8_t)(total ? used * 100 / total : 0);
+
+    // The graphics card: usage = busy time since the last refresh / the time between.
+    uint8_t ge[GE_COUNT] = { 0 };
+    syscall_gpu_stats_t g;
+    memset(&g, 0, sizeof g);
+    g.size = sizeof g;
+    gpu_ok = mos_syscall(SYS_TASK, SYS_TASK_GPU, (uint64_t)(uintptr_t)&g, 0) == SYS_SUCCESS;
+    if (gpu_ok) {
+        if (gpu_have_prev && g.now_ns > gpu_prev.now_ns) {
+            uint64_t span = g.now_ns - gpu_prev.now_ns, jobs = 0;
+            for (int e = 0; e < GE_COUNT; e++) {
+                uint64_t a = e == GE_CPU ? g.cpu_render_ns : g.engine_busy_ns[e];
+                uint64_t b = e == GE_CPU ? gpu_prev.cpu_render_ns : gpu_prev.engine_busy_ns[e];
+                uint64_t pct = a > b ? (a - b) * 100 / span : 0;
+                ge[e] = (uint8_t)(pct > 100 ? 100 : pct);
+                if (e < GE_CPU && g.engine_jobs[e] > gpu_prev.engine_jobs[e]) jobs += g.engine_jobs[e] - gpu_prev.engine_jobs[e];
+            }
+            gpu_jobs_per_s = (uint32_t)(jobs * 1000000000ull / span);
+        }
+        gpu_prev = g;
+        gpu_have_prev = 1;
+        gpu_now = g;
+    }
+    if (hist_count == HISTORY) {
+        for (int e = 0; e < GE_COUNT; e++) memmove(gpu_hist[e], gpu_hist[e] + 1, HISTORY - 1);
+        memmove(vram_hist, vram_hist + 1, HISTORY - 1);
+        memmove(gpu_top_hist, gpu_top_hist + 1, HISTORY - 1);
+    }
+    uint8_t top = 0;
+    for (int e = 0; e < GE_COUNT; e++) {
+        gpu_hist[e][hist_count] = ge[e];
+        // Like Windows: the GPU's figure is its busiest engine (the CPU renderer counts when there is no card's).
+        if ((e < GE_CPU || !(gpu_now.flags & SYS_GPU_STATS_ENGINES)) && ge[e] > top) top = ge[e];
+    }
+    gpu_top_hist[hist_count] = top;
+    vram_hist[hist_count] = (uint8_t)(gpu_now.vram_total ? gpu_now.vram_used * 100 / gpu_now.vram_total : 0);
     hist_count++;
     rebuild_view();
 }
@@ -503,30 +570,86 @@ static void graph(int x, int y, int w, int h, const uint8_t* hist, int n, uint32
     }
 }
 
-static void draw_performance(void) {
-    fill(0, TAB_H, (int)width, (int)height - TAB_H, C_BG);
+#define SIDE_W 172
+
+static rect_t side_rect(int i) {
+    rect_t r = { 8, TAB_H + 8 + i * 64, SIDE_W - 16, 58 };
+    return r;
+}
+
+// A small graph without frame (the sidebar's).
+static void spark(int x, int y, int w, int h, const uint8_t* hist, int n, uint32_t color) {
+    fill(x, y, w, h, C_BG);
+    if (n < 1 || w < 4) return;
+    for (int px = 0; px < w; px++) {
+        int i = (HISTORY - 1) * px / (w - 1) - (HISTORY - n);
+        if (i < 0) continue;
+        int bar = hist[i] * h / 100;
+        if (bar > 0) fill(x + px, y + h - bar, 1, bar, blend(C_BG, color, 110));
+    }
+}
+
+static void draw_side(void) {
+    fill(0, TAB_H, SIDE_W, (int)height - TAB_H, C_PANEL);
+    fill(SIDE_W - 1, TAB_H, 1, (int)height - TAB_H, C_LINE);
+    char v[48], t[24];
+    for (int i = 0; i < 3; i++) {
+        rect_t r = side_rect(i);
+        int on = perf_view == i, hover = inside(r, mouse_x, mouse_y);
+        if (on || hover) round_rect(r.x, r.y, r.w, r.h, 6, on ? C_SEL : C_HOVER);
+        const uint8_t* h = i == 0 ? cpu_hist : i == 1 ? mem_hist : gpu_top_hist;
+        uint32_t col = i == 0 ? C_ACCENT : i == 1 ? C_ACCENT2 : C_OK;
+        spark(r.x + 8, r.y + 8, 48, r.h - 16, h, hist_count, col);
+        const char* name = i == 0 ? "CPU" : i == 1 ? "Memory" : "GPU 0";
+        text(r.x + 64, r.y + 10, name, C_TEXT);
+        if (i == 0) { fmt_u(v, hist_count ? cpu_hist[hist_count - 1] : 0); strcat(v, " %"); }
+        else if (i == 1) {
+            fmt_bytes(v, mos_sysinfo_ram_used()); strcat(v, " / "); fmt_bytes(t, mos_sysinfo_ram_total()); strcat(v, t);
+        } else if (!gpu_ok || !gpu_now.name[0]) strcpy(v, "No card");
+        else { fmt_u(v, hist_count ? gpu_top_hist[hist_count - 1] : 0); strcat(v, " %"); }
+        text_fit(r.x + 64, r.y + 30, v, r.w - 72, C_DIM);
+    }
+}
+
+static void draw_system(int x0) {
+    fill(x0, TAB_H, (int)width - x0, (int)height - TAB_H, C_BG);
     int pad = 12, y = TAB_H + pad;
-    int w = (int)width - 2 * pad;
+    int w = (int)width - x0 - 2 * pad;
+    char v[48], t[48];
+    if (perf_view == 1) {
+        uint64_t total = mos_sysinfo_ram_total(), used = mos_sysinfo_ram_used();
+        fmt_bytes(v, used); strcat(v, " / "); fmt_bytes(t, total); strcat(v, t);
+        int gh = ((int)height - y - pad) * 60 / 100;
+        graph(x0 + pad, y, w, gh, mem_hist, hist_count, C_ACCENT2, "Memory", v);
+        y += gh + pad;
+        int ph = (int)height - y - pad;
+        if (ph < 40) return;
+        round_rect(x0 + pad, y, w, ph, 8, C_PANEL);
+        struct { const char* k; char v[48]; } rows[4];
+        int count = 0;
+        rows[count].k = "In use"; fmt_bytes(rows[count].v, used); count++;
+        rows[count].k = "Free"; fmt_bytes(rows[count].v, mos_sysinfo_ram_free()); count++;
+        rows[count].k = "Total"; fmt_bytes(rows[count].v, total); count++;
+        rows[count].k = "Kernel heap"; fmt_bytes(rows[count].v, mos_sysinfo_heap_used()); count++;
+        for (int i = 0; i < count && y + 12 + i * 22 + 18 <= y + ph; i++) {
+            text(x0 + pad + 14, y + 12 + i * 22, rows[i].k, C_DIM);
+            text(x0 + pad + w - 14 - text_width(rows[i].v, 1), y + 12 + i * 22, rows[i].v, C_TEXT);
+        }
+        return;
+    }
+    // CPU: the graph, then cores and figures.
     int half = (w - pad) / 2;
     int gh = ((int)height - y - pad) * 55 / 100;
     if (gh < 120) gh = 120;
-    char v[48], t[48];
     fmt_u(v, hist_count ? cpu_hist[hist_count - 1] : 0);
     strcat(v, " %");
-    graph(pad, y, half, gh, cpu_hist, hist_count, C_ACCENT, "CPU", v);
-    uint64_t total = mos_sysinfo_ram_total(), used = mos_sysinfo_ram_used();
-    fmt_bytes(v, used);
-    strcat(v, " / ");
-    fmt_bytes(t, total);
-    strcat(v, t);
-    graph(pad * 2 + half, y, w - half - pad, gh, mem_hist, hist_count, C_ACCENT2, "Memory", v);
-
-    // Cores and figures.
+    graph(x0 + pad, y, w, gh, cpu_hist, hist_count, C_ACCENT, "CPU", v);
     y += gh + pad;
     int ph = (int)height - y - pad;
     if (ph < 40) return;
-    round_rect(pad, y, half, ph, 8, C_PANEL);
-    text(pad + 14, y + 10, "Cores", C_DIM);
+    int px = x0 + pad;
+    round_rect(px, y, half, ph, 8, C_PANEL);
+    text(px + 14, y + 10, "Cores", C_DIM);
     uint32_t n = cores ? cores : 1;
     int cols = n > 8 ? 2 : 1;
     int per_col = (int)((n + (uint32_t)cols - 1) / (uint32_t)cols);
@@ -534,7 +657,7 @@ static void draw_performance(void) {
     int row_h = per_col ? (ph - 36) / per_col : 0;
     if (row_h > 22) row_h = 22;
     for (uint32_t c = 0; c < n && row_h >= 8; c++) {
-        int cx = pad + 14 + (int)(c / (uint32_t)per_col) * (bar_w + 12);
+        int cx = px + 14 + (int)(c / (uint32_t)per_col) * (bar_w + 12);
         int cy = y + 32 + (int)(c % (uint32_t)per_col) * row_h;
         uint64_t u = mos_sysinfo_core_usage(c);
         if (u > 100) u = 100;
@@ -550,22 +673,85 @@ static void draw_performance(void) {
         strcat(label, "%");
         text(bx + bw + 8, cy + (row_h - text_height(1)) / 2, label, C_TEXT);
     }
-
-    int fx = pad * 2 + half, fw = w - half - pad;
+    int fx = px + half + pad, fw = w - half - pad;
     round_rect(fx, y, fw, ph, 8, C_PANEL);
-    struct { const char* k; char v[48]; } rows[6];
+    struct { const char* k; char v[48]; } rows[4];
     int count = 0;
     rows[count].k = "Up time"; fmt_duration(rows[count].v, mos_sysinfo_uptime_ms()); count++;
     rows[count].k = "Tasks"; fmt_u(rows[count].v, (uint64_t)task_count); count++;
     rows[count].k = "Cores"; fmt_u(rows[count].v, n); count++;
-    rows[count].k = "Free memory"; fmt_bytes(rows[count].v, mos_sysinfo_ram_free()); count++;
-    rows[count].k = "Kernel heap"; fmt_bytes(rows[count].v, mos_sysinfo_heap_used()); count++;
     for (int i = 0; i < count; i++) {
         int ry = y + 12 + i * 22;
         if (ry + 18 > y + ph) break;
         text(fx + 14, ry, rows[i].k, C_DIM);
         text(fx + fw - 14 - text_width(rows[i].v, 1), ry, rows[i].v, C_TEXT);
     }
+}
+
+static void draw_gpu(int x0) {
+    fill(x0, TAB_H, (int)width - x0, (int)height - TAB_H, C_BG);
+    int pad = 12, y = TAB_H + pad, w = (int)width - x0 - 2 * pad;
+    char v[64], t[32];
+    if (!gpu_ok) {
+        text(x0 + pad, y + 8, "This system does not report its graphics card (a newer kernel does).", C_DIM);
+        return;
+    }
+    text_big(x0 + pad, y, gpu_now.name[0] ? gpu_now.name : "No graphics card", C_TEXT);
+    strcpy(v, "FarcadeGL: ");
+    strcat(v, gpu_now.renderer[0] ? gpu_now.renderer : "CPU");
+    text(x0 + pad + w - text_width(v, 1), y + 8, v, C_DIM);
+    y += 40;
+    // Engines, 2 x 2 (the CPU renderer instead of Video Encode when the card's engines are not measured).
+    int engines = gpu_now.flags & SYS_GPU_STATS_ENGINES;
+    int show[4] = { GE_3D, GE_COPY, GE_DECODE, engines ? GE_ENCODE : GE_CPU };
+    int gw = (w - pad) / 2;
+    int total_h = (int)height - y - pad;
+    int gh = (total_h - 2 * pad) * 30 / 100;
+    if (gh < 96) gh = 96;
+    for (int k = 0; k < 4; k++) {
+        int e = show[k];
+        int gx = x0 + pad + (k % 2) * (gw + pad), gy = y + (k / 2) * (gh + pad);
+        if (!engines && e != GE_CPU) {
+            round_rect(gx, gy, gw, gh, 8, C_PANEL);
+            text(gx + 14, gy + 10, ge_name[e], C_DIM);
+            text(gx + 14, gy + 32, "not measured", C_DIM);
+            continue;
+        }
+        fmt_u(v, hist_count ? gpu_hist[e][hist_count - 1] : 0);
+        strcat(v, " %");
+        if (e == GE_ENCODE) strcat(v, "  (not used yet)");
+        graph(gx, gy, gw, gh, gpu_hist[e], hist_count, e == GE_3D ? C_OK : e == GE_COPY ? C_ACCENT : C_ACCENT2,
+              ge_name[e], v);
+    }
+    y += 2 * (gh + pad);
+    // Dedicated memory.
+    int mh = (int)height - y - pad;
+    if (mh < 60) return;
+    int mw = w * 62 / 100;
+    if (gpu_now.vram_total) {
+        fmt_bytes(v, gpu_now.vram_used); strcat(v, " / "); fmt_bytes(t, gpu_now.vram_total); strcat(v, t);
+    } else strcpy(v, "unknown");
+    graph(x0 + pad, y, mw, mh, vram_hist, hist_count, C_ACCENT2, "Dedicated GPU memory", v);
+    int fx = x0 + pad + mw + pad, fw = w - mw - pad;
+    round_rect(fx, y, fw, mh, 8, C_PANEL);
+    struct { const char* k; char v[32]; } rows[4];
+    int count = 0;
+    rows[count].k = "Utilization"; fmt_u(rows[count].v, hist_count ? gpu_top_hist[hist_count - 1] : 0); strcat(rows[count].v, " %"); count++;
+    rows[count].k = "Jobs/s"; fmt_u(rows[count].v, gpu_jobs_per_s); count++;
+    rows[count].k = "CPU drawing"; fmt_u(rows[count].v, hist_count ? gpu_hist[GE_CPU][hist_count - 1] : 0); strcat(rows[count].v, " %"); count++;
+    rows[count].k = "Free"; if (gpu_now.vram_total > gpu_now.vram_used) fmt_bytes(rows[count].v, gpu_now.vram_total - gpu_now.vram_used); else strcpy(rows[count].v, "-"); count++;
+    for (int i = 0; i < count; i++) {
+        int ry = y + 12 + i * 22;
+        if (ry + 18 > y + mh) break;
+        text(fx + 14, ry, rows[i].k, C_DIM);
+        text(fx + fw - 14 - text_width(rows[i].v, 1), ry, rows[i].v, C_TEXT);
+    }
+}
+
+static void draw_performance(void) {
+    draw_side();
+    if (perf_view == 2) draw_gpu(SIDE_W);
+    else draw_system(SIDE_W);
 }
 
 static void draw(void) {
@@ -612,7 +798,11 @@ static void move_selection(int delta) {
 static void click(int x, int y, uint64_t now) {
     for (int i = 0; i < 2; i++)
         if (inside(tab_rect(i), x, y)) { page = i; confirm = 0; return; }
-    if (page != 0) return;
+    if (page == 1) {
+        for (int i = 0; i < 3; i++)
+            if (inside(side_rect(i), x, y)) perf_view = i;
+        return;
+    }
     if (confirm) {
         if (inside(confirm_yes(), x, y)) { end_selected(now); return; }
         if (inside(confirm_no(), x, y)) { confirm = 0; return; }
@@ -686,6 +876,8 @@ int main(void) {
                     if (key == 43) { page = !page; confirm = 0; }                       // Tab
                     else if (key == 62) refresh(now);                                   // F5
                     else if (ctrl && key == 14) { show_kernel = !show_kernel; rebuild_view(); }   // Ctrl+K
+                    else if (page == 1 && key == 82) perf_view = perf_view > 0 ? perf_view - 1 : 0;   // Up
+                    else if (page == 1 && key == 81) perf_view = perf_view < 2 ? perf_view + 1 : 2;   // Down
                     else if (page == 0 && key == 82) move_selection(-1);                // Up
                     else if (page == 0 && key == 81) move_selection(1);                 // Down
                     else if (page == 0 && key == 75) move_selection(-list_rows());      // Page Up
