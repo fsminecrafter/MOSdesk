@@ -39,6 +39,7 @@ static const char* const g_page_names[PAGE_COUNT] = {
     "1  Disk", "2  Apps", "3  Repositories", "4  Install"
 };
 static int g_page;
+static int g_max_page;              // the furthest page reached: the step strip goes back to any up to it
 
 // Widgets of each page, shown and hidden together.
 #define PAGE_MAX_WIDGETS 32
@@ -66,7 +67,9 @@ static int g_repo_count;
 static int repo_input, repo_add;
 
 static int step_labels[PAGE_COUNT];
-static int back_button, next_button, summary;
+static int back_button, next_button;
+static int summary[3];              // disk, apps, repositories (an easyui label holds 127 characters)
+static int note;                    // under info: what happens to the picked disk
 
 static syscall_storage_device_t g_devices[MAX_DEVICES];
 static int g_disk_index[MAX_DEVICES];      // list row -> g_devices index
@@ -119,27 +122,43 @@ static const syscall_storage_device_t* selected_disk(void) {
     return &g_devices[g_disk_index[row]];
 }
 
+// Why a disk cannot be the target, or NULL when it can. A disk whose volumes are mounted as other drives
+// (1:, 2:, ...) can: the install unmounts them. Only the one holding the running system (0:) cannot.
+#define MIN_DISK_BYTES (512ull * 1024 * 1024)
+static const char* disk_problem(const syscall_storage_device_t* d) {
+    if (d->flags & SYSCALL_STORAGE_FLAG_BOOT) return "it holds the running system";
+    if (d->size_bytes < MIN_DISK_BYTES) return "it is too small (Minimal-OS needs 512 MiB)";
+    return NULL;
+}
+
 static void update_buttons(void) {
     const syscall_storage_device_t* d = selected_disk();
-    int ok = !g_running && g_payload && d && !(d->flags & SYSCALL_STORAGE_FLAG_IN_USE) &&
+    int ok = !g_running && g_payload && d && !disk_problem(d) &&
              easyui.getvalue(confirm);
     easyui.setenabled(install_button, ok);
     easyui.setenabled(mbr, d && d->size_bytes <= (2ull << 40));
-    int disk_ok = g_payload && d && !(d->flags & SYSCALL_STORAGE_FLAG_IN_USE);
+    int disk_ok = g_payload && d && !disk_problem(d);
     easyui.setenabled(next_button, !g_running && (g_page != PAGE_DISK || disk_ok));
     easyui.setenabled(back_button, !g_running && g_page > 0);
 }
 
 static void describe(void) {
     const syscall_storage_device_t* d = selected_disk();
-    char text[256] = "";
+    char text[128] = "";
+    if (!g_payload) {
+        // Next stays off: say why on this page (the install page's status line is not visible here).
+        easyui.settext(info, "Nothing to install from:");
+        easyui.settext(note, "start Minimal-OS from its ISO or an installed disk to install it.");
+        update_buttons();
+        return;
+    }
     if (!d) {
         int usable = 0;
         for (int r = 0; r < g_disk_rows; r++)
-            if (!(g_devices[g_disk_index[r]].flags & SYSCALL_STORAGE_FLAG_IN_USE)) usable++;
-        easyui.settext(info, !g_disk_rows ? "No disks found." :
-                       usable ? "Pick a disk." :
-                       "Every disk is in use by the running system. Attach another disk and press Rescan.");
+            if (!disk_problem(&g_devices[g_disk_index[r]])) usable++;
+        easyui.settext(info, !g_disk_rows ? "No disks found." : usable ? "Pick a disk." :
+                             "No disk can take Minimal-OS.");
+        easyui.settext(note, usable ? "" : "The system disk and disks under 512 MiB cannot. Attach one and press Rescan.");
         update_buttons();
         return;
     }
@@ -149,11 +168,19 @@ static void describe(void) {
     append(text, sizeof text, ": ");
     append(text, sizeof text, size);
     if (d->model[0]) { append(text, sizeof text, ", "); append(text, sizeof text, d->model); }
-    if (d->flags & SYSCALL_STORAGE_FLAG_IN_USE)
-        append(text, sizeof text, ". In use by the running system; pick another disk.");
-    else
-        append(text, sizeof text, ". Everything on it will be erased.");
     easyui.settext(info, text);
+    const char* why = disk_problem(d);
+    text[0] = '\0';
+    if (why) {
+        append(text, sizeof text, "Cannot be used: ");
+        append(text, sizeof text, why);
+        append(text, sizeof text, ".");
+    } else if (d->flags & SYSCALL_STORAGE_FLAG_IN_USE) {
+        append(text, sizeof text, "Its mounted volumes are unmounted, and everything on it is erased.");
+    } else {
+        append(text, sizeof text, "Everything on it will be erased.");
+    }
+    easyui.settext(note, text);
     easyui.settext(confirm, "Erase this disk and install Minimal-OS on it");
     update_buttons();
 }
@@ -177,13 +204,14 @@ static void scan(void) {
         append(row, sizeof row, "   ");
         append(row, sizeof row, d->model[0] ? d->model : "disk");
         if (d->flags & SYSCALL_STORAGE_FLAG_BOOT) append(row, sizeof row, "   (system disk)");
-        else if (d->flags & SYSCALL_STORAGE_FLAG_IN_USE) append(row, sizeof row, "   (in use)");
+        else if (d->size_bytes < MIN_DISK_BYTES) append(row, sizeof row, "   (too small)");
+        else if (d->flags & SYSCALL_STORAGE_FLAG_IN_USE) append(row, sizeof row, "   (mounted)");
         easyui.additem(list, row);
         g_disk_index[g_disk_rows++] = (int)i;
     }
     // Preselect the first disk that can be used.
     for (int r = 0; r < g_disk_rows; r++) {
-        if (!(g_devices[g_disk_index[r]].flags & SYSCALL_STORAGE_FLAG_IN_USE)) {
+        if (!disk_problem(&g_devices[g_disk_index[r]])) {
             easyui.setvalue(list, r);
             break;
         }
@@ -193,6 +221,22 @@ static void scan(void) {
                                "installed disk to install.");
     }
     describe();
+}
+
+// For its first seconds the installer looks again while no disk can take the system: after a RamFS boot the
+// kernel lists the computer's disks a moment after the desktop starts.
+static int g_auto_timer = -1, g_auto_left = 10;
+static void on_auto_rescan(int value) {
+    (void)value;
+    int usable = 0;
+    for (int r = 0; r < g_disk_rows; r++)
+        if (!disk_problem(&g_devices[g_disk_index[r]])) usable++;
+    if (usable || --g_auto_left <= 0) {
+        if (g_auto_timer >= 0) easyui.stoptimer(g_auto_timer);
+        g_auto_timer = -1;
+        return;
+    }
+    if (g_page == PAGE_DISK && !g_running) scan();
 }
 
 static void on_select(int value) { (void)value; describe(); }
@@ -389,7 +433,7 @@ static int build_command(const syscall_storage_device_t* d, char* out, size_t si
 
 static void update_summary(void) {
     const syscall_storage_device_t* d = selected_disk();
-    char text[512] = "";
+    char text[128] = "";
     char sz[24];
     append(text, sizeof text, "Disk: ");
     if (d) {
@@ -401,13 +445,17 @@ static void update_summary(void) {
     } else {
         append(text, sizeof text, "none picked");
     }
-    append(text, sizeof text, "\nApps: MOSdesk and its built-in apps");
+    easyui.settext(summary[0], text);
+    text[0] = '\0';
+    append(text, sizeof text, "Apps: MOSdesk and its built-in apps");
     for (int i = 0; i < g_app_count; i++) {
         if (!easyui.getvalue(g_app_checks[i])) continue;
         append(text, sizeof text, ", ");
         append(text, sizeof text, g_app_names[i]);
     }
-    append(text, sizeof text, "\nRepositories: ");
+    easyui.settext(summary[1], text);
+    text[0] = '\0';
+    append(text, sizeof text, "Repositories: ");
     int any = 0;
     for (int i = 0; i < g_repo_count; i++) {
         if (!easyui.getvalue(g_repo_checks[i])) continue;
@@ -416,7 +464,7 @@ static void update_summary(void) {
         any = 1;
     }
     if (!any) append(text, sizeof text, "none (add some later with 'dlr add')");
-    easyui.settext(summary, text);
+    easyui.settext(summary[2], text);
 }
 
 static void on_install(int value) {
@@ -458,11 +506,12 @@ static void on_done(int value) { (void)value; easyui.quit(); }
 static void show_page(int page) {
     if (page < 0 || page >= PAGE_COUNT) return;
     g_page = page;
+    if (page > g_max_page) g_max_page = page;
     for (int p = 0; p < PAGE_COUNT; p++) {
         for (int k = 0; k < g_page_widget_count[p]; k++)
             easyui.setvisible(g_page_widgets[p][k], p == page);
         easyui.setstyle(step_labels[p], p == page ? EASYUI_PRIMARY : EASYUI_SECONDARY);
-        easyui.setenabled(step_labels[p], p <= page);
+        easyui.setenabled(step_labels[p], p <= g_max_page);
     }
     easyui.setvisible(next_button, page != PAGE_INSTALL);
     if (page == PAGE_INSTALL) update_summary();
@@ -479,7 +528,7 @@ static void on_step(int value) {
     (void)value;
     int w = easyui.current();
     for (int p = 0; p < PAGE_COUNT; p++)
-        if (step_labels[p] == w && p <= g_page && !g_running) show_page(p);
+        if (step_labels[p] == w && p <= g_max_page && !g_running) show_page(p);
 }
 
 int main(void) {
@@ -505,7 +554,8 @@ int main(void) {
     list = page_add(easyui.createlistbox(20, 116, 430, 132));
     rescan = page_add(easyui.createbutton(460, 116, 80, 30, "Rescan"));
     easyui.setstyle(rescan, EASYUI_SECONDARY);
-    info = page_add(easyui.createlabel(20, 254, 520, 36, ""));
+    info = page_add(easyui.createlabel(20, 252, 520, 20, ""));
+    note = page_add(easyui.createlabel(20, 272, 520, 22, ""));
     page_add(easyui.createlabel(20, 300, 160, 20, "Partition scheme"));
     gpt = page_add(easyui.createradio(180, 298, 170, 24, "GPT (recommended)", 1));
     mbr = page_add(easyui.createradio(360, 298, 180, 24, "MBR (older PCs)", 1));
@@ -531,8 +581,8 @@ int main(void) {
     // 3. Repositories
     g_building = PAGE_REPOS;
     page_add(easyui.createlabel(20, 92, 520, 36,
-        "Deliver servers the new system installs packages from. Each is added the "
-        "first time the installed system reaches it (like 'dlr add')."));
+        "Deliver servers to install packages from. Each is added when the new system first "
+        "reaches it."));
     repo_input = page_add(easyui.createtextinput(20, 0, 370, 30, "host:port"));
     easyui.setmaxlength(repo_input, 63);
     repo_add = page_add(easyui.createbutton(400, 0, 140, 30, "Add repository"));
@@ -541,7 +591,7 @@ int main(void) {
 
     // 4. Install
     g_building = PAGE_INSTALL;
-    summary = page_add(easyui.createlabel(20, 92, 520, 92, ""));
+    for (int i = 0; i < 3; i++) summary[i] = page_add(easyui.createlabel(20, 96 + i * 28, 520, 26, ""));
     confirm = page_add(easyui.createcheckbox(20, 190, 520, 24,
                                              "Erase this disk and install Minimal-OS on it", 0));
     page_add(easyui.createlabel(20, 222, 260, 20, "Password for your account"));
@@ -574,5 +624,6 @@ int main(void) {
 
     scan();
     show_page(PAGE_DISK);
+    g_auto_timer = easyui.settimer(1500, on_auto_rescan);
     return easyui.run();
 }
