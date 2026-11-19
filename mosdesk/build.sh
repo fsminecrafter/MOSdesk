@@ -54,10 +54,14 @@ if [ -d "$APPS" ]; then
         name=$(basename -- "$app")
         case "$name" in
             *.c|*.cpp) name=${name%.*} ;;
+            icons) continue ;;
             *) [ -d "$app" ] || continue ;;
         esac
+        # Its launcher icon, when apps/icons/<name>.bmp exists (tools/make_icons.py).
+        ICON_ARGS=""
+        [ -f "$APPS/icons/$name.bmp" ] && ICON_ARGS="--icon $APPS/icons/$name.bmp"
         # One broken app should not stop the desktop from building.
-        if ! "$SDK_BUILD" --output "$PACKAGE/programs/mos_$name.run" "$app"; then
+        if ! "$SDK_BUILD" --output "$PACKAGE/programs/mos_$name.run" $ICON_ARGS "$app"; then
             echo "MOSdesk: WARNING: app '$name' failed to build and is left out" >&2
             SKIPPED_APPS="${SKIPPED_APPS:-}${SKIPPED_APPS:+ }$name"
         fi

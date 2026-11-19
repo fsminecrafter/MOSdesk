@@ -49,6 +49,7 @@ static uint64_t mos_window_get_icon(uint32_t id, uint32_t* pixels) {
 #define MOSDESK_VIDEO_PATH "0:/programs/mos_video.run"
 #define MOSDESK_PHOTOS_PATH "0:/programs/mos_photos.run"
 #define MOSDESK_CODE_PATH "0:/programs/mos_code.run"
+#define MOSDESK_TASKS_PATH "0:/programs/mos_tasks.run"
 #define MOSDESK_TERMINAL_PATH "0:/programs/mos_terminal.run"
 
 #define SYS_HEAP_ALLOC 1u
@@ -10343,6 +10344,16 @@ static void route_input(const syscall_input_event_t* input,
                 repeat_key = 0;
             }
             if (input->type == SYSCALL_INPUT_KEY_DOWN) dialog_key(input);
+            return;
+        }
+        /* Ctrl+Shift+Esc opens Tasks, whatever has the focus (a program
+         * that stopped answering included). */
+        if (input->type == SYSCALL_INPUT_KEY_DOWN && input->key == 41u &&
+            (input->mods & SYSCALL_INPUT_MOD_CTRL) &&
+            (input->mods & SYSCALL_INPUT_MOD_SHIFT)) {
+            menu_open = false;
+            if ((int64_t)mos_syscall3(SYS_EXEC, (uint64_t)(uintptr_t)MOSDESK_TASKS_PATH, 0, 0) < 0)
+                open_note(false, "Unable to open Tasks", true);
             return;
         }
         if (menu_open) {

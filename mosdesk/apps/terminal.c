@@ -999,6 +999,137 @@ static void cmd_history(int argc, char** argv) {
     }
 }
 
+
+/* mossettings: system settings in 0:/etc/System.conf (the kernel terminal
+ * has the same command). bootupanim: the hourglass while the system starts. */
+#define SYSCONF_PATH "0:/etc/System.conf"
+typedef struct { const char* name; const char* key; const char* fallback; const char* help; } mos_setting_t;
+static const mos_setting_t mos_settings[] = {
+    {"bootupanim", "BootupAnim", "true", "the hourglass animation from power-on until the desktop starts"},
+};
+#define MOS_SETTING_COUNT (sizeof(mos_settings) / sizeof(mos_settings[0]))
+
+static int lower_c(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+static int same_ci(const char* a, const char* b) {
+    while (*a && *b && lower_c((unsigned char)*a) == lower_c((unsigned char)*b)) { a++; b++; }
+    return !*a && !*b;
+}
+static char* read_sysconf(long* size) {
+    long fd = mos_open(SYSCONF_PATH, SYS_O_RDONLY);
+    *size = 0;
+    if (fd <= 0) return NULL;
+    long n = mos_size(fd), got = 0, r;
+    char* d = n >= 0 ? (char*)malloc((size_t)n + 1u) : NULL;
+    while (d && got < n && (r = mos_read(fd, d + got, (size_t)(n - got))) > 0) got += r;
+    mos_close(fd);
+    if (!d) return NULL;
+    d[got] = 0;
+    *size = got;
+    return d;
+}
+/* The line "key=value" (case-insensitive key): where the value starts, or -1. */
+static long sysconf_find(const char* d, long n, const char* key, long* line_start, long* line_end) {
+    long ls = 0;
+    while (ls < n) {
+        long le = ls;
+        while (le < n && d[le] != '\n') le++;
+        long i = ls, k = 0;
+        while (i < le && (d[i] == ' ' || d[i] == '\t')) i++;
+        while (key[k] && i < le && lower_c((unsigned char)d[i]) == lower_c((unsigned char)key[k])) { i++; k++; }
+        if (!key[k]) {
+            while (i < le && (d[i] == ' ' || d[i] == '\t')) i++;
+            if (i < le && d[i] == '=') {
+                i++;
+                while (i < le && (d[i] == ' ' || d[i] == '\t')) i++;
+                *line_start = ls;
+                *line_end = le;
+                return i;
+            }
+        }
+        ls = le + 1;
+    }
+    return -1;
+}
+static void setting_value(const mos_setting_t* st, char* out, size_t cap) {
+    long n, ls, le;
+    char* d = read_sysconf(&n);
+    long v = d ? sysconf_find(d, n, st->key, &ls, &le) : -1;
+    if (v >= 0) {
+        long e = le;
+        while (e > v && (d[e - 1] == '\r' || d[e - 1] == ' ')) e--;
+        size_t len = (size_t)(e - v) < cap - 1 ? (size_t)(e - v) : cap - 1;
+        memcpy(out, d + v, len);
+        out[len] = 0;
+    } else {
+        strlcpy_safe(out, st->fallback, cap);
+    }
+    free(d);
+    int off = out[0] == 'f' || out[0] == 'F' || out[0] == '0' || out[0] == 'n' || out[0] == 'N';
+    strlcpy_safe(out, off ? "false" : "true", cap);
+}
+static int setting_store(const mos_setting_t* st, const char* value) {
+    long n, ls, le;
+    char* d = read_sysconf(&n);
+    size_t kl = strlen(st->key), vl = strlen(value);
+    char* out = (char*)malloc((size_t)n + kl + vl + 4u);
+    if (!out) { free(d); return 0; }
+    long o = 0;
+    long v = d ? sysconf_find(d, n, st->key, &ls, &le) : -1;
+    if (v >= 0) {
+        memcpy(out, d, (size_t)ls); o = ls;
+    } else {
+        if (d && n) { memcpy(out, d, (size_t)n); o = n; if (out[o - 1] != '\n') out[o++] = '\n'; }
+    }
+    memcpy(out + o, st->key, kl); o += (long)kl;
+    out[o++] = '=';
+    memcpy(out + o, value, vl); o += (long)vl;
+    out[o++] = '\n';
+    if (v >= 0 && le < n) { memcpy(out + o, d + le + 1, (size_t)(n - le - 1)); o += n - le - 1; }
+    if (mos_is_dir("0:/etc") != 1) mos_mkdir("0:/etc");
+    int ok = write_file(SYSCONF_PATH, out, o);
+    free(out);
+    free(d);
+    return ok;
+}
+static const mos_setting_t* find_setting(const char* name) {
+    for (unsigned i = 0; i < MOS_SETTING_COUNT; i++)
+        if (same_ci(name, mos_settings[i].name) || same_ci(name, mos_settings[i].key)) return &mos_settings[i];
+    return NULL;
+}
+static void cmd_mossettings(int argc, char** argv) {
+    const char* usage = "usage: mossettings list | get <name> | set <name> <true|false>";
+    if (argc < 2) { error_line("mossettings", usage); return; }
+    char v[32];
+    if (same_ci(argv[1], "list")) {
+        for (unsigned i = 0; i < MOS_SETTING_COUNT; i++) {
+            setting_value(&mos_settings[i], v, sizeof v);
+            outc(mos_settings[i].name, color_ok);
+            for (int pad = (int)strlen(mos_settings[i].name); pad < 13; pad++) out(" ");
+            out(v);
+            for (int pad = (int)strlen(v); pad < 7; pad++) out(" ");
+            outc("(true|false)  ", color_dim);
+            out(mos_settings[i].help);
+            out("\n");
+        }
+        return;
+    }
+    if (same_ci(argv[1], "get") || same_ci(argv[1], "set")) {
+        int set = same_ci(argv[1], "set");
+        if (argc < (set ? 4 : 3)) { error_line("mossettings", usage); return; }
+        const mos_setting_t* st = find_setting(argv[2]);
+        if (!st) { error_line("mossettings", "no such setting (mossettings list shows them)"); return; }
+        if (!set) { setting_value(st, v, sizeof v); out(v); out("\n"); return; }
+        const char* a = argv[3];
+        const char* nv = same_ci(a, "true") || same_ci(a, "on") || same_ci(a, "yes") || same_ci(a, "1") ? "true"
+                       : same_ci(a, "false") || same_ci(a, "off") || same_ci(a, "no") || same_ci(a, "0") ? "false" : NULL;
+        if (!nv) { error_line("mossettings", "the value must be true or false"); return; }
+        if (!setting_store(st, nv)) { error_line("mossettings", "could not write 0:/etc/System.conf"); return; }
+        out(st->name); out(" = "); out(nv); outc("  (from the next start)\n", color_dim);
+        return;
+    }
+    error_line("mossettings", usage);
+}
+
 static void cmd_exit(int argc, char** argv) { (void)argc; (void)argv; easyui.quit(); }
 
 static const command_t commands[] = {
@@ -1028,6 +1159,7 @@ static const command_t commands[] = {
     {"img", cmd_img, "<file.img>  show a picture"},
     {"root", cmd_root, "<command>  run a kernel command (asks for your password, or y/N)"},
     {"programs", cmd_programs, "installed programs"},
+    {"mossettings", cmd_mossettings, "list | get <name> | set <name> <value>  system settings"},
     {"history", cmd_history, "commands typed so far"},
     {"clear", cmd_clear, "clear the screen"},
     {"exit", cmd_exit, "close the terminal"},
