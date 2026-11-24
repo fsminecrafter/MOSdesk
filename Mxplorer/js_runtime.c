@@ -3554,6 +3554,13 @@ js_val js_promise_resolved(js_val value, int rejected) {
     return js_obj_val(p);
 }
 
+js_obj* js_promise_new(void) { return new_promise(); }
+
+void js_promise_settle(js_obj* p, js_val value, int rejected) {
+    if (rejected) settle(p, 2, value);
+    else resolve_promise(p, value);
+}
+
 int js_promise_state(js_val promise, js_val* value) {
     if (promise.type != JS_OBJ || promise.u.obj->cls != CLS_PROMISE) return 1;
     promise_data* d = (promise_data*)promise.u.obj->data;
@@ -3574,8 +3581,9 @@ js_val js_promise_then(js_val promise, js_val on_ok, js_val on_err) {
     if (d->state) {
         schedule_reaction(r, d->state, d->value);
     } else {
-        r->next = d->reactions;
-        d->reactions = r;
+        reaction** tail = &d->reactions;
+        while (*tail) tail = &(*tail)->next;
+        *tail = r;
     }
     return js_obj_val(r->derived);
 }
@@ -3618,6 +3626,7 @@ static js_val promise_ctor(js_val self, js_val* args, int argc, js_obj* callee) 
     if (!js_is_callable(executor)) return js_throw_error("TypeError", "Promise resolver is not a function");
     js_obj* ok = js_new_native("resolve", resolve_fn, 1);
     ok->data = p;
+    ok->magic = 0;   /* js_new_native stores the arity here; 1 would mean reject */
     js_obj* err = js_new_native("reject", resolve_fn, 1);
     err->data = p;
     err->magic = 1;

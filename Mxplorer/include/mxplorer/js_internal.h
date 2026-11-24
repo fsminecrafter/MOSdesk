@@ -320,7 +320,9 @@ void js_runtime_init(void);
 js_val js_regexp_create(js_str* pattern, js_str* flags);
 js_val js_promise_resolved(js_val value, int rejected);
 js_val js_promise_then(js_val promise, js_val on_ok, js_val on_err);
-int js_promise_state(js_val promise, js_val* value);   /* 0 pending, 1 ok, 2 err */
+int js_promise_state(js_val promise, js_val* value);
+js_obj* js_promise_new(void);
+void js_promise_settle(js_obj* p, js_val value, int rejected);   /* 0 pending, 1 ok, 2 err */
 
 /* dom.c */
 void js_dom_init(void);

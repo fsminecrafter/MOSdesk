@@ -3146,6 +3146,7 @@ typedef struct gen_collector {
     struct gen_collector* prev;
 } gen_collector;
 static gen_collector* current_gen;
+static js_str* current_label;
 #define GEN_MAX_YIELDS 20000
 
 static js_obj* generator_proto;
@@ -3206,9 +3207,534 @@ static js_val make_generator(js_obj* values, js_val return_value, int is_async) 
     return js_obj_val(it);
 }
 
+/* ---- coroutines: lazy generators and suspending async functions ----
+ *
+ * A generator or async function body runs on its own small stack, so it can
+ * stop at a `yield` or at an `await` of a pending promise and continue later
+ * exactly where it was. Without this (other CPUs, or when no stack can be
+ * allocated) generators fall back to running eagerly (gen_collector above)
+ * and `await` to draining microtasks. */
+#if defined(__x86_64__)
+#define JS_HAVE_CORO 1
+__attribute__((visibility("hidden"))) void js_coro_switch(void** save_sp, void* to_sp);
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    "js_coro_switch:\n"
+    "    pushq %rbp\n"
+    "    pushq %rbx\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    movq %rsp, (%rdi)\n"
+    "    movq %rsi, %rsp\n"
+    "    popq %r15\n"
+    "    popq %r14\n"
+    "    popq %r13\n"
+    "    popq %r12\n"
+    "    popq %rbx\n"
+    "    popq %rbp\n"
+    "    ret\n");
+/* Calls fn(arg) with the stack pointer at `top`. */
+__attribute__((visibility("hidden"))) void js_call_on_stack(void* arg, void (*fn)(void*), void* top);
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    "js_call_on_stack:\n"
+    "    pushq %rbp\n"
+    "    movq %rsp, %rbp\n"
+    "    movq %rdx, %rsp\n"
+    "    call *%rsi\n"
+    "    movq %rbp, %rsp\n"
+    "    popq %rbp\n"
+    "    ret\n");
+#else
+#define JS_HAVE_CORO 0
+#endif
+
+/* Only the generator or async function's own body runs on its stack: every
+ * function it calls runs on the resumer's (big) stack, just below where the
+ * resumer is waiting, so a small stack is enough however deep that code
+ * goes. */
+#define CORO_STACK_SIZE (64u * 1024u)
+#define CORO_STACK_MARGIN (16u * 1024u)
+#define CORO_MAX_LIVE 1024
+#define CORO_POOL 16
+
+enum { SUSPEND_NONE, SUSPEND_YIELD, SUSPEND_AWAIT };
+
+typedef struct agen_request {
+    int mode;                   /* 0 next, 1 throw, 2 return */
+    js_val value;
+    js_obj* promise;
+    struct agen_request* next;
+} agen_request;
+
+typedef struct js_coro {
+    char* stack;
+    void* sp;                   /* coroutine's stack pointer while suspended */
+    void* caller_sp;            /* resumer's stack pointer while running */
+    js_obj* fo;
+    js_env* env;
+    js_obj* new_target;
+    uint8_t is_async, is_generator, started, running, done, suspend;
+    int resume_mode;            /* how it was resumed: 0 value, 1 throw, 2 return */
+    js_val transfer;            /* value passed in (resume) or out (yield) */
+    js_val result;              /* return value once done */
+    int depth_delta;
+    const char* source;
+    char* big_base;             /* the resumer's stack, for calls made from the body */
+    long big_limit;
+    js_obj* promise;            /* async function: its result */
+    agen_request* queue;        /* async generator: pending next() calls */
+    struct js_coro* next_live;
+} js_coro;
+
+static js_coro* current_coro;
+static js_coro* live_coros;     /* malloc'd; freed when the page goes */
+static int live_coro_count;
+static char* stack_pool[CORO_POOL];
+static int stack_pool_count;
+static js_obj* coro_gen_proto;
+static js_obj* coro_agen_proto;
+
+static js_val run_body(js_obj* fo, js_env* env, js_obj* new_target, js_val self);
+
+static void coro_release_stack(js_coro* c) {
+    if (!c->stack) return;
+    if (stack_pool_count < CORO_POOL) stack_pool[stack_pool_count++] = c->stack;
+    else free(c->stack);
+    c->stack = NULL;
+}
+
+/* Frees every coroutine of the previous page (their stacks point into the
+ * script heap, which is gone). */
+static void coro_reset(void) {
+    for (js_coro* c = live_coros; c;) {
+        js_coro* next = c->next_live;
+        coro_release_stack(c);
+        free(c);
+        c = next;
+    }
+    live_coros = NULL;
+    live_coro_count = 0;
+    current_coro = NULL;
+    coro_gen_proto = coro_agen_proto = NULL;
+}
+
+static void coro_entry(void) {
+    js_coro* c = current_coro;
+    c->result = run_body(c->fo, c->env, c->new_target, c->env->this_val);
+    c->done = 1;
+    c->suspend = SUSPEND_NONE;
+#if JS_HAVE_CORO
+    js_coro_switch(&c->sp, c->caller_sp);
+#endif
+    for (;;) {}
+}
+
+static js_coro* coro_create(js_obj* fo, js_env* env, js_obj* new_target) {
+#if JS_HAVE_CORO
+    if (live_coro_count >= CORO_MAX_LIVE) {
+        /* drop finished ones from the list first */
+        js_coro** link = &live_coros;
+        while (*link) {
+            js_coro* c = *link;
+            if (c->done && !c->running) {
+                *link = c->next_live;
+                coro_release_stack(c);
+                free(c);
+                live_coro_count--;
+            } else {
+                link = &c->next_live;
+            }
+        }
+        if (live_coro_count >= CORO_MAX_LIVE) return NULL;
+    }
+    char* stack = stack_pool_count ? stack_pool[--stack_pool_count] : (char*)malloc(CORO_STACK_SIZE);
+    if (!stack) return NULL;
+    js_coro* c = (js_coro*)calloc(1, sizeof(js_coro));
+    if (!c) {
+        free(stack);
+        return NULL;
+    }
+    c->stack = stack;
+    c->fo = fo;
+    c->env = env;
+    c->new_target = new_target;
+    c->transfer = c->result = js_undef();
+    /* first switch: pop six registers, then `ret` into coro_entry with the
+     * stack aligned as for a call */
+    uintptr_t top = ((uintptr_t)(stack + CORO_STACK_SIZE)) & ~(uintptr_t)15u;
+    void** sp = (void**)top;
+    *--sp = NULL;                       /* coro_entry's return address */
+    *--sp = (void*)coro_entry;
+    for (int i = 0; i < 6; i++) *--sp = NULL;
+    c->sp = sp;
+    c->next_live = live_coros;
+    live_coros = c;
+    live_coro_count++;
+    env->captured = 1;                  /* never pooled: the body keeps using it */
+    return c;
+#else
+    (void)fo; (void)env; (void)new_target;
+    return NULL;
+#endif
+}
+
+/* Runs `c` until it yields, awaits or finishes. */
+static void coro_run(js_coro* c) {
+#if JS_HAVE_CORO
+    char* saved_base = js_rt.stack_base;
+    long saved_limit = js_rt.stack_limit;
+    int depth = js_rt.depth;
+    const char* saved_source = js_rt.source;
+    int saved_line = js_rt.line;
+    int saved_allowed = scope_allowed;
+    js_str* saved_label = current_label;
+    gen_collector* saved_gen = current_gen;
+    js_coro* prev = current_coro;
+    current_coro = c;
+    current_gen = NULL;
+    current_label = NULL;
+    c->running = 1;
+    c->started = 1;
+    c->suspend = SUSPEND_NONE;
+    c->big_base = saved_base;
+    c->big_limit = saved_limit;
+    js_rt.stack_base = (char*)(((uintptr_t)(c->stack + CORO_STACK_SIZE)) & ~(uintptr_t)15u);
+    js_rt.stack_limit = (long)(CORO_STACK_SIZE - CORO_STACK_MARGIN);
+    js_rt.depth = depth + c->depth_delta;
+    if (c->source) js_rt.source = c->source;
+    scope_allowed = 0;
+    js_coro_switch(&c->caller_sp, c->sp);
+    c->running = 0;
+    c->depth_delta = js_rt.depth - depth;
+    c->source = js_rt.source;
+    js_rt.stack_base = saved_base;
+    js_rt.stack_limit = saved_limit;
+    js_rt.depth = depth;
+    js_rt.source = saved_source;
+    js_rt.line = saved_line;
+    scope_allowed = saved_allowed;
+    current_label = saved_label;
+    current_gen = saved_gen;
+    current_coro = prev;
+    if (c->done) coro_release_stack(c);
+#else
+    (void)c;
+#endif
+}
+
+static void coro_suspend(js_coro* c, int kind) {
+#if JS_HAVE_CORO
+    c->suspend = (uint8_t)kind;
+    js_coro_switch(&c->sp, c->caller_sp);
+#else
+    (void)c; (void)kind;
+#endif
+}
+
+static js_val iter_result(js_val value, int done) {
+    js_obj* r = js_new_object(js_object_proto);
+    js_set(js_obj_val(r), js_intern_c("value"), value);
+    js_set(js_obj_val(r), js_intern_c("done"), js_bool(done));
+    return js_obj_val(r);
+}
+
+/* async functions: settle the result promise once the body is done */
+static void async_finish(js_coro* c) {
+    if (!c->done || !c->promise) return;
+    js_obj* p = c->promise;
+    c->promise = NULL;
+    if (js_rt.ctl == CTL_THROW) {
+        js_val error = js_rt.value;
+        js_rt.ctl = CTL_NONE;
+        js_promise_settle(p, error, 1);
+    } else {
+        js_rt.ctl = CTL_NONE;
+        js_promise_settle(p, c->result, 0);
+    }
+}
+
+/* async generators: answer the oldest next() after a yield or the end */
+static void agen_after(js_coro* c) {
+    if (!c->done && c->suspend == SUSPEND_AWAIT) return;
+    agen_request* req = c->queue;
+    if (!req) return;
+    c->queue = req->next;
+    if (c->done) {
+        if (js_rt.ctl == CTL_THROW) {
+            js_val error = js_rt.value;
+            js_rt.ctl = CTL_NONE;
+            js_promise_settle(req->promise, error, 1);
+        } else {
+            js_rt.ctl = CTL_NONE;
+            js_promise_settle(req->promise, iter_result(c->result, 1), 0);
+            c->result = js_undef();
+        }
+    } else {
+        js_promise_settle(req->promise, iter_result(c->transfer, 0), 0);
+    }
+}
+
+static void agen_pump(js_coro* c) {
+    while (c->queue && !c->running) {
+        if (!c->done && c->suspend == SUSPEND_AWAIT) return;
+        agen_request* req = c->queue;
+        if (!c->done && !c->started && req->mode) {
+            c->done = 1;
+            coro_release_stack(c);
+        }
+        if (c->done) {
+            c->queue = req->next;
+            if (req->mode == 1) js_promise_settle(req->promise, req->value, 1);
+            else js_promise_settle(req->promise, iter_result(req->mode == 2 ? req->value : js_undef(), 1), 0);
+            continue;
+        }
+        c->resume_mode = req->mode;
+        c->transfer = req->value;
+        coro_run(c);
+        agen_after(c);
+    }
+}
+
+static js_val coro_await_cb(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self;
+    js_coro* c = (js_coro*)callee->data;
+    if (!c || c->done || c->running || c->suspend != SUSPEND_AWAIT) return js_undef();
+    c->resume_mode = callee->magic;
+    c->transfer = argc > 0 ? args[0] : js_undef();
+    coro_run(c);
+    if (c->is_generator) {
+        agen_after(c);
+        agen_pump(c);
+    } else {
+        async_finish(c);
+    }
+    return js_undef();
+}
+
+/* `await v` */
+static js_val coro_await(js_val v) {
+    js_coro* c = current_coro;
+    if (!c || !c->is_async || current_gen) return await_value(v);
+    js_val p = v;
+    if (v.type != JS_OBJ || v.u.obj->cls != CLS_PROMISE) {
+        p = js_promise_resolved(v, 0);   /* adopts thenables */
+        if (js_rt.ctl) return js_undef();
+    }
+    js_obj* ok = js_new_native("", coro_await_cb, 1);
+    ok->data = c;
+    ok->magic = 0;
+    js_obj* err = js_new_native("", coro_await_cb, 1);
+    err->data = c;
+    err->magic = 1;
+    js_promise_then(p, js_obj_val(ok), js_obj_val(err));
+    coro_suspend(c, SUSPEND_AWAIT);
+    if (c->resume_mode == 1) return js_throw(c->transfer);
+    return c->transfer;
+}
+
+/* `yield v` inside a coroutine generator */
+static js_val coro_yield(js_coro* c, js_val v) {
+    if (c->is_async) {
+        v = coro_await(v);
+        if (js_rt.ctl) return js_undef();
+    }
+    c->transfer = v;
+    coro_suspend(c, SUSPEND_YIELD);
+    if (c->resume_mode == 1) return js_throw(c->transfer);
+    if (c->resume_mode == 2) {
+        js_val r = c->transfer;
+        if (c->is_async) {
+            r = coro_await(r);
+            if (js_rt.ctl) return js_undef();
+        }
+        js_rt.ctl = CTL_RETURN;   /* runs finally blocks on the way out */
+        js_rt.value = r;
+        return js_undef();
+    }
+    return c->transfer;
+}
+
+/* `yield* iterable` inside a coroutine generator */
+static js_val coro_yield_star(js_coro* c, js_val iterable) {
+    js_val method = js_undef();
+    if (c->is_async) method = js_get_c(iterable, "@@asyncIterator");
+    if (!js_is_callable(method)) method = js_get_c(iterable, "@@iterator");
+    if (js_rt.ctl) return js_undef();
+    if (!js_is_callable(method)) return js_throw_error("TypeError", "yield* operand is not iterable");
+    js_val it = js_call(method, iterable, NULL, 0);
+    if (js_rt.ctl) return js_undef();
+    js_val next = js_get_c(it, "next");
+    if (js_rt.ctl) return js_undef();
+    js_val sent = js_undef();
+    int mode = 0;
+    for (;;) {
+        js_val fn = next;
+        if (mode == 1) fn = js_get_c(it, "throw");
+        else if (mode == 2) fn = js_get_c(it, "return");
+        if (js_rt.ctl) return js_undef();
+        if (!js_is_callable(fn)) {
+            if (mode == 1) return js_throw(sent);
+            if (mode == 2) {
+                js_rt.ctl = CTL_RETURN;
+                js_rt.value = sent;
+                return js_undef();
+            }
+            return js_throw_error("TypeError", "iterator.next is not a function");
+        }
+        js_val r = js_call(fn, it, &sent, 1);
+        if (js_rt.ctl) return js_undef();
+        if (c->is_async) {
+            r = coro_await(r);
+            if (js_rt.ctl) return js_undef();
+        }
+        if (r.type != JS_OBJ) return js_throw_error("TypeError", "Iterator result is not an object");
+        int done = js_truthy(js_get_c(r, "done"));
+        js_val value = js_get_c(r, "value");
+        if (js_rt.ctl) return js_undef();
+        if (done) {
+            if (mode == 2) {
+                js_rt.ctl = CTL_RETURN;
+                js_rt.value = value;
+                return js_undef();
+            }
+            return value;
+        }
+        c->transfer = value;
+        coro_suspend(c, SUSPEND_YIELD);
+        mode = c->resume_mode;
+        sent = c->transfer;
+    }
+}
+
+static js_coro* this_coro(js_val self) {
+    if (self.type == JS_OBJ && self.u.obj->magic == 0x7c0 && self.u.obj->data) return (js_coro*)self.u.obj->data;
+    js_throw_error("TypeError", "next method called on incompatible receiver");
+    return NULL;
+}
+
+static js_val coro_gen_next(js_val self, js_val* args, int argc, js_obj* callee) {
+    js_coro* c = this_coro(self);
+    if (!c) return js_undef();
+    int mode = callee->magic;
+    js_val arg = argc > 0 ? args[0] : js_undef();
+    if (c->running) return js_throw_error("TypeError", "Generator is already running");
+    if (!c->done && !c->started && mode) {
+        c->done = 1;
+        coro_release_stack(c);
+    }
+    if (c->done) {
+        if (mode == 1) return js_throw(arg);
+        return iter_result(mode == 2 ? arg : js_undef(), 1);
+    }
+    c->resume_mode = mode;
+    c->transfer = arg;
+    coro_run(c);
+    if (js_rt.ctl) return js_undef();
+    if (c->done) {
+        js_val r = c->result;
+        c->result = js_undef();
+        return iter_result(r, 1);
+    }
+    return iter_result(c->transfer, 0);
+}
+
+static js_val coro_agen_next(js_val self, js_val* args, int argc, js_obj* callee) {
+    js_coro* c = this_coro(self);
+    if (!c) return js_undef();
+    agen_request* req = (agen_request*)js_alloc(sizeof(agen_request));
+    req->mode = callee->magic;
+    req->value = argc > 0 ? args[0] : js_undef();
+    req->promise = js_promise_new();
+    req->next = NULL;
+    agen_request** tail = &c->queue;
+    while (*tail) tail = &(*tail)->next;
+    *tail = req;
+    js_obj* promise = req->promise;
+    agen_pump(c);
+    return js_obj_val(promise);
+}
+
+static js_val return_self(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)args; (void)argc; (void)callee;
+    return self;
+}
+
+static js_val make_coro_generator(js_coro* c, js_obj* fo) {
+    js_obj** protop = c->is_async ? &coro_agen_proto : &coro_gen_proto;
+    if (!*protop) {
+        js_obj* proto = js_new_object(js_object_proto);
+        js_native fn = c->is_async ? coro_agen_next : coro_gen_next;
+        static const char* const names[] = {"next", "throw", "return"};
+        for (int i = 0; i < 3; i++) {
+            js_obj* m = js_new_native(names[i], fn, 1);
+            m->magic = (int16_t)i;
+            js_define(proto, names[i], js_obj_val(m), PROP_HIDDEN);
+        }
+        js_define_native(proto, c->is_async ? "@@asyncIterator" : "@@iterator", return_self, 0);
+        js_define(proto, "@@toStringTag", js_str_val(js_intern_c(c->is_async ? "AsyncGenerator" : "Generator")), PROP_HIDDEN);
+        *protop = proto;
+    }
+    (void)fo;
+    js_obj* it = js_new_object(*protop);
+    it->magic = 0x7c0;
+    it->data = c;
+    return js_obj_val(it);
+}
+
+#if JS_HAVE_CORO
+typedef struct {
+    js_obj* fo;
+    js_val self;
+    js_val* args;
+    int argc;
+    js_obj* new_target;
+    js_val result;
+} big_call;
+
+static void big_call_run(void* p) {
+    big_call* b = (big_call*)p;
+    b->result = call_function(b->fo, b->self, b->args, b->argc, b->new_target);
+}
+
+static int on_coro_stack(js_coro* c) {
+    char probe;
+    return c->stack && &probe >= c->stack && &probe < c->stack + CORO_STACK_SIZE;
+}
+
+static js_val call_on_big_stack(js_coro* c, js_obj* fo, js_val self, js_val* args, int argc,
+                                js_obj* new_target) {
+    big_call b = {fo, self, args, argc, new_target, js_undef()};
+    char* coro_base = js_rt.stack_base;
+    long coro_limit = js_rt.stack_limit;
+    /* the resumer waits inside js_coro_switch at caller_sp; below it is free */
+    char* top = (char*)(((uintptr_t)c->caller_sp - 512u) & ~(uintptr_t)15u);
+    long used_above = c->big_base > top ? (long)(c->big_base - top) : 0;
+    js_rt.stack_base = c->big_base;
+    js_rt.stack_limit = c->big_limit;
+    if (used_above >= c->big_limit) {
+        js_rt.stack_base = coro_base;
+        js_rt.stack_limit = coro_limit;
+        return js_throw_error("RangeError", "Maximum call stack size exceeded");
+    }
+    js_call_on_stack(&b, big_call_run, top);
+    js_rt.stack_base = coro_base;
+    js_rt.stack_limit = coro_limit;
+    return b.result;
+}
+#endif
+
 static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
                             js_obj* new_target) {
     if (js_rt.ctl) return js_undef();
+#if JS_HAVE_CORO
+    if (current_coro && current_coro->running && on_coro_stack(current_coro))
+        return call_on_big_stack(current_coro, fo, self, args, argc, new_target);
+#endif
     if (stack_exhausted() || js_rt.depth > 1000) {
         return js_throw_error("RangeError", "Maximum call stack size exceeded");
     }
@@ -3231,7 +3757,7 @@ static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
         return js_throw_error("TypeError", "Class constructor cannot be invoked without 'new'");
     size_t saved_top = scope_top;
     int saved_allowed = scope_allowed;
-    int use_stack = !f->has_closures && !f->uses_arguments;
+    int use_stack = !f->has_closures && !f->uses_arguments && !f->generator && !f->is_async;
     scope_allowed = use_stack;
     uint32_t capacity = (uint32_t)(f->param_count + f->var_count + f->function_count + 2);
     js_env* env = new_env(fo->env, capacity, use_stack);
@@ -3274,29 +3800,34 @@ static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
         bind_pattern(param, i < argc ? args[i] : js_undef(), env, VAR_LET, 1);
     }
     js_val result = js_undef();
+    if ((f->generator || f->is_async) && !js_rt.ctl) {
+        js_coro* c = coro_create(fo, env, new_target);
+        if (c) {
+            c->is_async = f->is_async;
+            c->is_generator = f->generator;
+            js_rt.depth--;
+            js_rt.source = saved_source;
+            scope_top = saved_top;
+            scope_allowed = saved_allowed;
+            if (f->generator) return make_coro_generator(c, fo);
+            /* async function: runs now until its first await */
+            js_obj* promise = js_promise_new();
+            c->promise = promise;
+            coro_run(c);
+            async_finish(c);
+            return js_obj_val(promise);
+        }
+    }
     gen_collector collector;
+    js_coro* outer_coro = current_coro;
     if (f->generator) {
         collector.values = js_new_array(0);
         collector.prev = current_gen;
         current_gen = &collector;
     }
-    if (!js_rt.ctl) {
-        hoist(f, env);
-        if (new_target && f->is_class_constructor && !f->derived)
-            init_class_fields(fo, self);
-        if (f->expression_body) {
-            result = eval(f->body, env);
-        } else if (f->body) {
-            js_node* body = f->body;
-            for (uint32_t i = 0; i < body->count && !js_rt.ctl; i++) exec(body->list[i], env);
-            if (js_rt.ctl == CTL_RETURN) {
-                result = js_rt.value;
-                js_rt.ctl = CTL_NONE;
-            } else if (js_rt.ctl == CTL_BREAK || js_rt.ctl == CTL_CONTINUE) {
-                js_rt.ctl = CTL_NONE;
-            }
-        }
-    }
+    if (f->generator || f->is_async) current_coro = NULL;   /* eager fallback */
+    if (!js_rt.ctl) result = run_body(fo, env, new_target, self);
+    current_coro = outer_coro;
     if (new_target && f->derived && !js_rt.ctl) {
         /* derived constructors return the object super() made */
         js_val this_now = env->this_val;
@@ -3319,6 +3850,29 @@ static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
             return js_promise_resolved(error, 1);
         }
         return js_promise_resolved(result, 0);
+    }
+    return result;
+}
+
+/* Hoists and runs a function body in its prepared scope. */
+static js_val run_body(js_obj* fo, js_env* env, js_obj* new_target, js_val self) {
+    js_func* f = fo->func;
+    js_val result = js_undef();
+    hoist(f, env);
+    if (new_target && f->is_class_constructor && !f->derived)
+        init_class_fields(fo, self);
+    if (js_rt.ctl) return result;
+    if (f->expression_body) {
+        result = eval(f->body, env);
+    } else if (f->body) {
+        js_node* body = f->body;
+        for (uint32_t i = 0; i < body->count && !js_rt.ctl; i++) exec(body->list[i], env);
+        if (js_rt.ctl == CTL_RETURN) {
+            result = js_rt.value;
+            js_rt.ctl = CTL_NONE;
+        } else if (js_rt.ctl == CTL_BREAK || js_rt.ctl == CTL_CONTINUE) {
+            js_rt.ctl = CTL_NONE;
+        }
     }
     return result;
 }
@@ -3993,6 +4547,11 @@ __attribute__((noinline)) static js_val eval_tagged(js_node* n, js_env* env) {
     }
 
 __attribute__((noinline)) static js_val eval_yield(js_node* n, js_env* env) {
+        if (!current_gen && current_coro && current_coro->is_generator) {
+            js_val v = n->a ? eval(n->a, env) : js_undef();
+            JS_CHECK(v);
+            return n->flag ? coro_yield_star(current_coro, v) : coro_yield(current_coro, v);
+        }
         if (!current_gen) return js_throw_error("SyntaxError", "yield is only valid in generator functions");
         js_val v = n->a ? eval(n->a, env) : js_undef();
         JS_CHECK(v);
@@ -4121,7 +4680,7 @@ static js_val eval(js_node* n, js_env* env) {
     case N_AWAIT: {
         js_val v = eval(n->a, env);
         JS_CHECK(v);
-        return await_value(v);
+        return coro_await(v);
     }
     case N_YIELD: return eval_yield(n, env);
     case N_IMPORT_CALL: return eval_import_call(n, env);
@@ -4326,7 +4885,92 @@ static int loop_continue(js_node* label_owner, js_str* own_label) {
     return js_rt.ctl == CTL_NONE;
 }
 
-static js_str* current_label;
+
+/* for (x of iterable) / for await (x of iterable): asks the iterator for
+ * one value at a time (generators can be endless) and closes it with
+ * return() when the loop is left early. */
+static void exec_for_of_iterator(js_node* n, js_env* env, js_str* label, js_val subject) {
+    int is_await = n->flag;
+    js_val method = js_undef();
+    int sync_source = 0;
+    if (is_await) method = js_get_c(subject, "@@asyncIterator");
+    if (js_rt.ctl) return;
+    if (!js_is_callable(method)) {
+        method = js_get_c(subject, "@@iterator");
+        sync_source = 1;
+    }
+    if (js_rt.ctl) return;
+    js_val it;
+    if (js_is_callable(method)) {
+        it = js_call(method, subject, NULL, 0);
+    } else if (subject.type == JS_OBJ && is_await) {
+        /* array-likes */
+        js_val from = js_get(js_get_c(js_obj_val(js_global), "Array"), js_intern_c("from"));
+        js_val arr = js_call(from, js_undef(), &subject, 1);
+        if (js_rt.ctl) return;
+        it = js_list_iterator(arr.type == JS_OBJ ? arr.u.obj : js_new_array(0));
+    } else {
+        js_throw_error("TypeError", "object is not iterable");
+        return;
+    }
+    if (js_rt.ctl) return;
+    js_val next = js_get_c(it, "next");
+    if (js_rt.ctl) return;
+    if (!js_is_callable(next)) {
+        js_throw_error("TypeError", "iterator.next is not a function");
+        return;
+    }
+    js_node* left = n->a;
+    int kind = left->type == N_VAR ? left->op : -1;
+    js_node* pattern = left->type == N_VAR ? left->list[0]->a : left;
+    for (;;) {
+        if (!step()) return;
+        js_val r = js_call(next, it, NULL, 0);
+        if (js_rt.ctl) return;
+        if (is_await && !sync_source) {
+            r = coro_await(r);
+            if (js_rt.ctl) return;
+        }
+        if (r.type != JS_OBJ) {
+            js_throw_error("TypeError", "Iterator result is not an object");
+            return;
+        }
+        if (js_truthy(js_get_c(r, "done"))) return;
+        js_val item = js_get_c(r, "value");
+        if (js_rt.ctl) return;
+        if (is_await && sync_source) {
+            item = coro_await(item);
+            if (js_rt.ctl) return;
+        }
+        size_t saved = scope_top;
+        js_env* scope = env;
+        if (kind == VAR_LET || kind == VAR_CONST) scope = new_env(env, 2, scope_allowed);
+        bind_pattern(pattern, item, scope, kind >= 0 ? kind : VAR_VAR,
+                     kind == VAR_LET || kind == VAR_CONST);
+        if (!js_rt.ctl) exec(n->c, scope);
+        if (scope != env && scope->on_stack) scope_top = saved;
+        if (scope != env) env_release(scope);
+        int leaving = js_rt.ctl == CTL_BREAK || js_rt.ctl == CTL_RETURN || js_rt.ctl == CTL_THROW ||
+                      (js_rt.ctl == CTL_CONTINUE && js_rt.label && js_rt.label != label);
+        if (leaving) {
+            js_ctl ctl = js_rt.ctl;
+            js_val value = js_rt.value;
+            js_str* saved_label = js_rt.label;
+            js_rt.ctl = CTL_NONE;
+            js_val ret = js_get_c(it, "return");
+            if (!js_rt.ctl && js_is_callable(ret)) {
+                js_val done = js_call(ret, it, NULL, 0);
+                if (!js_rt.ctl && is_await && !sync_source) coro_await(done);
+            }
+            if (js_rt.ctl != CTL_THROW || ctl == CTL_THROW) {
+                js_rt.ctl = ctl;
+                js_rt.value = value;
+                js_rt.label = saved_label;
+            }
+        }
+        if (!loop_continue(n, label)) return;
+    }
+}
 
 static void exec_for_in_of(js_node* n, js_env* env, js_str* label) {
     js_val subject = eval(n->b, env);
@@ -4342,8 +4986,12 @@ static void exec_for_in_of(js_node* n, js_env* env, js_str* label) {
             if (o->cls == CLS_NODE) break;
         }
     } else {
-        if (subject.type == JS_OBJ && (subject.u.obj->cls == CLS_ARRAY || subject.u.obj->cls == CLS_ARGUMENTS)) {
+        if (subject.type == JS_OBJ && (subject.u.obj->cls == CLS_ARRAY || subject.u.obj->cls == CLS_ARGUMENTS) &&
+            !n->flag) {
             items = subject.u.obj;
+        } else if (subject.type == JS_OBJ || n->flag) {
+            exec_for_of_iterator(n, env, label, subject);
+            return;
         } else {
             js_val from = js_get(js_get_c(js_obj_val(js_global), "Array"), js_intern_c("from"));
             js_val arr = js_call(from, js_undef(), &subject, 1);
@@ -4864,6 +5512,7 @@ void js_core_init(void) {
     current_label = NULL;
     current_gen = NULL;
     generator_proto = NULL;
+    coro_reset();
     modules = NULL;
     import_map = js_undef();
     parse_as_module = 0;
