@@ -216,7 +216,17 @@ MATH1(sinh, (m_exp(x) - m_exp(-x)) / 2)
 MATH1(cosh, (m_exp(x) + m_exp(-x)) / 2)
 MATH1(tanh, (m_exp(2 * x) - 1) / (m_exp(2 * x) + 1))
 MATH1(sign, is_nan(x) ? x : x > 0 ? 1 : x < 0 ? -1 : x)
-MATH1(fround, x)
+MATH1(fround, (double)(float)x)
+MATH1(asinh, x == 0 ? x : (x < 0 ? -m_log(-x + mx_sqrt(x * x + 1)) : m_log(x + mx_sqrt(x * x + 1))))
+MATH1(acosh, x < 1 ? nan_value() : m_log(x + mx_sqrt(x * x - 1)))
+MATH1(atanh, x <= -1 || x >= 1 ? (x == 1 ? inf_value() : x == -1 ? -inf_value() : nan_value())
+                               : 0.5 * m_log((1 + x) / (1 - x)))
+
+static js_val math_imul(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)callee;
+    uint32_t a = (uint32_t)js_to_int32(ARG(0)), b = (uint32_t)js_to_int32(ARG(1));
+    return js_num((double)(int32_t)(a * b));
+}
 MATH1(clz32, (double)({ uint32_t v = (uint32_t)js_to_int32(js_num(x)); int n = 0; if (!v) n = 32; else while (!(v & 0x80000000u)) { v <<= 1; n++; } n; }))
 
 static js_val math_round(js_val self, js_val* args, int argc, js_obj* callee) {
@@ -540,16 +550,63 @@ static js_str* this_string(js_val self) {
     return js_to_string(self);
 }
 
-static int str_is_ascii(const js_str* s) {
-    for (uint32_t i = 0; i < s->length; i++)
-        if ((unsigned char)s->data[i] >= 0x80) return 0;
+/* cached on the string: regex loops and index math ask for every match */
+static int str_is_ascii(const js_str* cs) {
+    js_str* s = (js_str*)cs;
+    if (!s->ascii) {
+        s->ascii = 1;
+        for (uint32_t i = 0; i < s->length; i++)
+            if ((unsigned char)s->data[i] >= 0x80) {
+                s->ascii = 2;
+                break;
+            }
+    }
+    return s->ascii == 1;
+}
+
+/* Non-ASCII strings: code point <-> byte conversions walk the string, so
+ * the last position (and length) is remembered for the string last used.
+ * Strings only ever grow at the end, so a remembered prefix stays valid. */
+static const js_str* cp_hint_str;
+static uint32_t cp_hint_cp, cp_hint_byte;
+static const js_str* cp_count_str;
+static uint32_t cp_count_length, cp_count_value;
+
+static uint32_t cp_length(const js_str* s);
+static uint32_t cp_to_byte(const js_str* s, uint32_t index, int ascii);
+
+/* for js.c: string length and indexing in code points */
+uint32_t js_str_cp_length(js_str* s) { return cp_length(s); }
+int js_str_char_at(js_str* s, uint32_t index, uint32_t* start, uint32_t* end) {
+    int ascii = str_is_ascii(s);
+    if (ascii) {
+        if (index >= s->length) return 0;
+        *start = index;
+        *end = index + 1;
+        return 1;
+    }
+    uint32_t b = cp_to_byte(s, index, 0);
+    if (b >= s->length) return 0;
+    uint32_t e = b + 1;
+    while (e < s->length && ((unsigned char)s->data[e] & 0xC0) == 0x80) e++;
+    *start = b;
+    *end = e;
     return 1;
 }
 
+static void cp_cache_reset(void) {
+    cp_hint_str = cp_count_str = NULL;
+}
+
 static uint32_t cp_length(const js_str* s) {
+    if (str_is_ascii(s)) return s->length;
+    if (s == cp_count_str && s->length == cp_count_length) return cp_count_value;
     uint32_t n = 0;
     for (uint32_t i = 0; i < s->length; i++)
         if (((unsigned char)s->data[i] & 0xC0) != 0x80) n++;
+    cp_count_str = s;
+    cp_count_length = s->length;
+    cp_count_value = n;
     return n;
 }
 
@@ -557,19 +614,36 @@ static uint32_t cp_length(const js_str* s) {
 static uint32_t cp_to_byte(const js_str* s, uint32_t index, int ascii) {
     if (ascii) return index > s->length ? s->length : index;
     uint32_t cp = 0, i = 0;
+    if (s == cp_hint_str && index >= cp_hint_cp && cp_hint_byte <= s->length) {
+        cp = cp_hint_cp;
+        i = cp_hint_byte;
+    }
     while (i < s->length && cp < index) {
         i++;
         while (i < s->length && ((unsigned char)s->data[i] & 0xC0) == 0x80) i++;
         cp++;
     }
+    cp_hint_str = s;
+    cp_hint_cp = cp;
+    cp_hint_byte = i;
     return i;
 }
 
 static uint32_t byte_to_cp(const js_str* s, uint32_t offset, int ascii) {
     if (ascii) return offset;
-    uint32_t cp = 0;
-    for (uint32_t i = 0; i < offset && i < s->length; i++)
+    uint32_t cp = 0, i = 0;
+    if (s == cp_hint_str && offset >= cp_hint_byte && cp_hint_byte <= s->length) {
+        cp = cp_hint_cp;
+        i = cp_hint_byte;
+    }
+    for (; i < offset && i < s->length; i++)
         if (((unsigned char)s->data[i] & 0xC0) != 0x80) cp++;
+    /* remember only positions on a character boundary */
+    if (i >= s->length || ((unsigned char)s->data[i] & 0xC0) != 0x80) {
+        cp_hint_str = s;
+        cp_hint_cp = cp;
+        cp_hint_byte = i;
+    }
     return cp;
 }
 
@@ -864,9 +938,9 @@ static re_ast* re_parse_class(re_parser* rp) {
         negated = 1;
         rp->p++;
     }
-    int first = 1;
-    while (rp->p < rp->end && (*rp->p != ']' || first)) {
-        first = 0;
+    /* in JavaScript a ']' right after '[' or '[^' closes the class:
+     * [] matches nothing and [^] matches any character */
+    while (rp->p < rp->end && *rp->p != ']') {
         uint32_t lo;
         if (*rp->p == '\\') {
             rp->p++;
@@ -4446,6 +4520,7 @@ js_str* S_then_name(void) {
 }
 
 void js_runtime_init(void) {
+    cp_cache_reset();
     then_name = js_intern_c("then");
     rng_state ^= (uint64_t)mx_now_ms() * 0x2545F4914F6CDD1Dull + (uint64_t)(uintptr_t)&rng_state;
     if (!rng_state) rng_state = 1;
@@ -4644,7 +4719,8 @@ void js_runtime_init(void) {
     M(floor); M(ceil); M(trunc); M(abs); M(sqrt); M(cbrt); M(exp); M(log); M(log2);
     M(log10); M(log1p); M(expm1); M(sin); M(cos); M(tan); M(atan); M(asin); M(acos);
     M(sinh); M(cosh); M(tanh); M(sign); M(fround); M(clz32); M(round); M(atan2); M(pow);
-    M(hypot); M(random);
+    M(hypot); M(random); M(asinh); M(acosh); M(atanh);
+    js_define_native(math, "imul", math_imul, 2);
 #undef M
     js_define_native(math, "max", math_minmax, 2);
     js_define_native(math, "min", math_minmax, 2);

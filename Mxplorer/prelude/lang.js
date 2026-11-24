@@ -34,6 +34,14 @@ def(Object,'getOwnPropertyDescriptors',function(o){var r={},k=Reflect.ownKeys(o)
 def(String,'raw',function(s){var raw=s.raw,out='';for(var i=0;i<raw.length;i++){out+=raw[i];if(i+1<raw.length&&i+1<arguments.length)out+=arguments[i+1];}return out;});
 def(String.prototype,'isWellFormed',function(){return true;});
 def(String.prototype,'toWellFormed',function(){return String(this);});
+/* symbols are strings inside the engine ("@@sym:desc:n"); give them a prototype */
+var symDesc=function(s){s=String(s);var m=/^@@sym:([\s\S]*):\d+$/.exec(s);if(m)return m[1];m=/^@@for:([\s\S]*)$/.exec(s);if(m)return m[1];
+ return s.slice(0,2)==='@@'?'Symbol.'+s.slice(2):undefined;};
+if(!Symbol.prototype){var SyP={};def(SyP,'toString',function(){return 'Symbol('+(symDesc(this)||'')+')';});
+ def(SyP,'valueOf',function(){return this;});Object.defineProperty(SyP,'description',{get:function(){return symDesc(this);},configurable:true});
+ def(Symbol,'prototype',SyP);def(SyP,'constructor',Symbol);}
+Object.defineProperty(String.prototype,'description',{get:function(){return symDesc(this);},configurable:true});
+def(Symbol,'keyFor',function(s){var m=/^@@for:([\s\S]*)$/.exec(String(s));return m?m[1]:undefined;});
 var SP=Set.prototype,setOf=function(x){return x instanceof Set?x:new Set(x.keys?Array.from(x.keys()):x);};
 def(SP,'union',function(o){var r=new Set(this);setOf(o).forEach(function(v){r.add(v);});return r;});
 def(SP,'intersection',function(o){var s=setOf(o),r=new Set();this.forEach(function(v){if(s.has(v))r.add(v);});return r;});

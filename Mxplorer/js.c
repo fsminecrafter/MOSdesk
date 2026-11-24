@@ -109,6 +109,7 @@ js_str* js_new_str(const char* text, size_t length) {
     s->length = (uint32_t)length;
     s->capacity = (uint32_t)length + 1;
     s->owned = 0;
+    s->ascii = 0;
     if (length) memcpy(s->data, text, length);
     s->data[length] = '\0';
     s->hash = js_hash_bytes(s->data, length);
@@ -153,6 +154,7 @@ js_str* js_concat(js_str* a, js_str* b) {
     s->length = a->length + b->length;
     s->capacity = s->length + 1;
     s->owned = 0;
+    s->ascii = a->ascii == 1 && b->ascii == 1 ? 1 : 0;
     memcpy(s->data, a->data, a->length);
     memcpy(s->data + a->length, b->data, b->length);
     s->data[s->length] = '\0';
@@ -176,6 +178,7 @@ static js_str* append_owned(js_str* a, js_str* b) {
         a->length = total;
         a->data[total] = '\0';
         a->hashed = 0;
+        if (b->ascii != 1) a->ascii = 0;
         return a;
     }
     uint32_t capacity = total < 64 ? total + 1 : total * 2;
@@ -184,6 +187,7 @@ static js_str* append_owned(js_str* a, js_str* b) {
     s->capacity = capacity;
     s->owned = 1;
     s->hashed = 0;
+    s->ascii = a->ascii == 1 && b->ascii == 1 ? 1 : 0;
     memcpy(s->data, a->data, a->length);
     memcpy(s->data + a->length, b->data, b->length);
     s->data[total] = '\0';
@@ -453,28 +457,33 @@ __attribute__((noinline, cold)) static js_val throw_nullish_access(js_val target
     return js_throw_error("TypeError", message);
 }
 
+/* one-character strings are shared instead of allocated per s[i] */
+static js_str* single_char(char c) {
+    static js_str* table[256];
+    static uint32_t generation_seen;
+    extern uint32_t js_core_generation;
+    if (generation_seen != js_core_generation) {
+        memset(table, 0, sizeof(table));
+        generation_seen = js_core_generation;
+    }
+    unsigned char k = (unsigned char)c;
+    if (!table[k]) table[k] = js_intern(&c, 1);
+    return table[k];
+}
+
 js_val js_get(js_val target, js_str* key) {
     switch (target.type) {
     case JS_OBJ:
         return get_from(target.u.obj, key, target);
     case JS_STR: {
         js_str* s = target.u.str;
-        if (key == S_length) {
-            /* UTF-16-ish length: count code points */
-            uint32_t n = 0;
-            for (uint32_t i = 0; i < s->length; i++)
-                if (((unsigned char)s->data[i] & 0xC0) != 0x80) n++;
-            return js_num(n);
-        }
+        if (key == S_length) return js_num(js_str_cp_length(s));   /* code points */
         uint32_t index;
         if (js_array_index(key, &index)) {
-            uint32_t cp = 0, i = 0;
-            while (i < s->length) {
-                uint32_t start = i++;
-                while (i < s->length && ((unsigned char)s->data[i] & 0xC0) == 0x80) i++;
-                if (cp++ == index) return js_str_val(js_new_str(s->data + start, i - start));
-            }
-            return js_undef();
+            uint32_t start, end;
+            if (!js_str_char_at(s, index, &start, &end)) return js_undef();
+            return js_str_val(end - start == 1 ? single_char(s->data[start])
+                                               : js_new_str(s->data + start, end - start));
         }
         return get_from(js_string_proto, key, target);
     }
@@ -512,6 +521,16 @@ static js_str* key_of(js_val key) {
 }
 
 js_val js_get_index(js_val target, js_val key) {
+    if (target.type == JS_STR && key.type == JS_NUM) {
+        double n = key.u.num;
+        if (n >= 0 && n == (double)(uint32_t)n) {
+            uint32_t start, end;
+            js_str* s = target.u.str;
+            if (!js_str_char_at(s, (uint32_t)n, &start, &end)) return js_undef();
+            return js_str_val(end - start == 1 ? single_char(s->data[start])
+                                               : js_new_str(s->data + start, end - start));
+        }
+    }
     if (target.type == JS_OBJ && key.type == JS_NUM &&
         (target.u.obj->cls == CLS_ARRAY || target.u.obj->cls == CLS_ARGUMENTS)) {
         double n = key.u.num;
@@ -896,6 +915,7 @@ enum { T_EOF, T_NUM, T_STR, T_TEMPLATE, T_IDENT, T_PUNCT, T_REGEX, T_PRIVATE };
 typedef struct {
     uint8_t type;
     uint8_t newline_before;
+    uint8_t regex_after;  /* closing ) or }: a following '/' starts a regex */
     uint32_t punct;
     int line;
     js_str* str;          /* identifier / string / regex body / template raw */
@@ -913,7 +933,17 @@ typedef struct {
     uint32_t count, capacity;
     char error[160];
     int error_line;
+    /* open brackets: 1 = ( of if/for/while/with, 2 = block {, 0 = other */
+    uint8_t open_kind[1024];
+    int open_depth;
 } lexer_t;
+
+/* PACK("op") for string literals folds to a constant even at -Os, where the
+ * pack() call would run on every operator the interpreter dispatches. */
+#define PACK(s) ((uint32_t)(uint8_t)(s)[0] | \
+                 (sizeof(s) > 2 ? (uint32_t)(uint8_t)(s)[1 % sizeof(s)] << 8 : 0u) | \
+                 (sizeof(s) > 3 ? (uint32_t)(uint8_t)(s)[2 % sizeof(s)] << 16 : 0u) | \
+                 (sizeof(s) > 4 ? (uint32_t)(uint8_t)(s)[3 % sizeof(s)] << 24 : 0u))
 
 static uint32_t pack(const char* p) {
     uint32_t v = 0;
@@ -1052,11 +1082,45 @@ js_str* js_decode_escapes(const char* text, size_t length) {
  * strings, comments and nested templates. */
 static size_t scan_template(const char* s, size_t n, size_t i, int* lines);
 
+/* Inside ${...}: a '/' starts a regular expression when the code before it
+ * cannot end an operand (same idea as regex_allowed, on characters). */
+static int scan_regex_start(const char* s, size_t from, size_t i) {
+    size_t k = i;
+    while (k > from && (s[k - 1] == ' ' || s[k - 1] == '\t' || s[k - 1] == '\n' || s[k - 1] == '\r')) k--;
+    if (k == from) return 1;
+    char p = s[k - 1];
+    if (strchr("(,=:[!&|?{};+-*%<>~^", p)) return 1;
+    /* keywords such as return/typeof that precede an expression */
+    static const char* const words[] = {"return", "typeof", "case", "in", "of", "void", "delete",
+                                        "throw", "new", "else", "do", "await", "yield"};
+    for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); w++) {
+        size_t len = strlen(words[w]);
+        if (k - from >= len && !memcmp(s + k - len, words[w], len) &&
+            (k - from == len || !ident_part((unsigned char)s[k - len - 1])))
+            return 1;
+    }
+    return 0;
+}
+
 static size_t scan_code(const char* s, size_t n, size_t i, int* lines) {
     int depth = 0;
+    size_t from = i;
     while (i < n) {
         char c = s[i];
         if (c == '\n') (*lines)++;
+        if (c == '/' && i + 1 < n && s[i + 1] != '/' && s[i + 1] != '*' && scan_regex_start(s, from, i)) {
+            int in_class = 0;
+            i++;
+            while (i < n && s[i] != '\n') {
+                if (s[i] == '\\') i++;
+                else if (s[i] == '[') in_class = 1;
+                else if (s[i] == ']') in_class = 0;
+                else if (s[i] == '/' && !in_class) break;
+                i++;
+            }
+            i++;
+            continue;
+        }
         if (c == '"' || c == '\'') {
             i++;
             while (i < n && s[i] != c) {
@@ -1112,6 +1176,7 @@ static size_t scan_template(const char* s, size_t n, size_t i, int* lines) {
 }
 
 static int regex_allowed(lexer_t* lx);
+static void track_bracket(lexer_t* lx, js_token* t);
 
 /* Called after the new token was pushed: look at the one before it. */
 static int regex_allowed(lexer_t* lx) {
@@ -1127,9 +1192,52 @@ static int regex_allowed(lexer_t* lx) {
                s == K_throw || s == K_case || s == K_do || s == K_else ||
                s == K_await || s == K_yield;
     }
-    if (t->type == T_PUNCT)
-        return t->punct != pack(")") && t->punct != pack("]") && t->punct != pack("}");
+    if (t->type == T_PUNCT) {
+        if (t->punct == PACK(")") || t->punct == PACK("}")) return t->regex_after;
+        return t->punct != PACK("]") && t->punct != PACK("++") && t->punct != PACK("--");
+    }
     return 1;
+}
+
+/* Keeps the bracket stack for regex_allowed: `if (x) /re/.test(y)` and
+ * `function f() {} /re/` start regular expressions, `(a) / b` and
+ * `{a: 1} / 2`-like expressions divide. */
+static void track_bracket(lexer_t* lx, js_token* t) {
+    uint32_t p = t->punct;
+    js_token* prev = lx->count >= 2 ? &lx->tokens[lx->count - 2] : NULL;
+    if (p == PACK("(") || p == PACK("[") || p == PACK("{")) {
+        uint8_t kind = 0;
+        if (p == PACK("(") && prev && prev->type == T_IDENT &&
+            (prev->str == K_if || prev->str == K_for || prev->str == K_while || prev->str == K_with))
+            kind = 1;
+        if (p == PACK("{")) {
+            /* a block unless it follows something that makes it an object literal */
+            kind = 2;
+            if (prev && prev->type == T_PUNCT) {
+                uint32_t q = prev->punct;
+                if (q == PACK("(") || q == PACK(",") || q == PACK(":") || q == PACK("=") ||
+                    q == PACK("[") || q == PACK("?") || q == PACK("||") || q == PACK("&&") ||
+                    q == PACK("??") || q == PACK("+") || q == PACK("-") || q == PACK("!") ||
+                    q == PACK("...") || q == PACK("==") || q == PACK("===") || q == PACK("!=") ||
+                    q == PACK("!=="))
+                    kind = 0;
+            } else if (prev && prev->type == T_IDENT && (prev->str == K_return || prev->str == K_typeof ||
+                                                         prev->str == K_in || prev->str == K_of ||
+                                                         prev->str == K_case || prev->str == K_yield ||
+                                                         prev->str == K_await)) {
+                kind = 0;
+            }
+        }
+        if (lx->open_depth < (int)sizeof(lx->open_kind)) lx->open_kind[lx->open_depth] = kind;
+        lx->open_depth++;
+    } else if (p == PACK(")") || p == PACK("]") || p == PACK("}")) {
+        uint8_t kind = 0;
+        if (lx->open_depth > 0) {
+            lx->open_depth--;
+            if (lx->open_depth < (int)sizeof(lx->open_kind)) kind = lx->open_kind[lx->open_depth];
+        }
+        t->regex_after = (p == PACK(")") && kind == 1) || (p == PACK("}") && kind == 2);
+    }
 }
 
 static int lex(lexer_t* lx) {
@@ -1271,8 +1379,16 @@ static int lex(lexer_t* lx) {
         if (c == '"' || c == '\'') {
             size_t start = ++lx->pos;
             while (lx->pos < n && s[lx->pos] != c) {
-                if (s[lx->pos] == '\\') lx->pos++;
-                else if (s[lx->pos] == '\n') break;
+                if (s[lx->pos] == '\\') {
+                    lx->pos++;
+                    if (lx->pos < n && s[lx->pos] == '\n') lx->line++;
+                    if (lx->pos + 1 < n && s[lx->pos] == '\r' && s[lx->pos + 1] == '\n') {
+                        lx->pos++;   /* line continuation with CRLF */
+                        lx->line++;
+                    }
+                } else if (s[lx->pos] == '\n') {
+                    break;
+                }
                 lx->pos++;
             }
             if (lx->pos >= n || s[lx->pos] != c) {
@@ -1330,8 +1446,12 @@ static int lex(lexer_t* lx) {
         }
         t->type = T_PUNCT;
         int matched = 0;
+        static uint8_t punct_length[sizeof(puncts) / sizeof(puncts[0])];
+        if (!punct_length[0])
+            for (size_t i = 0; i < sizeof(puncts) / sizeof(puncts[0]); i++) punct_length[i] = (uint8_t)strlen(puncts[i]);
         for (size_t i = 0; i < sizeof(puncts) / sizeof(puncts[0]); i++) {
-            size_t len = strlen(puncts[i]);
+            size_t len = punct_length[i];
+            if (puncts[i][0] != c) continue;
             if (lx->pos + len <= n && !memcmp(s + lx->pos, puncts[i], len)) {
                 /* "?." followed by a digit is "?" then a number */
                 if (len == 2 && puncts[i][0] == '?' && puncts[i][1] == '.' &&
@@ -1340,11 +1460,16 @@ static int lex(lexer_t* lx) {
                 t->punct = pack(puncts[i]);
                 lx->pos += len;
                 matched = 1;
+                track_bracket(lx, t);
                 break;
             }
         }
         if (!matched) {
-            mx_copy(lx->error, sizeof(lx->error), "Invalid or unexpected token");
+            mx_copy(lx->error, sizeof(lx->error), "Invalid or unexpected token  near: ");
+            size_t used = strlen(lx->error), k = 0;
+            while (lx->pos + k < n && k < 24 && used + 1 < sizeof(lx->error) && s[lx->pos + k] != '\n')
+                lx->error[used++] = s[lx->pos + k++];
+            lx->error[used] = '\0';
             lx->error_line = lx->line;
             return 0;
         }
@@ -1419,9 +1544,14 @@ static js_token* next(parser_t* p) {
     return t;
 }
 
-static int is_punct(js_token* t, const char* text) {
+static int is_punct_s(js_token* t, const char* text) {
     return t->type == T_PUNCT && t->punct == pack(text);
 }
+
+static inline int is_punct_p(const js_token* t, uint32_t packed) {
+    return t->type == T_PUNCT && t->punct == packed;
+}
+#define is_punct(t, literal) is_punct_p((t), PACK(literal))
 
 static int is_kw(js_token* t, js_str* kw) {
     return t->type == T_IDENT && t->str == kw;
@@ -1453,7 +1583,7 @@ static void fail(parser_t* p, const char* message, js_token* at) {
 }
 
 static int accept(parser_t* p, const char* text) {
-    if (is_punct(peek(p), text)) {
+    if (is_punct_s(peek(p), text)) {
         next(p);
         return 1;
     }
@@ -1728,7 +1858,7 @@ static js_node* to_pattern(parser_t* p, js_node* e) {
     case N_OBJECT_PAT: case N_REST:
         return e;
     case N_ASSIGN:
-        if (e->op == pack("=")) {
+        if (e->op == 0) {   /* plain `=`: a default value */
             js_node* d = node(p, N_ASSIGN_PAT);
             d->line = e->line;
             d->a = to_pattern(p, e->a);
@@ -1979,8 +2109,8 @@ static int arrow_ahead(parser_t* p) {
     for (; i < p->count; i++) {
         js_token* t = &p->tokens[i];
         if (t->type != T_PUNCT) continue;
-        if (t->punct == pack("(") || t->punct == pack("[") || t->punct == pack("{")) depth++;
-        else if (t->punct == pack(")") || t->punct == pack("]") || t->punct == pack("}")) {
+        if (t->punct == PACK("(") || t->punct == PACK("[") || t->punct == PACK("{")) depth++;
+        else if (t->punct == PACK(")") || t->punct == PACK("]") || t->punct == PACK("}")) {
             depth--;
             if (!depth) {
                 return i + 1 < p->count && is_punct(&p->tokens[i + 1], "=>") &&
@@ -2266,7 +2396,7 @@ static js_node* parse_postfix(parser_t* p) {
     if ((is_punct(t, "++") || is_punct(t, "--")) && !t->newline_before) {
         next(p);
         js_node* u = node(p, N_UPDATE);
-        u->op = t->punct == pack("++") ? '+' : '-';
+        u->op = t->punct == PACK("++") ? '+' : '-';
         u->flag = 0;   /* postfix */
         u->a = e;
         return u;
@@ -2279,7 +2409,7 @@ static js_node* parse_unary(parser_t* p) {
     if (t->type == T_PUNCT) {
         const char* ops[] = {"!", "~", "+", "-"};
         for (int i = 0; i < 4; i++)
-            if (is_punct(t, ops[i])) {
+            if (is_punct_s(t, ops[i])) {
                 next(p);
                 js_node* u = node(p, N_UNARY);
                 u->op = (uint8_t)ops[i][0];
@@ -2289,7 +2419,7 @@ static js_node* parse_unary(parser_t* p) {
         if (is_punct(t, "++") || is_punct(t, "--")) {
             next(p);
             js_node* u = node(p, N_UPDATE);
-            u->op = t->punct == pack("++") ? '+' : '-';
+            u->op = t->punct == PACK("++") ? '+' : '-';
             u->flag = 1;
             u->a = parse_unary(p);
             return u;
@@ -2328,8 +2458,11 @@ static int binary_precedence(parser_t* p, js_token* t) {
         {"<=", 8}, {">=", 8}, {"<<", 9}, {">>", 9}, {">>>", 9}, {"+", 10},
         {"-", 10}, {"*", 11}, {"/", 11}, {"%", 11}, {"**", 12},
     };
+    static uint32_t packed[sizeof(table) / sizeof(table[0])];
+    if (!packed[0])
+        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) packed[i] = pack(table[i].op);
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
-        if (t->punct == pack(table[i].op)) return table[i].prec;
+        if (t->punct == packed[i]) return table[i].prec;
     return 0;
 }
 
@@ -2344,9 +2477,9 @@ static js_node* parse_binary(parser_t* p, int min_prec) {
         js_node* right = parse_binary(p, right_assoc ? prec : prec + 1);
         js_node* b;
         if (t->type == T_PUNCT &&
-            (t->punct == pack("&&") || t->punct == pack("||") || t->punct == pack("??"))) {
+            (t->punct == PACK("&&") || t->punct == PACK("||") || t->punct == PACK("??"))) {
             b = node(p, N_LOGICAL);
-            b->op = t->punct == pack("&&") ? '&' : t->punct == pack("||") ? '|' : '?';
+            b->op = t->punct == PACK("&&") ? '&' : t->punct == PACK("||") ? '|' : '?';
         } else {
             b = node(p, N_BINARY);
             if (t->type == T_IDENT) b->op = t->str == K_in ? 'i' : 'I';
@@ -2391,8 +2524,11 @@ static js_node* parse_assignment(parser_t* p) {
     js_node* left = parse_conditional(p);
     js_token* t = peek(p);
     if (t->type != T_PUNCT) return left;
+    static uint32_t assign_packed[sizeof(assign_ops) / sizeof(assign_ops[0])];
+    if (!assign_packed[0])
+        for (size_t i = 0; i < sizeof(assign_ops) / sizeof(assign_ops[0]); i++) assign_packed[i] = pack(assign_ops[i]);
     for (size_t i = 0; i < sizeof(assign_ops) / sizeof(assign_ops[0]); i++) {
-        if (t->punct != pack(assign_ops[i])) continue;
+        if (t->punct != assign_packed[i]) continue;
         next(p);
         js_node* a = node(p, N_ASSIGN);
         a->line = t->line + p->line_offset;
@@ -4113,7 +4249,7 @@ static void bind_pattern(js_node* pattern, js_val value, js_env* env, int kind,
 static double js_pow(double base, double exponent);
 
 static js_val arithmetic(uint32_t op, js_val a, js_val b) {
-    if (op == pack("+")) {
+    if (op == PACK("+")) {
         if (a.type == JS_NUM && b.type == JS_NUM) return js_num(a.u.num + b.u.num);
         js_val pa = js_to_primitive(a, 2);
         JS_CHECK(pa);
@@ -4123,31 +4259,31 @@ static js_val arithmetic(uint32_t op, js_val a, js_val b) {
             return js_str_val(js_concat(js_to_string(pa), js_to_string(pb)));
         return js_num(js_to_number(pa) + js_to_number(pb));
     }
-    if (op == pack("==")) return js_bool(js_loose_equals(a, b));
-    if (op == pack("!=")) return js_bool(!js_loose_equals(a, b));
-    if (op == pack("===")) return js_bool(js_strict_equals(a, b));
-    if (op == pack("!==")) return js_bool(!js_strict_equals(a, b));
-    if (op == pack("<") || op == pack(">") || op == pack("<=") || op == pack(">=")) {
+    if (op == PACK("==")) return js_bool(js_loose_equals(a, b));
+    if (op == PACK("!=")) return js_bool(!js_loose_equals(a, b));
+    if (op == PACK("===")) return js_bool(js_strict_equals(a, b));
+    if (op == PACK("!==")) return js_bool(!js_strict_equals(a, b));
+    if (op == PACK("<") || op == PACK(">") || op == PACK("<=") || op == PACK(">=")) {
         js_val pa = js_to_primitive(a, 1), pb = js_to_primitive(b, 1);
         if (pa.type == JS_STR && pb.type == JS_STR) {
             int c = strcmp(pa.u.str->data, pb.u.str->data);
-            if (op == pack("<")) return js_bool(c < 0);
-            if (op == pack(">")) return js_bool(c > 0);
-            if (op == pack("<=")) return js_bool(c <= 0);
+            if (op == PACK("<")) return js_bool(c < 0);
+            if (op == PACK(">")) return js_bool(c > 0);
+            if (op == PACK("<=")) return js_bool(c <= 0);
             return js_bool(c >= 0);
         }
         double x = js_to_number(pa), y = js_to_number(pb);
-        if (op == pack("<")) return js_bool(x < y);
-        if (op == pack(">")) return js_bool(x > y);
-        if (op == pack("<=")) return js_bool(x <= y);
+        if (op == PACK("<")) return js_bool(x < y);
+        if (op == PACK(">")) return js_bool(x > y);
+        if (op == PACK("<=")) return js_bool(x <= y);
         return js_bool(x >= y);
     }
     double x = js_to_number(a), y = js_to_number(b);
     JS_CHECK(x);
-    if (op == pack("-")) return js_num(x - y);
-    if (op == pack("*")) return js_num(x * y);
-    if (op == pack("/")) return js_num(x / y);
-    if (op == pack("%")) {
+    if (op == PACK("-")) return js_num(x - y);
+    if (op == PACK("*")) return js_num(x * y);
+    if (op == PACK("/")) return js_num(x / y);
+    if (op == PACK("%")) {
         if (y == 0 || x != x || y != y) return js_num(0.0 / 0.0);
         if (x == (long long)x && y == (long long)y && x >= -9e15 && x <= 9e15 && y >= -9e15 && y <= 9e15) {
             long long r = (long long)x % (long long)y;
@@ -4158,14 +4294,14 @@ static js_val arithmetic(uint32_t op, js_val a, js_val b) {
         double t = q < 0 ? -(double)(long long)(-q) : (double)(long long)q;
         return js_num(x - t * y);
     }
-    if (op == pack("**")) return js_num(js_pow(x, y));
+    if (op == PACK("**")) return js_num(js_pow(x, y));
     int32_t ix = js_to_int32(a), iy = js_to_int32(b);
-    if (op == pack("&")) return js_num(ix & iy);
-    if (op == pack("|")) return js_num(ix | iy);
-    if (op == pack("^")) return js_num(ix ^ iy);
-    if (op == pack("<<")) return js_num((int32_t)((uint32_t)ix << (iy & 31)));
-    if (op == pack(">>")) return js_num(ix >> (iy & 31));
-    if (op == pack(">>>")) return js_num((double)((uint32_t)ix >> (iy & 31)));
+    if (op == PACK("&")) return js_num(ix & iy);
+    if (op == PACK("|")) return js_num(ix | iy);
+    if (op == PACK("^")) return js_num(ix ^ iy);
+    if (op == PACK("<<")) return js_num((int32_t)((uint32_t)ix << (iy & 31)));
+    if (op == PACK(">>")) return js_num(ix >> (iy & 31));
+    if (op == PACK(">>>")) return js_num((double)((uint32_t)ix >> (iy & 31)));
     return js_undef();
 }
 
@@ -5592,7 +5728,10 @@ js_val js_load_module(const char* url) {
 /* ====================================================================== */
 
 void js_core_init(void);
+uint32_t js_core_generation = 1;
+
 void js_core_init(void) {
+    js_core_generation++;   /* caches of strings from the last page are stale */
     memset(intern_table, 0, sizeof(intern_table));
     init_names();
     if (!scope_stack) scope_stack = (char*)malloc(JS_SCOPE_STACK);

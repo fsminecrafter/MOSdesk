@@ -107,10 +107,10 @@ void mx_dom_set_attr(mx_document_t* doc, mx_node_t* node, const char* name,
     for (mx_attr_t* a = node->attrs; a; a = a->next) {
         if (mx_streq_nocase(a->name, name)) {
             const char* old = a->value;
-            if (a->value && value && !strcmp(a->value, value)) {
-                HOOK(MX_MUT_ATTR, node, NULL, a->name, old);   /* still a mutation */
-                return;
-            }
+            /* no record for an unchanged value: style and class updates
+             * rewrite their attribute on every property set, and an
+             * observer reacting to its own no-op changes would loop */
+            if (a->value && value && !strcmp(a->value, value)) return;
             a->value = mx_arena_strdup(&doc->arena, value);
             HOOK(MX_MUT_ATTR, node, NULL, a->name, old);
             return;

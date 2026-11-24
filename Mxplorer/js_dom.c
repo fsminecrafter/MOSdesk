@@ -190,11 +190,22 @@ void js_dom_mutated(void) {
 /* Wrappers                                                               */
 /* ====================================================================== */
 
+#define TAG_PROTOS 96
+static struct { char tag[16]; js_obj* proto; } tag_protos[TAG_PROTOS];
+static int tag_proto_count;
+
+static js_obj* element_proto_for(const char* tag) {
+    if (tag)
+        for (int i = 0; i < tag_proto_count; i++)
+            if (tag_protos[i].tag[0] == tag[0] && !strcmp(tag_protos[i].tag, tag)) return tag_protos[i].proto;
+    return element_proto;
+}
+
 js_val js_wrap_node(mx_node_t* node) {
     if (!node) return js_null();
     if (node->js_wrapper) return js_obj_val((js_obj*)node->js_wrapper);
     js_obj* proto = node->type == MX_NODE_DOCUMENT ? document_proto :
-                    node->type == MX_NODE_ELEMENT ? element_proto : text_proto;
+                    node->type == MX_NODE_ELEMENT ? element_proto_for(node->tag) : text_proto;
     js_obj* o = js_new_object(proto);
     o->cls = CLS_NODE;
     o->node = node;
@@ -463,7 +474,7 @@ enum {
     G_TEXT,
     /* <video> (HTMLMediaElement); media.c plays them */
     G_PAUSED, G_CURRENT_TIME, G_DURATION, G_ENDED, G_MUTED, G_VIDEO_WIDTH,
-    G_VIDEO_HEIGHT, G_COUNT
+    G_VIDEO_HEIGHT, G_CURRENT_SCRIPT, G_COUNT
 };
 
 static const char* const getter_names[G_COUNT] = {
@@ -486,10 +497,13 @@ static const char* const getter_names[G_COUNT] = {
     "referrer", "domain", "characterSet", "compatMode", "contentEditable",
     "isContentEditable", "label", "text",
     "paused", "currentTime", "duration", "ended", "muted", "videoWidth",
-    "videoHeight",
+    "videoHeight", "currentScript",
 };
 
 static js_str* getter_keys[G_COUNT];
+static mx_node_t* current_script;   /* document.currentScript */
+
+void mx_js_set_current_script(mx_node_t* script) { current_script = script; }
 static int16_t getter_table[512];   /* open addressing on the key hash */
 
 static void build_getter_table(void) {
@@ -854,7 +868,13 @@ static js_val document_getter(int id, int* found) {
     case G_URL: return js_str_val(js_cstr(page_url));
     case G_LOCATION: return js_obj_val(location_obj);
     case G_DEFAULT_VIEW: return js_obj_val(js_global);
-    case G_ACTIVE_ELEMENT: return js_wrap_node(js_doc->body);
+    case G_ACTIVE_ELEMENT: {
+        mx_node_t* f = mx_html_focused();
+        int connected = 0;
+        for (mx_node_t* p = f; p; p = p->parent) connected |= p == js_doc->root;
+        return js_wrap_node(connected ? f : js_doc->body);
+    }
+    case G_CURRENT_SCRIPT: return current_script ? js_wrap_node(current_script) : js_null();
     case G_FORMS: return collect_tags("form");
     case G_IMAGES: return collect_tags("img");
     case G_SCRIPTS: return collect_tags("script");
@@ -986,8 +1006,14 @@ js_val js_dom_get(js_obj* obj, js_str* key, int* found) {
 }
 
 static void set_inner_html(mx_node_t* n, const char* html) {
-    mx_dom_remove_children(n);
-    mx_dom_parse_fragment(js_doc, n, html, strlen(html));
+    if (n->type == MX_NODE_ELEMENT && (mx_dom_is(n, "script") || mx_dom_is(n, "style") ||
+                                       mx_dom_is(n, "textarea") || mx_dom_is(n, "title"))) {
+        /* raw text: `script.innerHTML = "if (a<b) ..."` is code, not markup */
+        mx_dom_set_text_content(js_doc, n, html);
+    } else {
+        mx_dom_remove_children(n);
+        mx_dom_parse_fragment(js_doc, n, html, strlen(html));
+    }
     js_dom_mutated();
 }
 
@@ -1552,7 +1578,26 @@ static js_val el_misc(js_val self, js_val* args, int argc, js_obj* callee) {
     case 0:   /* click */
         if (n) mx_js_dispatch(n, "click", NULL);
         return js_undef();
-    case 1:   /* focus, blur, select, noop methods */
+    case 1:   /* select, noop methods */
+        return js_undef();
+    case 20:   /* focus */
+        if (n && n != mx_html_focused() && n->type == MX_NODE_ELEMENT) {
+            mx_node_t* previous = mx_html_focused();
+            mx_html_set_focus(n);
+            if (previous) {
+                mx_js_dispatch(previous, "blur", NULL);
+                mx_js_dispatch(previous, "focusout", NULL);
+            }
+            mx_js_dispatch(n, "focus", NULL);
+            mx_js_dispatch(n, "focusin", NULL);
+        }
+        return js_undef();
+    case 21:   /* blur */
+        if (n && n == mx_html_focused()) {
+            mx_html_set_focus(NULL);
+            mx_js_dispatch(n, "blur", NULL);
+            mx_js_dispatch(n, "focusout", NULL);
+        }
         return js_undef();
     case 2:   /* checkValidity, reportValidity */
         return js_bool(1);
@@ -2740,37 +2785,75 @@ static js_val image_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
 
 /* ---- dynamic scripts ---- */
 
+const char* js_page_url(void);
+
+static int script_type_ok(mx_node_t* script, int* module) {
+    const char* type = mx_dom_attr(script, "type");
+    *module = type && mx_streq_nocase(type, "module");
+    return !type || !*type || mx_streq_nocase(type, "text/javascript") ||
+           mx_streq_nocase(type, "application/javascript") || mx_streq_nocase(type, "text/ecmascript") ||
+           mx_streq_nocase(type, "application/ecmascript") || *module;
+}
+
+/* An inserted <script src>: fetched and run as its own task, like browsers
+ * do, so the code that inserted it can still add onload handlers. */
+static void run_external_script(mx_node_t* script) {
+    int module = 0;
+    script_type_ok(script, &module);
+    const char* src = mx_dom_attr(script, "src");
+    char url[2048];
+    mx_html_resolve(src ? src : "", url, sizeof(url));
+    char* body = NULL;
+    size_t length = 0;
+    if (!js_host.fetch || !js_host.fetch(js_host.user, url, "script", &body, &length)) {
+        mx_js_dispatch(script, "error", NULL);
+        return;
+    }
+    const char* base = strrchr(url, '/');
+    char name[48];
+    mx_copy(name, sizeof(name), base && base[1] ? base + 1 : url);
+    char* q = strchr(name, '?');
+    if (q) *q = '\0';
+    const char* saved = js_rt.source;
+    mx_node_t* saved_script = current_script;
+    current_script = module ? NULL : script;
+    if (module) mx_js_run_module(body, length, url, js_intern_c(name)->data);
+    else mx_js_run(body, length, js_intern_c(name)->data);
+    current_script = saved_script;
+    js_rt.source = saved;
+    free(body);
+    mx_js_dispatch(script, "load", NULL);
+}
+
+static js_val script_task(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc;
+    if (callee->node) run_external_script(callee->node);
+    return js_undef();
+}
+
 static void run_script_node(mx_node_t* script) {
     if (script->checked) return;
+    int module = 0;
+    if (!script_type_ok(script, &module)) return;
     script->checked = 1;
-    const char* type = mx_dom_attr(script, "type");
-    if (type && *type && !mx_streq_nocase(type, "text/javascript") &&
-        !mx_streq_nocase(type, "application/javascript") && !mx_streq_nocase(type, "module"))
-        return;
     const char* src = mx_dom_attr(script, "src");
     if (src && *src) {
-        char url[2048];
-        mx_html_resolve(src, url, sizeof(url));
-        char* body = NULL;
-        size_t length = 0;
-        if (!js_host.fetch || !js_host.fetch(js_host.user, url, "script", &body, &length)) {
-            mx_js_dispatch(script, "error", NULL);
-            return;
-        }
-        const char* base = strrchr(url, '/');
-        char name[48];
-        mx_copy(name, sizeof(name), base && base[1] ? base + 1 : url);
-        const char* saved = js_rt.source;
-        mx_js_run(body, length, js_intern_c(name)->data);
-        js_rt.source = saved;
-        free(body);
-        mx_js_dispatch(script, "load", NULL);
+        js_obj* task = js_new_native("", script_task, 0);
+        task->node = script;
+        js_val set_timeout = js_get_c(js_obj_val(js_global), "setTimeout");
+        js_val call_args[2] = {js_obj_val(task), js_num(0)};
+        if (js_is_callable(set_timeout)) js_call(set_timeout, js_undef(), call_args, 2);
+        else run_external_script(script);
         return;
     }
     char* text = mx_dom_text_content(js_doc, script);
     if (*text) {
         const char* saved = js_rt.source;
-        mx_js_run(text, strlen(text), "inserted script");
+        mx_node_t* saved_script = current_script;
+        current_script = module ? NULL : script;
+        if (module) mx_js_run_module(text, strlen(text), js_page_url(), "inserted module");
+        else mx_js_run(text, strlen(text), "inserted script");
+        current_script = saved_script;
         js_rt.source = saved;
     }
 }
@@ -3204,8 +3287,8 @@ void js_dom_init(void) {
     method(ep, "getClientRects", el_geometry, 1);
     method(ep, "scrollIntoView", el_geometry, 2);
     method(ep, "click", el_misc, 0);
-    method(ep, "focus", el_misc, 1);
-    method(ep, "blur", el_misc, 1);
+    method(ep, "focus", el_misc, 20);
+    method(ep, "blur", el_misc, 21);
     method(ep, "select", el_misc, 1);
     method(ep, "setSelectionRange", el_misc, 1);
     method(ep, "scrollTo", el_misc, 1);
@@ -3260,14 +3343,58 @@ void js_dom_init(void) {
     if (at.type == JS_OBJ) method(js_array_proto, "item", at.u.obj->native, 0);
 
     /* constructors for instanceof checks */
-    static const char* const element_types[] = {
-        "Element", "HTMLElement", "HTMLDivElement", "HTMLInputElement", "HTMLAnchorElement",
-        "HTMLButtonElement", "HTMLFormElement", "HTMLImageElement", "HTMLSelectElement",
-        "HTMLTextAreaElement", "HTMLScriptElement", "HTMLCanvasElement", "HTMLSpanElement",
-        "HTMLBodyElement", "HTMLIFrameElement", "HTMLTemplateElement", "SVGElement",
-        "HTMLMediaElement", "HTMLVideoElement", "HTMLLinkElement", "HTMLStyleElement"};
-    for (size_t i = 0; i < sizeof(element_types) / sizeof(element_types[0]); i++)
-        global_ctor(element_types[i], i ? html_element_ctor : illegal_ctor, 0, element_proto);
+    /* each element interface has its own prototype (picked by tag name in
+     * js_wrap_node), so `x instanceof HTMLIFrameElement` is only true for
+     * iframes and pages can patch e.g. HTMLInputElement.prototype */
+    static const struct { const char* name; const char* tags; int parent; } element_types[] = {
+        {"Element", NULL, -1}, {"HTMLElement", NULL, -1},
+        {"HTMLDivElement", "div", 1}, {"HTMLInputElement", "input", 1},
+        {"HTMLAnchorElement", "a", 1}, {"HTMLButtonElement", "button", 1},
+        {"HTMLFormElement", "form", 1}, {"HTMLImageElement", "img", 1},
+        {"HTMLSelectElement", "select", 1}, {"HTMLTextAreaElement", "textarea", 1},
+        {"HTMLScriptElement", "script", 1}, {"HTMLCanvasElement", "canvas", 1},
+        {"HTMLSpanElement", "span", 1}, {"HTMLBodyElement", "body", 1},
+        {"HTMLIFrameElement", "iframe", 1}, {"HTMLTemplateElement", "template", 1},
+        {"SVGElement", "svg g path circle rect line polyline polygon ellipse text tspan use defs "
+                       "symbol lineargradient radialgradient stop clippath mask pattern image", 1},
+        {"HTMLMediaElement", NULL, 1}, {"HTMLVideoElement", "video", 17},
+        {"HTMLAudioElement", "audio", 17}, {"HTMLLinkElement", "link", 1},
+        {"HTMLStyleElement", "style", 1}, {"HTMLParagraphElement", "p", 1},
+        {"HTMLHeadingElement", "h1 h2 h3 h4 h5 h6", 1}, {"HTMLUListElement", "ul", 1},
+        {"HTMLOListElement", "ol", 1}, {"HTMLLIElement", "li", 1},
+        {"HTMLTableElement", "table", 1}, {"HTMLTableRowElement", "tr", 1},
+        {"HTMLTableCellElement", "td th", 1}, {"HTMLTableSectionElement", "thead tbody tfoot", 1},
+        {"HTMLLabelElement", "label", 1}, {"HTMLOptionElement", "option", 1},
+        {"HTMLHeadElement", "head", 1}, {"HTMLHtmlElement", "html", 1},
+        {"HTMLMetaElement", "meta", 1}, {"HTMLTitleElement", "title", 1},
+        {"HTMLDialogElement", "dialog", 1}, {"HTMLDetailsElement", "details", 1},
+        {"HTMLPreElement", "pre", 1}, {"HTMLBRElement", "br", 1}, {"HTMLHRElement", "hr", 1},
+        {"HTMLSourceElement", "source", 1}, {"HTMLPictureElement", "picture", 1},
+        {"HTMLFieldSetElement", "fieldset", 1}, {"HTMLSlotElement", "slot", 1},
+        {"HTMLQuoteElement", "blockquote q", 1}, {"HTMLOptGroupElement", "optgroup", 1},
+        {"HTMLProgressElement", "progress", 1}, {"HTMLOutputElement", "output", 1}};
+    js_obj* type_protos[sizeof(element_types) / sizeof(element_types[0])];
+    tag_proto_count = 0;
+    for (size_t i = 0; i < sizeof(element_types) / sizeof(element_types[0]); i++) {
+        js_obj* proto = element_proto;
+        if (element_types[i].parent >= 0) {
+            proto = js_new_object(type_protos[element_types[i].parent]);
+            js_define(proto, "@@toStringTag", js_str_val(js_intern_c(element_types[i].name)), PROP_HIDDEN);
+        }
+        type_protos[i] = proto;
+        global_ctor(element_types[i].name, i ? html_element_ctor : illegal_ctor, 0, proto);
+        for (const char* t = element_types[i].tags; t && *t;) {
+            const char* end = strchr(t, ' ');
+            size_t n = end ? (size_t)(end - t) : strlen(t);
+            if (tag_proto_count < TAG_PROTOS && n < sizeof(tag_protos[0].tag)) {
+                memcpy(tag_protos[tag_proto_count].tag, t, n);
+                tag_protos[tag_proto_count].tag[n] = '\0';
+                tag_protos[tag_proto_count++].proto = proto;
+            }
+            t += n;
+            while (*t == ' ') t++;
+        }
+    }
     global_ctor("Node", illegal_ctor, 0, node_proto);
     global_ctor("Text", illegal_ctor, 0, text_proto);
     global_ctor("CharacterData", illegal_ctor, 0, text_proto);
@@ -3428,8 +3555,8 @@ void js_dom_init(void) {
     io->data = io;   /* marks the intersection variant */
     global_ctor("ResizeObserver", observer_method, 0, NULL);
     global_ctor("PerformanceObserver", observer_method, 0, NULL);
-    global_ctor("Image", image_ctor, 0, element_proto);
-    global_ctor("Option", image_ctor, 1, element_proto);
+    global_ctor("Image", image_ctor, 0, element_proto_for("img"));
+    global_ctor("Option", image_ctor, 1, element_proto_for("option"));
     global_ctor("URL", url_ctor, 0, NULL);
     global_ctor("URLSearchParams", params_method, 0, NULL);
 
@@ -3587,6 +3714,14 @@ static const char js_lang_prelude[] =
 "def(String,'raw',function(s){var raw=s.raw,out='';for(var i=0;i<raw.length;i++){out+=raw[i];if(i+1<raw.length&&i+1<arguments.length)out+=arguments[i+1];}return out;});\n"
 "def(String.prototype,'isWellFormed',function(){return true;});\n"
 "def(String.prototype,'toWellFormed',function(){return String(this);});\n"
+"/* symbols are strings inside the engine (\"@@sym:desc:n\"); give them a prototype */\n"
+"var symDesc=function(s){s=String(s);var m=/^@@sym:([\\s\\S]*):\\d+$/.exec(s);if(m)return m[1];m=/^@@for:([\\s\\S]*)$/.exec(s);if(m)return m[1];\n"
+" return s.slice(0,2)==='@@'?'Symbol.'+s.slice(2):undefined;};\n"
+"if(!Symbol.prototype){var SyP={};def(SyP,'toString',function(){return 'Symbol('+(symDesc(this)||'')+')';});\n"
+" def(SyP,'valueOf',function(){return this;});Object.defineProperty(SyP,'description',{get:function(){return symDesc(this);},configurable:true});\n"
+" def(Symbol,'prototype',SyP);def(SyP,'constructor',Symbol);}\n"
+"Object.defineProperty(String.prototype,'description',{get:function(){return symDesc(this);},configurable:true});\n"
+"def(Symbol,'keyFor',function(s){var m=/^@@for:([\\s\\S]*)$/.exec(String(s));return m?m[1]:undefined;});\n"
 "var SP=Set.prototype,setOf=function(x){return x instanceof Set?x:new Set(x.keys?Array.from(x.keys()):x);};\n"
 "def(SP,'union',function(o){var r=new Set(this);setOf(o).forEach(function(v){r.add(v);});return r;});\n"
 "def(SP,'intersection',function(o){var s=setOf(o),r=new Set();this.forEach(function(v){if(s.has(v))r.add(v);});return r;});\n"
@@ -3717,6 +3852,43 @@ static const char js_lang_prelude[] =
 " else if(x.nodeType)throw new DOMException('Node could not be cloned.','DataCloneError');\n"
 " else{r={};seen.set(x,r);for(var k in x)if(Object.prototype.hasOwnProperty.call(x,k))r[k]=c(x[k]);return r;}\n"
 " seen.set(x,r);return r;};return c(v);});\n"
+"/* constructable stylesheets; adoptedStyleSheets become <style> elements in\n"
+" * <head> (:host is rewritten to the host's tag, as styles are global here) */\n"
+"if(!G.CSSStyleSheet){var SS=function(o){this._t='';this.cssRules=[];this.media=o&&o.media||'';this.disabled=false;this._owners=[];};\n"
+" var splitRules=function(t){var out=[],depth=0,start=0;for(var i=0;i<t.length;i++){var c=t.charAt(i);\n"
+"  if(c==='{')depth++;else if(c==='}'&&--depth===0){var r=t.slice(start,i+1).trim();if(r)out.push({cssText:r});start=i+1;}}return out;};\n"
+" var ssp=SS.prototype;\n"
+" def(ssp,'replaceSync',function(t){this._t=String(t);this.cssRules=splitRules(this._t);for(var i=0;i<this._owners.length;i++)adoptRefresh(this._owners[i]);});\n"
+" def(ssp,'replace',function(t){this.replaceSync(t);return Promise.resolve(this);});\n"
+" def(ssp,'insertRule',function(r,i){i=i||0;this.cssRules.splice(i,0,{cssText:String(r)});this.replaceSync(this.cssRules.map(function(x){return x.cssText;}).join('\\n'));return i;});\n"
+" def(ssp,'deleteRule',function(i){this.cssRules.splice(i,1);this.replaceSync(this.cssRules.map(function(x){return x.cssText;}).join('\\n'));});\n"
+" acc(ssp,'rules',function(){return this.cssRules;});\n"
+" G.CSSStyleSheet=SS;}\n"
+"var adoptRefresh=function(owner){var sheets=owner.__mxAdopted||[],el=owner.__mxAdoptStyle;\n"
+" if(!el){el=document.createElement('style');def(owner,'__mxAdoptStyle',el);(document.head||document.documentElement).appendChild(el);}\n"
+" var tag=owner.nodeType===1?owner.localName:null,text=sheets.map(function(x){return x._t||'';}).join('\\n');\n"
+" if(tag)text=text.replace(/:host\\(([^)]*)\\)/g,tag+'$1').replace(/:host\\b/g,tag);el.textContent=text;};\n"
+"var adoptAcc=function(o){acc(o,'adoptedStyleSheets',function(){return this.__mxAdopted||[];},function(v){var me=this,old=this.__mxAdopted||[];\n"
+" old.forEach(function(x){var i=x._owners?x._owners.indexOf(me):-1;if(i>=0)x._owners.splice(i,1);});\n"
+" var list=Array.from(v||[]);list.forEach(function(x){if(x._owners&&x._owners.indexOf(me)<0)x._owners.push(me);});\n"
+" def(this,'__mxAdopted',list);adoptRefresh(this);});};\n"
+"adoptAcc(Object.getPrototypeOf(document));adoptAcc(EP);\n"
+"/* DOMParser: parses into a detached <html> element and answers like a document */\n"
+"if(!G.DOMParser){var DP=function(){};def(DP.prototype,'parseFromString',function(str,type){\n"
+" var root=document.createElement('html');root.innerHTML=String(str);\n"
+" var head=root.querySelector('head'),body=root.querySelector('body');\n"
+" if(!body){body=document.createElement('body');var kids=Array.from(root.childNodes);for(var i=0;i<kids.length;i++)if(kids[i]!==head)body.appendChild(kids[i]);root.appendChild(body);}\n"
+" if(!head){head=document.createElement('head');root.insertBefore(head,root.firstChild);}\n"
+" var d={nodeType:9,nodeName:'#document',documentElement:root,head:head,body:body,contentType:type||'text/html',\n"
+"  childNodes:[root],firstChild:root,firstElementChild:root,children:[root],\n"
+"  querySelector:function(q){return root.querySelector(q);},querySelectorAll:function(q){return root.querySelectorAll(q);},\n"
+"  getElementById:function(id){return root.querySelector('[id=\"'+String(id).replace(/\"/g,'\\\\\"')+'\"]');},\n"
+"  getElementsByTagName:function(t){return root.getElementsByTagName(t);},getElementsByClassName:function(c){return root.getElementsByClassName(c);},\n"
+"  createElement:function(t){return document.createElement(t);},createTextNode:function(t){return document.createTextNode(t);},\n"
+"  importNode:function(n,deep){return n.cloneNode(deep);},adoptNode:function(n){return n;}};\n"
+" acc(d,'title',function(){var t=root.querySelector('title');return t?t.textContent.trim():'';});\n"
+" return d;});G.DOMParser=DP;}\n"
+"if(!G.XMLSerializer){var XS=function(){};def(XS.prototype,'serializeToString',function(n){return n.outerHTML!==undefined?n.outerHTML:(n.documentElement?n.documentElement.outerHTML:String(n.textContent||''));});G.XMLSerializer=XS;}\n"
 "/* MutationObserver: the engine hands over raw tree changes (__mxMODeliver) */\n"
 "var regs=[];\n"
 "var MO=function(cb){if(typeof cb!=='function')throw new TypeError(\"Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.\");this._cb=cb;this._q=[];};\n"

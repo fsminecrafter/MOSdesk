@@ -47,6 +47,43 @@ def(G,'structuredClone',function(v){var seen=new Map();var c=function(x){
  else if(x.nodeType)throw new DOMException('Node could not be cloned.','DataCloneError');
  else{r={};seen.set(x,r);for(var k in x)if(Object.prototype.hasOwnProperty.call(x,k))r[k]=c(x[k]);return r;}
  seen.set(x,r);return r;};return c(v);});
+/* constructable stylesheets; adoptedStyleSheets become <style> elements in
+ * <head> (:host is rewritten to the host's tag, as styles are global here) */
+if(!G.CSSStyleSheet){var SS=function(o){this._t='';this.cssRules=[];this.media=o&&o.media||'';this.disabled=false;this._owners=[];};
+ var splitRules=function(t){var out=[],depth=0,start=0;for(var i=0;i<t.length;i++){var c=t.charAt(i);
+  if(c==='{')depth++;else if(c==='}'&&--depth===0){var r=t.slice(start,i+1).trim();if(r)out.push({cssText:r});start=i+1;}}return out;};
+ var ssp=SS.prototype;
+ def(ssp,'replaceSync',function(t){this._t=String(t);this.cssRules=splitRules(this._t);for(var i=0;i<this._owners.length;i++)adoptRefresh(this._owners[i]);});
+ def(ssp,'replace',function(t){this.replaceSync(t);return Promise.resolve(this);});
+ def(ssp,'insertRule',function(r,i){i=i||0;this.cssRules.splice(i,0,{cssText:String(r)});this.replaceSync(this.cssRules.map(function(x){return x.cssText;}).join('\n'));return i;});
+ def(ssp,'deleteRule',function(i){this.cssRules.splice(i,1);this.replaceSync(this.cssRules.map(function(x){return x.cssText;}).join('\n'));});
+ acc(ssp,'rules',function(){return this.cssRules;});
+ G.CSSStyleSheet=SS;}
+var adoptRefresh=function(owner){var sheets=owner.__mxAdopted||[],el=owner.__mxAdoptStyle;
+ if(!el){el=document.createElement('style');def(owner,'__mxAdoptStyle',el);(document.head||document.documentElement).appendChild(el);}
+ var tag=owner.nodeType===1?owner.localName:null,text=sheets.map(function(x){return x._t||'';}).join('\n');
+ if(tag)text=text.replace(/:host\(([^)]*)\)/g,tag+'$1').replace(/:host\b/g,tag);el.textContent=text;};
+var adoptAcc=function(o){acc(o,'adoptedStyleSheets',function(){return this.__mxAdopted||[];},function(v){var me=this,old=this.__mxAdopted||[];
+ old.forEach(function(x){var i=x._owners?x._owners.indexOf(me):-1;if(i>=0)x._owners.splice(i,1);});
+ var list=Array.from(v||[]);list.forEach(function(x){if(x._owners&&x._owners.indexOf(me)<0)x._owners.push(me);});
+ def(this,'__mxAdopted',list);adoptRefresh(this);});};
+adoptAcc(Object.getPrototypeOf(document));adoptAcc(EP);
+/* DOMParser: parses into a detached <html> element and answers like a document */
+if(!G.DOMParser){var DP=function(){};def(DP.prototype,'parseFromString',function(str,type){
+ var root=document.createElement('html');root.innerHTML=String(str);
+ var head=root.querySelector('head'),body=root.querySelector('body');
+ if(!body){body=document.createElement('body');var kids=Array.from(root.childNodes);for(var i=0;i<kids.length;i++)if(kids[i]!==head)body.appendChild(kids[i]);root.appendChild(body);}
+ if(!head){head=document.createElement('head');root.insertBefore(head,root.firstChild);}
+ var d={nodeType:9,nodeName:'#document',documentElement:root,head:head,body:body,contentType:type||'text/html',
+  childNodes:[root],firstChild:root,firstElementChild:root,children:[root],
+  querySelector:function(q){return root.querySelector(q);},querySelectorAll:function(q){return root.querySelectorAll(q);},
+  getElementById:function(id){return root.querySelector('[id="'+String(id).replace(/"/g,'\\"')+'"]');},
+  getElementsByTagName:function(t){return root.getElementsByTagName(t);},getElementsByClassName:function(c){return root.getElementsByClassName(c);},
+  createElement:function(t){return document.createElement(t);},createTextNode:function(t){return document.createTextNode(t);},
+  importNode:function(n,deep){return n.cloneNode(deep);},adoptNode:function(n){return n;}};
+ acc(d,'title',function(){var t=root.querySelector('title');return t?t.textContent.trim():'';});
+ return d;});G.DOMParser=DP;}
+if(!G.XMLSerializer){var XS=function(){};def(XS.prototype,'serializeToString',function(n){return n.outerHTML!==undefined?n.outerHTML:(n.documentElement?n.documentElement.outerHTML:String(n.textContent||''));});G.XMLSerializer=XS;}
 /* MutationObserver: the engine hands over raw tree changes (__mxMODeliver) */
 var regs=[];
 var MO=function(cb){if(typeof cb!=='function')throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");this._cb=cb;this._q=[];};

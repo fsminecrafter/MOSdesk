@@ -17,10 +17,14 @@ typedef struct js_str {
     uint8_t hashed;          /* hash is up to date */
     uint8_t owned;           /* string builder: only one variable holds it,
                                 so `s += x` may append in place */
+    uint8_t ascii;           /* 0 not checked yet, 1 all ASCII, 2 not */
     char data[];
 } js_str;
 
 uint32_t js_hash_bytes(const char* text, size_t length);
+/* code-point length / the bytes of character `index` (js_runtime.c) */
+uint32_t js_str_cp_length(js_str* s);
+int js_str_char_at(js_str* s, uint32_t index, uint32_t* start, uint32_t* end);
 static inline uint32_t js_str_hash(js_str* s) {
     if (!s->hashed) {
         s->hash = js_hash_bytes(s->data, s->length);

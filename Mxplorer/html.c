@@ -2379,8 +2379,10 @@ static void run_scripts(void) {
             stats.fetch_ms += mx_now_ms() - t0;
             if (!ok) continue;
             long s0 = mx_now_ms();
+            mx_js_set_current_script(module ? NULL : script);
             if (module) mx_js_run_module(body, length, url, name);
             else mx_js_run(body, length, name);
+            mx_js_set_current_script(NULL);
             stats.script_ms += mx_now_ms() - s0;
             free(body);
             ran++;
@@ -2390,6 +2392,7 @@ static void run_scripts(void) {
             mx_append_int(name, sizeof(name), inline_index);
             char* text = mx_dom_text_content(&doc, script);
             long s0 = mx_now_ms();
+            mx_js_set_current_script(module ? NULL : script);
             if (module) {
                 char url[2048];
                 mx_copy(url, sizeof(url), doc.base_url);
@@ -2399,6 +2402,7 @@ static void run_scripts(void) {
             } else {
                 mx_js_run(text, strlen(text), name);
             }
+            mx_js_set_current_script(NULL);
             stats.script_ms += mx_now_ms() - s0;
             ran++;
         }
@@ -2490,6 +2494,13 @@ mx_html_result_t mx_html_load(const char* source, size_t length,
 static void attach_inline_handlers(void) {
     /* onclick="..." attributes are compiled lazily by the JS engine when
      * events are dispatched; nothing to do here. */
+}
+
+mx_node_t* mx_html_focused(void) { return focused; }
+
+void mx_html_set_focus(mx_node_t* node) {
+    focused = node;
+    doc.mutated = 1;
 }
 
 void mx_html_unload(void) {

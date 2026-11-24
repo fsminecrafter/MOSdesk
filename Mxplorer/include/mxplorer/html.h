@@ -88,6 +88,9 @@ int mx_html_key(int usb_key, char ascii, int mods, char* navigate,
                 size_t capacity);
 /* Resolves a URL against the document base. */
 void mx_html_resolve(const char* reference, char* out, size_t capacity);
+/* The focused form control or link (document.activeElement). */
+mx_node_t* mx_html_focused(void);
+void mx_html_set_focus(mx_node_t* node);
 /* Devtools element highlight (NULL clears). */
 void mx_html_set_highlight(mx_node_t* node);
 void mx_html_viewport(int* width, int* height);

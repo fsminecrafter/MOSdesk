@@ -3,6 +3,7 @@ void mx_js_begin(mx_document_t* d, const char* u, const mx_js_host_t* h) { (void
 void mx_js_end(void) {}
 int mx_js_active(void) { return 0; }
 int mx_js_run(const char* s, size_t l, const char* n) { (void)s; (void)l; (void)n; return 1; }
+void mx_js_set_current_script(mx_node_t* s) { (void)s; }
 int mx_js_eval(const char* s, char* r, size_t c) { (void)s; (void)r; (void)c; return 0; }
 int mx_js_dispatch(mx_node_t* t, const char* ty, const mx_js_event_info_t* i) { (void)t; (void)ty; (void)i; return 0; }
 void mx_js_dispatch_window(const char* t) { (void)t; }
