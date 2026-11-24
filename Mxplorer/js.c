@@ -210,7 +210,7 @@ static js_str *K_var, *K_let, *K_const, *K_function, *K_return, *K_if,
     *K_throw, *K_try, *K_catch, *K_finally, *K_switch, *K_case, *K_true,
     *K_false, *K_null, *K_undefined, *K_class, *K_extends, *K_super,
     *K_static, *K_get, *K_set, *K_async, *K_await, *K_yield, *K_import,
-    *K_export, *K_debugger, *K_with, *K_arguments;
+    *K_export, *K_debugger, *K_with, *K_arguments, *K_to_primitive;
 
 static void init_names(void) {
 #define N(var, text) var = js_intern_c(text)
@@ -233,7 +233,7 @@ static void init_names(void) {
     N(K_super, "super"); N(K_static, "static"); N(K_get, "get");
     N(K_set, "set"); N(K_async, "async"); N(K_await, "await");
     N(K_yield, "yield"); N(K_import, "import"); N(K_export, "export");
-    N(K_debugger, "debugger"); N(K_with, "with"); N(K_arguments, "arguments");
+    N(K_debugger, "debugger"); N(K_with, "with"); N(K_arguments, "arguments"); N(K_to_primitive, "@@toPrimitive");
 #undef N
 }
 
@@ -660,9 +660,43 @@ js_obj* js_own_keys(js_obj* o, int include_hidden) {
             for (uint32_t i = 0; i < list.u.obj->length; i++)
                 js_array_push(keys, list.u.obj->items[i]);
     }
+    /* integer keys first in ascending order, then the others in the order
+     * they were added; symbols (stored as "@@..." keys) only when hidden
+     * keys are asked for */
+    uint32_t first_index = keys->length, index_count = 0;
     for (uint32_t i = 0; i < o->prop_count; i++) {
-        if (!include_hidden && (o->props[i].flags & PROP_HIDDEN)) continue;
-        js_array_push(keys, js_str_val(o->props[i].key));
+        js_prop* p = &o->props[i];
+        uint32_t index;
+        if (!include_hidden && (p->flags & PROP_HIDDEN)) continue;
+        if (js_array_index(p->key, &index)) {
+            js_array_push(keys, js_str_val(p->key));
+            index_count++;
+        }
+    }
+    if (index_count > 1) {
+        for (uint32_t i = first_index + 1; i < keys->length; i++) {
+            js_val v = keys->items[i];
+            uint32_t key;
+            js_array_index(v.u.str, &key);
+            uint32_t j = i;
+            while (j > first_index) {
+                uint32_t prev;
+                js_array_index(keys->items[j - 1].u.str, &prev);
+                if (prev <= key) break;
+                keys->items[j] = keys->items[j - 1];
+                j--;
+            }
+            keys->items[j] = v;
+        }
+    }
+    for (uint32_t i = 0; i < o->prop_count; i++) {
+        js_prop* p = &o->props[i];
+        uint32_t index;
+        if (!include_hidden && (p->flags & PROP_HIDDEN)) continue;
+        if (index_count && js_array_index(p->key, &index)) continue;
+        if (!include_hidden && p->key->length > 2 && p->key->data[0] == '@' && p->key->data[1] == '@')
+            continue;
+        js_array_push(keys, js_str_val(p->key));
     }
     return keys;
 }
@@ -681,10 +715,22 @@ int js_truthy(js_val v) {
     }
 }
 
-js_val js_to_primitive(js_val v, int hint_number) {
+/* hint: 0 string, 1 number, 2 default (+, ==): valueOf first except Dates */
+js_val js_to_primitive(js_val v, int hint) {
     if (v.type != JS_OBJ) return v;
     js_obj* o = v.u.obj;
     if (o->cls == CLS_BOXED) return o->primitive;
+    js_val exotic = js_get(v, K_to_primitive);
+    if (js_rt.ctl) return js_undef();
+    if (js_is_callable(exotic)) {
+        js_val name = js_str_val(js_intern_c(hint == 0 ? "string" : hint == 1 ? "number" : "default"));
+        js_val r = js_call(exotic, v, &name, 1);
+        if (js_rt.ctl) return js_undef();
+        if (r.type == JS_OBJ) return js_throw_error("TypeError", "Cannot convert object to primitive value");
+        return r;
+    }
+    if (hint == 2) hint = o->cls == CLS_DATE ? 0 : 1;
+    int hint_number = hint == 1;
     if (o->cls == CLS_DATE && !hint_number) {
         js_val fn = js_get(v, S_toString);
         if (js_is_callable(fn)) return js_call(fn, v, NULL, 0);
@@ -776,8 +822,8 @@ int js_loose_equals(js_val a, js_val b) {
     int a_nullish = a.type == JS_NULL || a.type == JS_UNDEF;
     int b_nullish = b.type == JS_NULL || b.type == JS_UNDEF;
     if (a_nullish || b_nullish) return a_nullish && b_nullish;
-    if (a.type == JS_OBJ) a = js_to_primitive(a, 1);
-    if (b.type == JS_OBJ) b = js_to_primitive(b, 1);
+    if (a.type == JS_OBJ) a = js_to_primitive(a, 2);
+    if (b.type == JS_OBJ) b = js_to_primitive(b, 2);
     if (a.type == JS_STR && b.type == JS_STR) return js_str_eq(a.u.str, b.u.str);
     return js_to_number(a) == js_to_number(b);
 }
@@ -1534,6 +1580,9 @@ static js_node* parse_template(parser_t* p, js_token* t) {
         if (i == length || (s[i] == '$' && i + 1 < length && s[i + 1] == '{')) {
             js_node* text = node(p, N_STR);
             text->str = decode_string(s + start, i - start);
+            js_node* raw = node(p, N_STR);   /* String.raw / tag functions */
+            raw->str = js_new_str(s + start, i - start);
+            text->b = raw;
             list_push(&parts, text);
             if (i == length) break;
             size_t expr_start = i + 2;
@@ -1969,6 +2018,14 @@ static js_node* parse_primary(parser_t* p) {
         return n;
     case T_IDENT: {
         js_str* s = t->str;
+        if (s->length > 1 && s->data[0] == '#' && is_kw(peek_at(p, 1), K_in)) {
+            /* `#field in object`: private fields are keys named "#field" */
+            next(p);
+            n = node(p, N_STR);
+            n->str = s;
+            n->line = t->line + p->line_offset;
+            return n;
+        }
         if (s == K_function) {
             next(p);
             int generator = accept(p, "*");
@@ -4048,9 +4105,9 @@ static double js_pow(double base, double exponent);
 static js_val arithmetic(uint32_t op, js_val a, js_val b) {
     if (op == pack("+")) {
         if (a.type == JS_NUM && b.type == JS_NUM) return js_num(a.u.num + b.u.num);
-        js_val pa = js_to_primitive(a, 0);
+        js_val pa = js_to_primitive(a, 2);
         JS_CHECK(pa);
-        js_val pb = js_to_primitive(b, 0);
+        js_val pb = js_to_primitive(b, 2);
         JS_CHECK(pb);
         if (pa.type == JS_STR || pb.type == JS_STR)
             return js_str_val(js_concat(js_to_string(pa), js_to_string(pb)));
@@ -4385,7 +4442,7 @@ __attribute__((noinline)) static int append_statement(js_node* n, js_env* env) {
     js_str* tail;
     if (rhs.type == JS_STR) tail = rhs.u.str;
     else if (rhs.type == JS_OBJ) {
-        js_val p = js_to_primitive(rhs, 0);
+        js_val p = js_to_primitive(rhs, 2);
         if (js_rt.ctl) return 1;
         tail = js_to_string(p);
     } else tail = js_to_string(rhs);
@@ -4525,23 +4582,35 @@ __attribute__((noinline)) static js_val eval_unary(js_node* n, js_env* env) {
         return js_undef();
     }
 
+#define TAGGED_CACHE 512
+static struct { js_node* node; js_obj* strings; } tagged_cache[TAGGED_CACHE];
+
 __attribute__((noinline)) static js_val eval_tagged(js_node* n, js_env* env) {
         js_val fn = eval(n->a, env);
         JS_CHECK(fn);
-        js_obj* strings = js_new_array(0);
-        js_obj* raw = js_new_array(0);
+        /* the strings array is the same object every time this tag runs
+         * (lit-html and others cache templates by it) */
+        uint32_t slot = (uint32_t)(((uintptr_t)n >> 4) * 2654435761u) % TAGGED_CACHE;
+        js_obj* strings = tagged_cache[slot].node == n ? tagged_cache[slot].strings : NULL;
+        if (!strings) {
+            strings = js_new_array(0);
+            js_obj* raw = js_new_array(0);
+            for (uint32_t i = 0; i < n->b->count; i += 2) {
+                js_node* part = n->b->list[i];
+                js_array_push(strings, js_str_val(part->str));
+                js_array_push(raw, js_str_val(part->b ? part->b->str : part->str));
+            }
+            js_define(strings, "raw", js_obj_val(raw), PROP_HIDDEN);
+            raw->frozen = strings->frozen = 1;
+            tagged_cache[slot].node = n;
+            tagged_cache[slot].strings = strings;
+        }
         js_val* args = (js_val*)js_alloc(sizeof(js_val) * (n->b->count / 2 + 2));
         int argc = 1;
-        for (uint32_t i = 0; i < n->b->count; i++) {
-            if (i % 2 == 0) {
-                js_array_push(strings, js_str_val(n->b->list[i]->str));
-                js_array_push(raw, js_str_val(n->b->list[i]->str));
-            } else {
-                args[argc++] = eval(n->b->list[i], env);
-                JS_CHECK(fn);
-            }
+        for (uint32_t i = 1; i < n->b->count; i += 2) {
+            args[argc++] = eval(n->b->list[i], env);
+            JS_CHECK(fn);
         }
-        js_define(strings, "raw", js_obj_val(raw), PROP_HIDDEN);
         args[0] = js_obj_val(strings);
         return js_call(fn, js_undef(), args, argc);
     }
@@ -5513,6 +5582,7 @@ void js_core_init(void) {
     current_gen = NULL;
     generator_proto = NULL;
     coro_reset();
+    memset(tagged_cache, 0, sizeof(tagged_cache));
     modules = NULL;
     import_map = js_undef();
     parse_as_module = 0;

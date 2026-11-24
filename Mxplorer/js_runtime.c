@@ -713,6 +713,109 @@ static int class_escape(char c, re_range* out, int* count, int capacity) {
     return 1;
 }
 
+
+/* \p{...} and \P{...}: Unicode properties, approximated with the main
+ * ranges of each (enough for the letter/number/emoji/script tests pages
+ * use; not a full Unicode database). Ranges are sorted. */
+typedef struct { const char* name; const re_range* ranges; int count; } re_property;
+#define RANGES(name, ...) static const re_range name[] = {__VA_ARGS__}
+RANGES(up_letter, {'A','Z'},{'a','z'},{0xAA,0xAA},{0xB5,0xB5},{0xBA,0xBA},{0xC0,0xD6},{0xD8,0xF6},{0xF8,0x2C1},
+       {0x370,0x373},{0x376,0x377},{0x37B,0x37D},{0x386,0x386},{0x388,0x3FF},{0x400,0x481},{0x48A,0x52F},
+       {0x531,0x587},{0x5D0,0x5EA},{0x620,0x64A},{0x671,0x6D3},{0x904,0x939},{0xE01,0xE30},{0x10A0,0x10FF},
+       {0x1100,0x11FF},{0x1E00,0x1FFF},{0x2C00,0x2DFF},{0x3041,0x3096},{0x30A1,0x30FA},{0x3400,0x4DBF},
+       {0x4E00,0x9FFF},{0xA000,0xA4CF},{0xAC00,0xD7A3},{0xF900,0xFAFF},{0xFF21,0xFF3A},{0xFF41,0xFF5A},
+       {0xFF66,0xFFDC},{0x20000,0x2FFFF});
+RANGES(up_upper, {'A','Z'},{0xC0,0xD6},{0xD8,0xDE},{0x391,0x3A9},{0x400,0x42F},{0xFF21,0xFF3A});
+RANGES(up_lower, {'a','z'},{0xDF,0xF6},{0xF8,0xFF},{0x3B1,0x3C9},{0x430,0x45F},{0xFF41,0xFF5A});
+RANGES(up_number, {'0','9'},{0xB2,0xB3},{0xB9,0xB9},{0xBC,0xBE},{0x660,0x669},{0x6F0,0x6F9},{0x966,0x96F},
+       {0x2150,0x218F},{0x2460,0x249B},{0xFF10,0xFF19});
+RANGES(up_digit, {'0','9'},{0x660,0x669},{0x6F0,0x6F9},{0x966,0x96F},{0xFF10,0xFF19});
+RANGES(up_punct, {0x21,0x23},{0x25,0x2A},{0x2C,0x2F},{0x3A,0x3B},{0x3F,0x40},{0x5B,0x5D},{0x5F,0x5F},
+       {0x7B,0x7B},{0x7D,0x7D},{0xA1,0xA1},{0xA7,0xA7},{0xAB,0xAB},{0xB6,0xB7},{0xBB,0xBB},{0xBF,0xBF},
+       {0x2010,0x2027},{0x2030,0x205E},{0x3001,0x3003},{0x3008,0x3011});
+RANGES(up_symbol, {0x24,0x24},{0x2B,0x2B},{0x3C,0x3E},{0x5E,0x5E},{0x60,0x60},{0x7C,0x7C},{0x7E,0x7E},
+       {0xA2,0xA6},{0xA8,0xA9},{0xAC,0xAC},{0xAE,0xB1},{0xB4,0xB4},{0xD7,0xD7},{0xF7,0xF7},{0x2100,0x214F},
+       {0x2190,0x23FF},{0x2500,0x27BF},{0x2900,0x2BFF},{0x1F300,0x1FAFF});
+RANGES(up_mark, {0x300,0x36F},{0x483,0x489},{0x591,0x5BD},{0x64B,0x65F},{0x900,0x903},{0x93A,0x94F},
+       {0x1AB0,0x1AFF},{0x1DC0,0x1DFF},{0x20D0,0x20FF},{0xFE00,0xFE0F},{0xFE20,0xFE2F});
+RANGES(up_emoji, {0x203C,0x203C},{0x2049,0x2049},{0x2122,0x2122},{0x2139,0x2139},{0x2194,0x21AA},
+       {0x231A,0x23FF},{0x24C2,0x24C2},{0x25AA,0x27BF},{0x2934,0x2935},{0x2B05,0x2B55},{0x3030,0x3030},
+       {0x303D,0x303D},{0x3297,0x3297},{0x3299,0x3299},{0x1F000,0x1FAFF});
+RANGES(up_space, {'\t','\r'},{' ',' '},{0x85,0x85},{0xA0,0xA0},{0x1680,0x1680},{0x2000,0x200A},
+       {0x2028,0x2029},{0x202F,0x202F},{0x205F,0x205F},{0x3000,0x3000});
+RANGES(up_latin, {'A','Z'},{'a','z'},{0xAA,0xAA},{0xBA,0xBA},{0xC0,0xD6},{0xD8,0xF6},{0xF8,0x24F},
+       {0x1E00,0x1EFF},{0xFF21,0xFF3A},{0xFF41,0xFF5A});
+RANGES(up_greek, {0x370,0x3FF},{0x1F00,0x1FFF});
+RANGES(up_cyrillic, {0x400,0x52F});
+RANGES(up_han, {0x2E80,0x2FDF},{0x3005,0x3005},{0x3007,0x3007},{0x3021,0x3029},{0x3400,0x4DBF},
+       {0x4E00,0x9FFF},{0xF900,0xFAFF},{0x20000,0x2FFFF});
+RANGES(up_hiragana, {0x3041,0x309F});
+RANGES(up_katakana, {0x30A0,0x30FF},{0x31F0,0x31FF},{0xFF66,0xFF9F});
+RANGES(up_arabic, {0x600,0x6FF},{0x750,0x77F});
+RANGES(up_hebrew, {0x591,0x5F4});
+RANGES(up_hangul, {0x1100,0x11FF},{0x3130,0x318F},{0xAC00,0xD7AF});
+RANGES(up_thai, {0xE01,0xE5B});
+RANGES(up_devanagari, {0x900,0x97F});
+RANGES(up_any, {0,0x10FFFF});
+RANGES(up_ascii, {0,0x7F});
+#undef RANGES
+#define P(n, r) {n, r, (int)(sizeof(r) / sizeof(r[0]))}
+static const re_property re_properties[] = {
+    P("L", up_letter), P("Letter", up_letter), P("Alphabetic", up_letter), P("Alpha", up_letter),
+    P("ID_Start", up_letter), P("Lu", up_upper), P("Uppercase_Letter", up_upper), P("Uppercase", up_upper),
+    P("Ll", up_lower), P("Lowercase_Letter", up_lower), P("Lowercase", up_lower),
+    P("N", up_number), P("Number", up_number), P("Nd", up_digit), P("Decimal_Number", up_digit),
+    P("digit", up_digit), P("P", up_punct), P("Punctuation", up_punct), P("S", up_symbol),
+    P("Symbol", up_symbol), P("M", up_mark), P("Mark", up_mark), P("Mn", up_mark),
+    P("Emoji", up_emoji), P("Emoji_Presentation", up_emoji), P("Extended_Pictographic", up_emoji),
+    P("White_Space", up_space), P("space", up_space), P("Z", up_space), P("Zs", up_space),
+    P("Latin", up_latin), P("Latn", up_latin), P("Greek", up_greek), P("Grek", up_greek),
+    P("Cyrillic", up_cyrillic), P("Cyrl", up_cyrillic), P("Han", up_han), P("Hani", up_han),
+    P("Hiragana", up_hiragana), P("Hira", up_hiragana), P("Katakana", up_katakana), P("Kana", up_katakana),
+    P("Arabic", up_arabic), P("Arab", up_arabic), P("Hebrew", up_hebrew), P("Hebr", up_hebrew),
+    P("Hangul", up_hangul), P("Hang", up_hangul), P("Thai", up_thai), P("Devanagari", up_devanagari),
+    P("Deva", up_devanagari), P("Any", up_any), P("ASCII", up_ascii),
+};
+#undef P
+
+/* rp->p is at 'p' or 'P'. Adds the ranges and returns 1, or returns 0. */
+static int property_escape(re_parser* rp, re_range* out, int* count, int capacity) {
+    char kind = *rp->p;
+    if ((kind != 'p' && kind != 'P') || rp->p + 1 >= rp->end || rp->p[1] != '{') return 0;
+    const char* name = rp->p + 2;
+    const char* end = name;
+    while (end < rp->end && *end != '}') end++;
+    if (end >= rp->end) return 0;
+    const char* eq = memchr(name, '=', (size_t)(end - name));
+    if (eq) name = eq + 1;   /* Script=Latin, sc=Greek, General_Category=L */
+    size_t length = (size_t)(end - name);
+    const re_property* prop = NULL;
+    for (size_t i = 0; i < sizeof(re_properties) / sizeof(re_properties[0]); i++)
+        if (strlen(re_properties[i].name) == length && !memcmp(re_properties[i].name, name, length)) {
+            prop = &re_properties[i];
+            break;
+        }
+    rp->p = end + 1;
+    if (!prop) prop = &re_properties[0];   /* unknown: treat as letters */
+    if (kind == 'p') {
+        for (int i = 0; i < prop->count && *count < capacity; i++) out[(*count)++] = prop->ranges[i];
+    } else {
+        uint32_t next = 0;
+        for (int i = 0; i < prop->count && *count < capacity; i++) {
+            if (prop->ranges[i].lo > next) {
+                out[*count].lo = next;
+                out[(*count)++].hi = prop->ranges[i].lo - 1;
+            }
+            next = prop->ranges[i].hi + 1;
+        }
+        if (next <= 0x10FFFF && *count < capacity) {
+            out[*count].lo = next;
+            out[(*count)++].hi = 0x10FFFF;
+        }
+    }
+    return 1;
+}
+
 static uint32_t re_escape_char(re_parser* rp) {
     char c = *rp->p++;
     switch (c) {
@@ -772,6 +875,7 @@ static re_ast* re_parse_class(re_parser* rp) {
                 rp->p++;
                 continue;
             }
+            if (property_escape(rp, ranges, &count, 128)) continue;
             if (*rp->p == 'b') {
                 rp->p++;
                 lo = '\b';
@@ -841,16 +945,13 @@ static re_ast* re_parse_atom(re_parser* rp) {
                 if (rp->p < rp->end && *rp->p == ')') rp->p++;
                 return look;
             } else if (kind == '<' && rp->p + 2 < rp->end && (rp->p[2] == '=' || rp->p[2] == '!')) {
-                /* lookbehind: unsupported, treated as always true */
-                int depth = 1;
+                /* lookbehind: the body must match text ending here */
+                re_ast* look = re_node(A_LOOK);
+                look->flag = (uint8_t)((rp->p[2] == '!') | 2);
                 rp->p += 3;
-                while (rp->p < rp->end && depth) {
-                    if (*rp->p == '\\') rp->p++;
-                    else if (*rp->p == '(') depth++;
-                    else if (*rp->p == ')') depth--;
-                    rp->p++;
-                }
-                return re_node(A_EMPTY);
+                re_add_child(look, re_parse_alt(rp));
+                if (rp->p < rp->end && *rp->p == ')') rp->p++;
+                return look;
             } else if (kind == '<') {
                 /* named group */
                 rp->p += 2;
@@ -900,8 +1001,13 @@ static re_ast* re_parse_atom(re_parser* rp) {
             n->value = (uint32_t)(e - '0');
             return n;
         }
-        re_range ranges[16];
+        re_range ranges[64];
         int count = 0;
+        if (property_escape(rp, ranges, &count, 64)) {
+            re_ast* n = re_node(A_CLASS);
+            n->value = (uint32_t)re_add_class(rp->prog, ranges, count, 0);
+            return n;
+        }
         if (class_escape(e, ranges, &count, 16)) {
             rp->p++;
             re_ast* n = re_node(A_CLASS);
@@ -1053,9 +1159,11 @@ static void re_compile(re_prog* prog, re_ast* n) {
         break;
     case A_LOOK: {
         int look = re_emit(prog, RE_LOOK);
-        prog->code[look].negated = n->flag;
+        prog->code[look].negated = n->flag & 1;
+        prog->code[look].y = (n->flag & 2) != 0;   /* behind */
         re_compile(prog, n->children[0]);
-        re_emit(prog, RE_LOOKEND);
+        int end = re_emit(prog, RE_LOOKEND);
+        prog->code[end].x = (n->flag & 2) != 0;
         prog->code[look].x = prog->count;
         break;
     }
@@ -1112,6 +1220,7 @@ typedef struct {
     int caps[20];
     long steps;
     int depth;
+    uint32_t look_target;   /* lookbehind: where the body has to end */
 } re_vm;
 
 static uint32_t re_lower(uint32_t c) {
@@ -1171,8 +1280,13 @@ static int re_run(re_vm* vm, int pc, uint32_t sp, uint32_t* end_out) {
             }
             pc++;
             break;
-        case RE_MATCH:
         case RE_LOOKEND:
+            if (in->x && sp != vm->look_target) {
+                vm->depth--;
+                return 0;
+            }
+            /* fall through */
+        case RE_MATCH:
             *end_out = sp;
             vm->depth--;
             return 1;
@@ -1227,7 +1341,19 @@ static int re_run(re_vm* vm, int pc, uint32_t sp, uint32_t* end_out) {
             uint32_t ignored;
             int saved[20];
             memcpy(saved, vm->caps, sizeof(saved));
-            int matched = re_run(vm, pc + 1, sp, &ignored);
+            int matched = 0;
+            if (in->y) {
+                uint32_t saved_target = vm->look_target;
+                vm->look_target = sp;
+                uint32_t lowest = sp > 4096 ? sp - 4096 : 0;
+                for (uint32_t k = sp + 1; k-- > lowest && !matched;) {
+                    if (k < sp && ((unsigned char)vm->s[k] & 0xC0) == 0x80) continue;
+                    matched = re_run(vm, pc + 1, k, &ignored);
+                }
+                vm->look_target = saved_target;
+            } else {
+                matched = re_run(vm, pc + 1, sp, &ignored);
+            }
             if (in->negated) memcpy(vm->caps, saved, sizeof(saved));
             if (matched == in->negated) {
                 vm->depth--;
