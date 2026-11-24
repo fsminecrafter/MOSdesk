@@ -495,7 +495,7 @@ static int16_t getter_table[512];   /* open addressing on the key hash */
 static void build_getter_table(void) {
     for (int i = 0; i < 512; i++) getter_table[i] = -1;
     for (int i = 0; i < G_COUNT; i++) {
-        uint32_t slot = getter_keys[i]->hash & 511u;
+        uint32_t slot = js_str_hash(getter_keys[i]) & 511u;
         int duplicate = 0;
         while (getter_table[slot] >= 0) {
             if (js_str_eq(getter_keys[getter_table[slot]], getter_keys[i])) duplicate = 1;
@@ -506,7 +506,7 @@ static void build_getter_table(void) {
 }
 
 static int getter_id(js_str* key) {
-    uint32_t slot = key->hash & 511u;
+    uint32_t slot = js_str_hash(key) & 511u;
     while (getter_table[slot] >= 0) {
         js_str* candidate = getter_keys[getter_table[slot]];
         if (candidate == key || js_str_eq(candidate, key)) return getter_table[slot];
@@ -1373,18 +1373,18 @@ static js_val el_attribute(js_val self, js_val* args, int argc, js_obj* callee) 
 
 static js_val query(mx_node_t* root, js_val selector, int all) {
     js_str* s = js_to_string(selector);
+    const void* compiled = mx_css_compile(s->data);
+    if (!compiled) {
+        char message[200];
+        mx_copy(message, sizeof(message), "Failed to execute 'querySelector': '");
+        mx_append(message, sizeof(message), s->data);
+        mx_append(message, sizeof(message), "' is not a valid selector.");
+        return js_throw_error("SyntaxError", message);
+    }
     js_obj* list = all ? node_list() : NULL;
     for (mx_node_t* n = root->first ? mx_dom_next(root, root) : NULL; n; n = mx_dom_next(root, n)) {
         if (n->type != MX_NODE_ELEMENT) continue;
-        int m = mx_css_matches(n, s->data);
-        if (m < 0) {
-            char message[200];
-            mx_copy(message, sizeof(message), "Failed to execute 'querySelector': '");
-            mx_append(message, sizeof(message), s->data);
-            mx_append(message, sizeof(message), "' is not a valid selector.");
-            return js_throw_error("SyntaxError", message);
-        }
-        if (!m) continue;
+        if (!mx_css_matches_compiled(n, compiled)) continue;
         if (!all) return js_wrap_node(n);
         js_array_push(list, js_wrap_node(n));
     }
@@ -1450,12 +1450,10 @@ static js_val el_query(js_val self, js_val* args, int argc, js_obj* callee) {
         return js_bool(m);
     }
     case 7: {   /* closest */
-        js_str* s = js_to_string(ARG(0));
-        for (mx_node_t* e = n; e && e->type == MX_NODE_ELEMENT; e = e->parent) {
-            int m = mx_css_matches(e, s->data);
-            if (m < 0) return js_throw_error("SyntaxError", "is not a valid selector");
-            if (m) return js_wrap_node(e);
-        }
+        const void* compiled = mx_css_compile(js_to_string(ARG(0))->data);
+        if (!compiled) return js_throw_error("SyntaxError", "is not a valid selector");
+        for (mx_node_t* e = n; e && e->type == MX_NODE_ELEMENT; e = e->parent)
+            if (mx_css_matches_compiled(e, compiled)) return js_wrap_node(e);
         return js_null();
     }
     }

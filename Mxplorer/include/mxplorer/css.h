@@ -124,6 +124,9 @@ void mx_css_pop_ancestor(mx_node_t* element);
 int mx_css_dark_page(void);
 /* 1 when the element matches the selector list; -1 on a syntax error. */
 int mx_css_matches(mx_node_t* element, const char* selectors);
+/* Parses (and caches until mx_css_reset) a selector list; NULL when invalid. */
+const void* mx_css_compile(const char* selectors);
+int mx_css_matches_compiled(mx_node_t* element, const void* compiled);
 int mx_css_parse_color(const char* value, uint32_t* color);
 int mx_css_media_matches(const char* query);
 int mx_len_resolve(mx_len_t length, int reference);

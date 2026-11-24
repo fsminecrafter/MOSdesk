@@ -12,9 +12,22 @@
 
 typedef struct js_str {
     uint32_t length;
-    uint32_t hash;
+    uint32_t hash;           /* read through js_str_hash(): may be stale */
+    uint32_t capacity;       /* bytes available in data[] (with the NUL) */
+    uint8_t hashed;          /* hash is up to date */
+    uint8_t owned;           /* string builder: only one variable holds it,
+                                so `s += x` may append in place */
     char data[];
 } js_str;
+
+uint32_t js_hash_bytes(const char* text, size_t length);
+static inline uint32_t js_str_hash(js_str* s) {
+    if (!s->hashed) {
+        s->hash = js_hash_bytes(s->data, s->length);
+        s->hashed = 1;
+    }
+    return s->hash;
+}
 
 typedef enum { JS_UNDEF, JS_NULL, JS_BOOL, JS_NUM, JS_STR, JS_OBJ } js_type;
 
@@ -64,6 +77,13 @@ typedef struct js_obj {
     struct js_obj* proto;
     js_prop* props;
     uint32_t prop_count, prop_capacity;
+    /* hash index over props (built once an object has many properties):
+     * open addressing, slot = prop number + 1, 0 = empty */
+    uint32_t* prop_index;
+    uint32_t prop_index_cap;
+    /* Map/Set: hash index over items, same layout */
+    uint32_t* coll_index;
+    uint32_t coll_index_cap;
     /* arrays */
     js_val* items;
     uint32_t length, item_capacity;

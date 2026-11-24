@@ -95,7 +95,7 @@ static void* scope_alloc(size_t size) {
 /* Strings                                                                */
 /* ====================================================================== */
 
-static uint32_t str_hash(const char* text, size_t length) {
+uint32_t js_hash_bytes(const char* text, size_t length) {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < length; i++) {
         h ^= (uint8_t)text[i];
@@ -107,9 +107,12 @@ static uint32_t str_hash(const char* text, size_t length) {
 js_str* js_new_str(const char* text, size_t length) {
     js_str* s = (js_str*)js_alloc(sizeof(js_str) + length + 1);
     s->length = (uint32_t)length;
+    s->capacity = (uint32_t)length + 1;
+    s->owned = 0;
     if (length) memcpy(s->data, text, length);
     s->data[length] = '\0';
-    s->hash = str_hash(s->data, length);
+    s->hash = js_hash_bytes(s->data, length);
+    s->hashed = 1;
     return s;
 }
 
@@ -125,7 +128,7 @@ typedef struct intern_entry {
 static intern_entry* intern_table[INTERN_SIZE];
 
 js_str* js_intern(const char* text, size_t length) {
-    uint32_t h = str_hash(text, length);
+    uint32_t h = js_hash_bytes(text, length);
     intern_entry** slot = &intern_table[h % INTERN_SIZE];
     for (intern_entry* e = *slot; e; e = e->next)
         if (e->str->hash == h && e->str->length == length &&
@@ -148,15 +151,47 @@ js_str* js_concat(js_str* a, js_str* b) {
     if (!b->length) return a;
     js_str* s = (js_str*)js_alloc(sizeof(js_str) + a->length + b->length + 1);
     s->length = a->length + b->length;
+    s->capacity = s->length + 1;
+    s->owned = 0;
     memcpy(s->data, a->data, a->length);
     memcpy(s->data + a->length, b->data, b->length);
     s->data[s->length] = '\0';
-    s->hash = str_hash(s->data, s->length);
+    s->hashed = 0;   /* hashed when first used as a key */
+    return s;
+}
+
+/* `name += value` as a statement on a string variable. The result becomes a
+ * string builder with spare room that only this variable holds (reading the
+ * variable anywhere else clears `owned`), so a loop that builds a string
+ * appends in place instead of copying the whole string every time. */
+static inline js_val share_val(js_val v) {
+    if (v.type == JS_STR) v.u.str->owned = 0;
+    return v;
+}
+
+static js_str* append_owned(js_str* a, js_str* b) {
+    uint32_t total = a->length + b->length;
+    if (a->owned && a->capacity > total) {
+        memcpy(a->data + a->length, b->data, b->length);
+        a->length = total;
+        a->data[total] = '\0';
+        a->hashed = 0;
+        return a;
+    }
+    uint32_t capacity = total < 64 ? total + 1 : total * 2;
+    js_str* s = (js_str*)js_alloc(sizeof(js_str) + capacity);
+    s->length = total;
+    s->capacity = capacity;
+    s->owned = 1;
+    s->hashed = 0;
+    memcpy(s->data, a->data, a->length);
+    memcpy(s->data + a->length, b->data, b->length);
+    s->data[total] = '\0';
     return s;
 }
 
 int js_str_eq(const js_str* a, const js_str* b) {
-    return a == b || (a->hash == b->hash && a->length == b->length &&
+    return a == b || (a->length == b->length && js_str_hash((js_str*)a) == js_str_hash((js_str*)b) &&
                       !memcmp(a->data, b->data, a->length));
 }
 
@@ -256,10 +291,46 @@ void js_array_set_length(js_obj* a, uint32_t length) {
     a->length = length;
 }
 
+/* Objects with many properties (the global object, prototypes, big
+ * dictionaries) get a hash index so lookups stop scanning every property. */
+#define PROP_INDEX_MIN 10u
+
+static void prop_index_insert(js_obj* o, uint32_t i) {
+    uint32_t mask = o->prop_index_cap - 1;
+    uint32_t h = js_str_hash(o->props[i].key) & mask;
+    while (o->prop_index[h]) h = (h + 1) & mask;
+    o->prop_index[h] = i + 1;
+}
+
+static void prop_index_build(js_obj* o) {
+    uint32_t cap = 16;
+    while (cap < o->prop_count * 2 + 2) cap <<= 1;
+    uint32_t* slots = (uint32_t*)js_alloc(sizeof(uint32_t) * cap);
+    if (!slots) { o->prop_index = NULL; return; }
+    memset(slots, 0, sizeof(uint32_t) * cap);
+    o->prop_index = slots;
+    o->prop_index_cap = cap;
+    for (uint32_t i = 0; i < o->prop_count; i++) prop_index_insert(o, i);
+}
+
 js_prop* js_find_own(js_obj* o, js_str* key) {
+    if (o->prop_count >= PROP_INDEX_MIN) {
+        if (!o->prop_index) prop_index_build(o);
+        if (o->prop_index) {
+            uint32_t mask = o->prop_index_cap - 1;
+            for (uint32_t h = js_str_hash(key) & mask;; h = (h + 1) & mask) {
+                uint32_t slot = o->prop_index[h];
+                if (!slot) return NULL;
+                js_prop* p = &o->props[slot - 1];
+                if (p->key == key || (p->key->length == key->length && js_str_hash(p->key) == js_str_hash(key) &&
+                                      !memcmp(p->key->data, key->data, key->length)))
+                    return p;
+            }
+        }
+    }
     for (uint32_t i = 0; i < o->prop_count; i++) {
         js_prop* p = &o->props[i];
-        if (p->key == key || (p->key->hash == key->hash && p->key->length == key->length &&
+        if (p->key == key || (p->key->length == key->length && js_str_hash(p->key) == js_str_hash(key) &&
                               !memcmp(p->key->data, key->data, key->length)))
             return p;
     }
@@ -278,6 +349,10 @@ static js_prop* add_prop(js_obj* o, js_str* key) {
     memset(p, 0, sizeof(*p));
     p->key = key;
     p->value = js_undef();
+    if (o->prop_index) {
+        if (o->prop_count * 2 + 2 > o->prop_index_cap) prop_index_build(o);
+        else prop_index_insert(o, o->prop_count - 1);
+    }
     return p;
 }
 
@@ -547,6 +622,7 @@ int js_delete(js_val target, js_str* key) {
             memmove(&o->props[i], &o->props[i + 1],
                     sizeof(js_prop) * (o->prop_count - i - 1));
             o->prop_count--;
+            o->prop_index = NULL;   /* rebuilt on the next lookup */
             return 1;
         }
     }
@@ -2940,6 +3016,7 @@ static js_val lookup_identifier(js_env* env, js_str* name, int typeof_check) {
     js_var* v = env_lookup(env, name);
     if (v) {
         if (!v->initialized) return throw_reference(name, 1);
+        if (v->value.type == JS_STR) v->value.u.str->owned = 0;   /* now shared */
         return v->value;
     }
     if (name == K_arguments) {
@@ -3319,7 +3396,7 @@ static void bind_pattern(js_node* pattern, js_val value, js_env* env, int kind,
             if (kind == VAR_VAR) {
                 /* var inside blocks lands in the function scope */
                 js_var* outer = env_lookup(env, pattern->str);
-                if (outer) outer->value = value;
+                if (outer) outer->value = share_val(value);
             }
         } else {
             assign_identifier(env, pattern->str, value);
@@ -3740,6 +3817,30 @@ __attribute__((noinline)) static js_val eval_update(js_node* n, js_env* env) {
     double updated = n->op == '+' ? value + 1 : value - 1;
     put_reference(n->a, env, object, key, js_num(updated));
     return js_num(n->flag ? updated : value);
+}
+
+/* `name += rhs;` where name is a string variable in scope: see append_owned.
+ * Returns 0 to let the generic path handle it. */
+__attribute__((noinline)) static int append_statement(js_node* n, js_env* env) {
+    js_str* name = n->a->str;
+    js_var* v = env_lookup(env, name);
+    if (!v || !v->initialized || v->kind == VAR_CONST || v->value.type != JS_STR) return 0;
+    js_str* old = v->value.u.str;
+    js_val rhs = eval(n->b, env);
+    if (js_rt.ctl) return 1;
+    js_str* tail;
+    if (rhs.type == JS_STR) tail = rhs.u.str;
+    else if (rhs.type == JS_OBJ) {
+        js_val p = js_to_primitive(rhs, 0);
+        if (js_rt.ctl) return 1;
+        tail = js_to_string(p);
+    } else tail = js_to_string(rhs);
+    if (js_rt.ctl) return 1;
+    js_str* result = append_owned(old, tail);
+    v = env_lookup(env, name);   /* the scope may have grown meanwhile */
+    if (v) v->value = js_str_val(result);
+    else { result->owned = 0; assign_identifier(env, name, js_str_val(result)); }
+    return 1;
 }
 
 __attribute__((noinline)) static js_val eval_assign(js_node* n, js_env* env) {
@@ -4200,7 +4301,7 @@ static void exec_block(js_node* n, js_env* env) {
  * values of `let`. */
 static js_env* iteration_scope(js_env* loop_env, js_env* parent) {
     js_env* fresh = new_env(parent, loop_env->count + 1, scope_allowed);
-    for (uint32_t i = 0; i < loop_env->count; i++) fresh->vars[i] = loop_env->vars[i];
+    for (uint32_t i = 0; i < loop_env->count; i++) { fresh->vars[i] = loop_env->vars[i]; share_val(fresh->vars[i].value); }
     fresh->count = loop_env->count;
     return fresh;
 }
@@ -4281,6 +4382,9 @@ static void exec(js_node* n, js_env* env) {
     switch (n->type) {
     case N_EXPR_STMT:
         js_rt.line = n->line;
+        if (n->a->type == N_ASSIGN && n->a->op == 1 && n->a->a->type == N_IDENT &&
+            append_statement(n->a, env))
+            return;
         eval(n->a, env);
         return;
     case N_VAR:
@@ -4478,14 +4582,14 @@ js_val js_exec_program(js_node* program) {
     for (int i = 0; i < f->var_count; i++) {
         js_var* v = env_lookup(js_global_env, f->vars[i]);
         if (v && !js_find_own(js_global, f->vars[i]))
-            js_set(js_obj_val(js_global), f->vars[i], v->value);
+            js_set(js_obj_val(js_global), f->vars[i], share_val(v->value));
     }
     /* drop them from the scope so the global object stays authoritative */
     uint32_t kept = 0;
     for (uint32_t i = 0; i < js_global_env->count; i++) {
         js_var* v = &js_global_env->vars[i];
         if (v->kind == VAR_VAR) {
-            js_set(js_obj_val(js_global), v->name, v->value);
+            js_set(js_obj_val(js_global), v->name, share_val(v->value));
             continue;
         }
         js_global_env->vars[kept++] = *v;
@@ -4580,7 +4684,7 @@ static void export_pattern_names(js_node* pattern, js_obj* ns, js_env* env) {
     switch (pattern->type) {
     case N_IDENT: {
         js_var* v = env_lookup(env, pattern->str);
-        js_set(js_obj_val(ns), pattern->str, v ? v->value : js_undef());
+        js_set(js_obj_val(ns), pattern->str, v ? share_val(v->value) : js_undef());
         break;
     }
     case N_ASSIGN_PAT: case N_REST:
@@ -4685,7 +4789,7 @@ static void exec_module(js_node* program, module_record* rec) {
         if (s->op == 3 && !s->c)
             for (uint32_t k = 0; k < s->count; k++) {
                 js_var* v = env_lookup(env, s->list[k]->str);
-                js_set(js_obj_val(ns), s->list[k]->b->str, v ? v->value : js_undef());
+                js_set(js_obj_val(ns), s->list[k]->b->str, v ? share_val(v->value) : js_undef());
             }
         if (s->op == 2 && s->a && s->a->type == N_VAR)
             for (uint32_t k = 0; k < s->a->count; k++) export_pattern_names(s->a->list[k]->a, ns, env);

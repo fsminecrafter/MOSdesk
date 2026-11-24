@@ -1163,13 +1163,51 @@ static int list_matches(const css_selector_list_t* list, mx_node_t* e) {
     return 0;
 }
 
-int mx_css_matches(mx_node_t* element, const char* selectors) {
-    if (!element || element->type != MX_NODE_ELEMENT) return 0;
+/* Scripts call matches()/querySelector() with the same few selectors over and
+ * over (querySelectorAll asks once per element). Parsing each time filled the
+ * stylesheet arena until every query failed as "not a valid selector", so
+ * parsed lists are kept here until the next mx_css_reset. */
+#define SELECTOR_CACHE 256
+typedef struct {
+    char* text;
+    uint32_t hash;
+    uint32_t generation;
+    css_selector_list_t* list;   /* NULL: the selector is invalid */
+} selector_cache_t;
+static selector_cache_t selector_cache[SELECTOR_CACHE];
+
+const void* mx_css_compile(const char* selectors) {
+    if (!selectors) return NULL;
+    size_t length = strlen(selectors);
+    uint32_t h = mx_hash(selectors, length);
+    selector_cache_t* slot = &selector_cache[h % SELECTOR_CACHE];
+    if (slot->text && slot->generation == css_generation && slot->hash == h &&
+        !strcmp(slot->text, selectors))
+        return slot->list;
     int error = 0;
-    css_selector_list_t* list =
-        parse_selector_list(selectors, strlen(selectors), &error);
+    css_selector_list_t* list = parse_selector_list(selectors, length, &error);
+    if (error) list = NULL;   /* querySelector throws when any part is invalid */
+    char* text = mx_arena_strndup(&css_arena, selectors, length);
+    if (text) {
+        slot->text = text;
+        slot->hash = h;
+        slot->generation = css_generation;
+        slot->list = list;
+    }
+    return list;
+}
+
+int mx_css_matches_compiled(mx_node_t* element, const void* compiled) {
+    if (!compiled) return -1;
+    if (!element || element->type != MX_NODE_ELEMENT) return 0;
+    return list_matches((const css_selector_list_t*)compiled, element);
+}
+
+int mx_css_matches(mx_node_t* element, const char* selectors) {
+    const void* list = mx_css_compile(selectors);
     if (!list) return -1;
-    return list_matches(list, element);
+    if (!element || element->type != MX_NODE_ELEMENT) return 0;
+    return list_matches((const css_selector_list_t*)list, element);
 }
 
 /* ====================================================================== */

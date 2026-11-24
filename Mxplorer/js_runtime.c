@@ -2353,7 +2353,6 @@ static js_val string_case(js_val self, js_val* args, int argc, js_obj* callee) {
         if (callee->magic && c >= 'a' && c <= 'z') out->data[i] = (char)(c - 32);
         else if (!callee->magic && c >= 'A' && c <= 'Z') out->data[i] = (char)(c + 32);
     }
-    out->hash = 0;
     js_str* fixed = js_new_str(out->data, out->length);
     return js_str_val(fixed);
 }
@@ -3691,10 +3690,72 @@ static js_val queue_microtask(js_val self, js_val* args, int argc, js_obj* calle
 /* Map / Set                                                              */
 /* ====================================================================== */
 
+/* Map and Set keep insertion order in items[] and a hash index next to it,
+ * so get/set/has/delete no longer scan every entry. */
+static uint32_t value_hash(js_val v) {
+    switch (v.type) {
+    case JS_STR: return js_str_hash(v.u.str);
+    case JS_NUM: {
+        double d = v.u.num;
+        if (d == 0) d = 0;            /* -0 and +0 are the same key */
+        if (is_nan(d)) return 0x7ff80000u;
+        uint64_t bits;
+        memcpy(&bits, &d, sizeof(bits));
+        bits ^= bits >> 29; bits *= 0xbf58476d1ce4e5b9ull; bits ^= bits >> 32;
+        return (uint32_t)bits;
+    }
+    case JS_OBJ: {
+        uintptr_t p = (uintptr_t)v.u.obj;
+        return (uint32_t)((p >> 4) * 2654435761u);
+    }
+    case JS_BOOL: return v.u.boolean ? 0x9e3779b9u : 0x7f4a7c15u;
+    default: return (uint32_t)v.type * 0x85ebca6bu;
+    }
+}
+
+static void coll_index_insert(js_obj* c, uint32_t i) {
+    uint32_t mask = c->coll_index_cap - 1;
+    uint32_t h = value_hash(c->items[i]) & mask;
+    while (c->coll_index[h]) h = (h + 1) & mask;
+    c->coll_index[h] = i + 1;
+}
+
+static void coll_index_build(js_obj* c) {
+    uint32_t cap = 16;
+    while (cap < c->length * 2 + 2) cap <<= 1;
+    uint32_t* slots = (uint32_t*)js_alloc(sizeof(uint32_t) * cap);
+    c->coll_index = slots;
+    if (!slots) return;
+    memset(slots, 0, sizeof(uint32_t) * cap);
+    c->coll_index_cap = cap;
+    for (uint32_t i = 0; i < c->length; i++) coll_index_insert(c, i);
+}
+
 static long collection_find(js_obj* c, js_val key) {
+    if (c->length >= 8) {
+        if (!c->coll_index) coll_index_build(c);
+        if (c->coll_index) {
+            uint32_t mask = c->coll_index_cap - 1;
+            for (uint32_t h = value_hash(key) & mask;; h = (h + 1) & mask) {
+                uint32_t slot = c->coll_index[h];
+                if (!slot) return -1;
+                if (same_value_zero(c->items[slot - 1], key)) return (long)slot - 1;
+            }
+        }
+    }
     for (uint32_t i = 0; i < c->length; i++)
         if (same_value_zero(c->items[i], key)) return (long)i;
     return -1;
+}
+
+static void collection_append(js_obj* c, js_val key, js_val value) {
+    if (key.type == JS_NUM && key.u.num == 0) key = js_num(0);   /* -0 is stored as +0 */
+    js_array_push(c, key);
+    if (c->data) js_array_push((js_obj*)c->data, value);
+    if (c->coll_index) {
+        if (c->length * 2 + 2 > c->coll_index_cap) coll_index_build(c);
+        else coll_index_insert(c, c->length - 1);
+    }
 }
 
 static js_val collection_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
@@ -3710,14 +3771,10 @@ static js_val collection_ctor(js_val self, js_val* args, int argc, js_obj* calle
             if (is_map) {
                 js_val k = js_get_index(item, js_num(0)), v = js_get_index(item, js_num(1));
                 long at = collection_find(c, k);
-                if (at >= 0) {
-                    ((js_obj*)c->data)->items[at] = v;
-                } else {
-                    js_array_push(c, k);
-                    js_array_push((js_obj*)c->data, v);
-                }
+                if (at >= 0) ((js_obj*)c->data)->items[at] = v;
+                else collection_append(c, k, v);
             } else if (collection_find(c, item) < 0) {
-                js_array_push(c, item);
+                collection_append(c, item, js_undef());
             }
         }
     }
@@ -3744,8 +3801,7 @@ static js_val collection_method(js_val self, js_val* args, int argc, js_obj* cal
         if (at >= 0) {
             if (values) values->items[at] = ARG(1);
         } else {
-            js_array_push(c, ARG(0));
-            if (values) js_array_push(values, ARG(1));
+            collection_append(c, ARG(0), ARG(1));
         }
         return self;
     case 2:   /* has */
@@ -3759,9 +3815,11 @@ static js_val collection_method(js_val self, js_val* args, int argc, js_obj* cal
             memmove(values->items + at, values->items + at + 1, sizeof(js_val) * (values->length - (uint32_t)at - 1));
             values->length--;
         }
+        c->coll_index = NULL;
         return js_bool(1);
     case 4:   /* clear */
         c->length = 0;
+        c->coll_index = NULL;
         if (values) values->length = 0;
         return js_undef();
     case 5:   /* forEach */
