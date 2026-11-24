@@ -126,6 +126,8 @@ int mx_css_dark_page(void);
 int mx_css_matches(mx_node_t* element, const char* selectors);
 /* Parses (and caches until mx_css_reset) a selector list; NULL when invalid. */
 const void* mx_css_compile(const char* selectors);
+/* Evaluates an @supports condition such as "(display: grid) and (not (x: y))". */
+int mx_css_supports(const char* condition, size_t length);
 int mx_css_matches_compiled(mx_node_t* element, const void* compiled);
 int mx_css_parse_color(const char* value, uint32_t* color);
 int mx_css_media_matches(const char* query);

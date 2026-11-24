@@ -41,14 +41,24 @@ mx_node_t* mx_dom_create_text(mx_document_t* doc, const char* text,
     return node;
 }
 
+/* Scripts' MutationObservers and custom elements listen here. Parsing and
+ * cloning build new trees nobody observes yet, so they are quiet; a parsed
+ * fragment is reported as its top-level nodes once it is complete. */
+mx_dom_mutation_fn mx_dom_mutation_hook;
+static int hook_quiet;
+#define HOOK(kind, target, node, name, old) \
+    do { if (mx_dom_mutation_hook && !hook_quiet) mx_dom_mutation_hook(kind, target, node, name, old); } while (0)
+
 void mx_dom_remove(mx_node_t* child) {
     mx_node_t* parent = child->parent;
     if (!parent) return;
+    HOOK(MX_MUT_REMOVING, parent, child, NULL, NULL);
     if (child->prev) child->prev->next = child->next;
     else parent->first = child->next;
     if (child->next) child->next->prev = child->prev;
     else parent->last = child->prev;
     child->parent = child->prev = child->next = NULL;
+    HOOK(MX_MUT_REMOVED, parent, child, NULL, NULL);
 }
 
 void mx_dom_insert_before(mx_node_t* parent, mx_node_t* child,
@@ -72,6 +82,7 @@ void mx_dom_insert_before(mx_node_t* parent, mx_node_t* child,
         else parent->first = child;
         reference->prev = child;
     }
+    HOOK(MX_MUT_ADDED, parent, child, NULL, NULL);
 }
 
 void mx_dom_append(mx_node_t* parent, mx_node_t* child) {
@@ -95,8 +106,13 @@ void mx_dom_set_attr(mx_document_t* doc, mx_node_t* node, const char* name,
     if (!node || node->type != MX_NODE_ELEMENT) return;
     for (mx_attr_t* a = node->attrs; a; a = a->next) {
         if (mx_streq_nocase(a->name, name)) {
-            if (a->value && value && !strcmp(a->value, value)) return;
+            const char* old = a->value;
+            if (a->value && value && !strcmp(a->value, value)) {
+                HOOK(MX_MUT_ATTR, node, NULL, a->name, old);   /* still a mutation */
+                return;
+            }
             a->value = mx_arena_strdup(&doc->arena, value);
+            HOOK(MX_MUT_ATTR, node, NULL, a->name, old);
             return;
         }
     }
@@ -109,13 +125,16 @@ void mx_dom_set_attr(mx_document_t* doc, mx_node_t* node, const char* name,
     mx_attr_t** tail = &node->attrs;
     while (*tail) tail = &(*tail)->next;
     *tail = attr;
+    HOOK(MX_MUT_ATTR, node, NULL, attr->name, NULL);
 }
 
 void mx_dom_remove_attr(mx_node_t* node, const char* name) {
     mx_attr_t** link = &node->attrs;
     while (*link) {
         if (mx_streq_nocase((*link)->name, name)) {
-            *link = (*link)->next;
+            mx_attr_t* gone = *link;
+            *link = gone->next;
+            HOOK(MX_MUT_ATTR, node, NULL, gone->name, gone->value);
             return;
         }
         link = &(*link)->next;
@@ -230,7 +249,16 @@ mx_node_t* mx_dom_prev_element(const mx_node_t* node) {
     return NULL;
 }
 
+static mx_node_t* clone_quiet(mx_document_t* doc, mx_node_t* node, int deep);
+
 mx_node_t* mx_dom_clone(mx_document_t* doc, mx_node_t* node, int deep) {
+    hook_quiet++;
+    mx_node_t* copy = clone_quiet(doc, node, deep);
+    hook_quiet--;
+    return copy;
+}
+
+static mx_node_t* clone_quiet(mx_document_t* doc, mx_node_t* node, int deep) {
     mx_node_t* copy;
     if (node->type == MX_NODE_ELEMENT) {
         copy = mx_dom_create_element(doc, node->tag);
@@ -289,7 +317,9 @@ char* mx_dom_text_content(mx_document_t* doc, const mx_node_t* node) {
 void mx_dom_set_text_content(mx_document_t* doc, mx_node_t* node,
                              const char* text) {
     if (node->type == MX_NODE_TEXT) {
+        const char* old = node->text;
         node->text = mx_arena_strdup(&doc->arena, text);
+        HOOK(MX_MUT_TEXT, node, NULL, NULL, old);
         node->text_length = node->text ? strlen(node->text) : 0;
         if (!node->text) node->text = (char*)"";
         return;
@@ -947,7 +977,9 @@ void mx_dom_parse(mx_document_t* doc, const char* source, size_t length) {
         source += 3;
         length -= 3;
     }
+    hook_quiet++;
     build(&b, source, length);
+    hook_quiet--;
     for (mx_node_t* n = doc->head; n; n = mx_dom_next(doc->head, n)) {
         if (mx_dom_is(n, "title") && !doc->title[0]) {
             char* text = mx_dom_text_content(doc, n);
@@ -971,5 +1003,10 @@ void mx_dom_parse(mx_document_t* doc, const char* source, size_t length) {
 void mx_dom_parse_fragment(mx_document_t* doc, mx_node_t* parent,
                            const char* source, size_t length) {
     builder_t b = {doc, parent, 1, 1, parent};
+    mx_node_t* before = parent->last;
+    hook_quiet++;
     build(&b, source, length);
+    hook_quiet--;
+    for (mx_node_t* n = before ? before->next : parent->first; n; n = n->next)
+        HOOK(MX_MUT_ADDED, parent, n, NULL, NULL);
 }

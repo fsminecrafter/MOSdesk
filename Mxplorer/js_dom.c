@@ -1264,13 +1264,14 @@ static js_val el_replace_child(js_val self, js_val* args, int argc, js_obj* call
 
 static js_val el_replace_with(js_val self, js_val* args, int argc, js_obj* callee) {
     mx_node_t* n = this_node(self);
-    if (!n || !n->parent) return js_undef();
-    mx_node_t* parent = n->parent;
-    if (callee->magic) {   /* replaceChildren */
+    if (n && callee->magic) {   /* replaceChildren */
         mx_dom_remove_children(n);
         for (int i = 0; i < argc; i++) insert(n, as_insertable(args[i]), NULL);
+        js_dom_mutated();
         return js_undef();
     }
+    if (!n || !n->parent) return js_undef();
+    mx_node_t* parent = n->parent;
     for (int i = 0; i < argc; i++) insert(parent, as_insertable(args[i]), n);
     mx_dom_remove(n);
     js_dom_mutated();
@@ -1462,12 +1463,16 @@ static js_val el_query(js_val self, js_val* args, int argc, js_obj* callee) {
 
 /* ---- creation ---- */
 
+static void ce_created(mx_node_t* e);
+
 static js_val doc_create(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self;
     switch (callee->magic) {
     case 0: {   /* createElement */
         js_str* tag = js_to_string(ARG(0));
-        return js_wrap_node(mx_dom_create_element(js_doc, tag->data));
+        mx_node_t* e = mx_dom_create_element(js_doc, tag->data);
+        if (e) ce_created(e);
+        return js_wrap_node(e);
     }
     case 1: {   /* createTextNode */
         js_str* text = js_to_string(ARG(0));
@@ -2807,7 +2812,341 @@ static js_val illegal_ctor(js_val self, js_val* args, int argc, js_obj* callee) 
     return js_throw_error("TypeError", "Illegal constructor");
 }
 
+/* ====================================================================== */
+/* Tree changes: MutationObserver records and custom elements             */
+/* ====================================================================== */
+
+static int mo_enabled;          /* a MutationObserver is observing something */
+static js_obj* mo_records;      /* records waiting for the microtask */
+
+#define CE_MAX 128
+typedef struct {
+    const char* name;           /* lower case */
+    js_obj* ctor;
+    js_obj* observed;           /* observedAttributes, or NULL */
+} ce_def;
+static ce_def ce_defs[CE_MAX];
+static int ce_count;
+static js_obj* ce_waiting;      /* name -> [promise, resolve] for whenDefined */
+
+enum { CE_UPGRADE, CE_CONNECTED, CE_DISCONNECTED, CE_ATTR };
+typedef struct ce_reaction {
+    int type;
+    mx_node_t* node;
+    js_val name, old_value, new_value;
+    struct ce_reaction* next;
+} ce_reaction;
+static ce_reaction* ce_head;
+static ce_reaction* ce_tail;
+static int ce_flushing, ce_flush_scheduled;
+static int removing_connected;
+static mx_node_t* ce_pending_node;   /* the element HTMLElement() should return */
+
+static int node_connected(const mx_node_t* n) {
+    while (n && n->parent) n = n->parent;
+    return js_doc && n == js_doc->root;
+}
+
+static ce_def* ce_lookup(const char* tag) {
+    if (!tag || !strchr(tag, '-')) return NULL;
+    for (int i = 0; i < ce_count; i++)
+        if (!strcmp(ce_defs[i].name, tag)) return &ce_defs[i];
+    return NULL;
+}
+
+static ce_def* ce_by_ctor(js_obj* ctor) {
+    for (int i = 0; i < ce_count; i++)
+        if (ce_defs[i].ctor == ctor) return &ce_defs[i];
+    return NULL;
+}
+
+static void ce_queue(int type, mx_node_t* node, js_val name, js_val old_value, js_val new_value) {
+    ce_reaction* r = (ce_reaction*)js_alloc(sizeof(ce_reaction));
+    r->type = type;
+    r->node = node;
+    r->name = name;
+    r->old_value = old_value;
+    r->new_value = new_value;
+    r->next = NULL;
+    if (ce_tail) ce_tail->next = r;
+    else ce_head = r;
+    ce_tail = r;
+}
+
+static void ce_call(mx_node_t* node, const char* method_name, js_val* args, int argc) {
+    js_val self = js_wrap_node(node);
+    js_val fn = js_get_c(self, method_name);
+    if (!js_rt.ctl && js_is_callable(fn)) js_call(fn, self, args, argc);
+    if (js_rt.ctl == CTL_THROW) js_report_exception();
+    js_rt.ctl = CTL_NONE;
+}
+
+static int ce_observes(ce_def* d, const char* name) {
+    if (!d->observed) return 0;
+    for (uint32_t i = 0; i < d->observed->length; i++) {
+        js_val v = d->observed->items[i];
+        if (v.type == JS_STR && mx_streq_nocase(v.u.str->data, name)) return 1;
+    }
+    return 0;
+}
+
+static void ce_upgrade(mx_node_t* node) {
+    ce_def* d = ce_lookup(node->tag);
+    if (!d || node->ce_state) return;
+    node->ce_state = 1;
+    js_val self = js_wrap_node(node);
+    ce_pending_node = node;
+    js_construct_this_override = self.u.obj;
+    js_construct(js_obj_val(d->ctor), NULL, 0);
+    js_construct_this_override = NULL;
+    ce_pending_node = NULL;
+    if (js_rt.ctl == CTL_THROW) {
+        js_report_exception();
+        js_rt.ctl = CTL_NONE;
+        node->ce_state = 2;
+        return;
+    }
+    js_rt.ctl = CTL_NONE;
+    for (mx_attr_t* a = node->attrs; a; a = a->next)
+        if (ce_observes(d, a->name)) {
+            js_val args[3] = {js_str_val(js_cstr(a->name)), js_null(), js_str_val(js_cstr(a->value ? a->value : ""))};
+            ce_call(node, "attributeChangedCallback", args, 3);
+        }
+    if (node_connected(node)) ce_call(node, "connectedCallback", NULL, 0);
+}
+
+static void ce_flush(void) {
+    if (ce_flushing) return;
+    ce_flushing = 1;
+    while (ce_head) {
+        ce_reaction* r = ce_head;
+        ce_head = r->next;
+        if (!ce_head) ce_tail = NULL;
+        switch (r->type) {
+        case CE_UPGRADE: ce_upgrade(r->node); break;
+        case CE_CONNECTED:
+            if (r->node->ce_state == 1 && node_connected(r->node)) ce_call(r->node, "connectedCallback", NULL, 0);
+            break;
+        case CE_DISCONNECTED:
+            if (r->node->ce_state == 1) ce_call(r->node, "disconnectedCallback", NULL, 0);
+            break;
+        case CE_ATTR: {
+            js_val args[3] = {r->name, r->old_value, r->new_value};
+            if (r->node->ce_state == 1) ce_call(r->node, "attributeChangedCallback", args, 3);
+            break;
+        }
+        }
+    }
+    ce_flushing = 0;
+}
+
+static js_val ce_flush_task(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc; (void)callee;
+    ce_flush_scheduled = 0;
+    ce_flush();
+    return js_undef();
+}
+
+static js_val mo_deliver_task(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc; (void)callee;
+    js_obj* records = mo_records;
+    mo_records = NULL;
+    if (!records || !records->length) return js_undef();
+    js_val deliver = js_get_c(js_obj_val(js_global), "__mxMODeliver");
+    if (js_is_callable(deliver)) {
+        js_val list = js_obj_val(records);
+        js_call(deliver, js_undef(), &list, 1);
+    }
+    return js_undef();
+}
+
+static void mo_record(int kind, mx_node_t* target, mx_node_t* node, const char* name, const char* old_value) {
+    if (!mo_records) {
+        mo_records = js_new_array(0);
+        js_enqueue_microtask(js_obj_val(js_new_native("", mo_deliver_task, 0)), js_undef());
+    }
+    js_obj* r = js_new_array(7);
+    js_array_push(r, js_num(kind));
+    js_array_push(r, js_wrap_node(target));
+    js_array_push(r, node ? js_wrap_node(node) : js_null());
+    js_array_push(r, name ? js_str_val(js_cstr(name)) : js_null());
+    js_array_push(r, old_value ? js_str_val(js_cstr(old_value)) : js_null());
+    js_array_push(r, node && node->prev ? js_wrap_node(node->prev) : js_null());
+    js_array_push(r, node && node->next ? js_wrap_node(node->next) : js_null());
+    js_array_push(mo_records, js_obj_val(r));
+}
+
+static void dom_hook(int kind, mx_node_t* target, mx_node_t* node, const char* name, const char* old_value) {
+    if (!js_doc || js_rt.out_of_memory) return;
+    if (mo_enabled) {
+        if (kind == MX_MUT_ADDED || kind == MX_MUT_REMOVING) mo_record(kind == MX_MUT_ADDED ? 0 : 1, target, node, NULL, NULL);
+        else if (kind == MX_MUT_ATTR) mo_record(3, target, NULL, name, old_value);
+        else if (kind == MX_MUT_TEXT) mo_record(4, target, NULL, NULL, old_value);
+    }
+    if (!ce_count) return;
+    int queued = 0;
+    if (kind == MX_MUT_ADDED && node->type != MX_NODE_TEXT) {
+        int connected = node_connected(target);
+        for (mx_node_t* e = node; e; e = mx_dom_next(node, e)) {
+            if (e->type != MX_NODE_ELEMENT || !ce_lookup(e->tag)) continue;
+            if (!e->ce_state) ce_queue(CE_UPGRADE, e, js_undef(), js_undef(), js_undef());
+            else if (connected) ce_queue(CE_CONNECTED, e, js_undef(), js_undef(), js_undef());
+            queued = 1;
+        }
+    } else if (kind == MX_MUT_REMOVING) {
+        removing_connected = node_connected(target);
+    } else if (kind == MX_MUT_REMOVED && removing_connected) {
+        for (mx_node_t* e = node; e; e = mx_dom_next(node, e))
+            if (e->type == MX_NODE_ELEMENT && e->ce_state == 1) {
+                ce_queue(CE_DISCONNECTED, e, js_undef(), js_undef(), js_undef());
+                queued = 1;
+            }
+    } else if (kind == MX_MUT_ATTR && target->ce_state == 1) {
+        ce_def* d = ce_lookup(target->tag);
+        if (d && ce_observes(d, name)) {
+            const char* now = mx_dom_attr(target, name);
+            ce_queue(CE_ATTR, target, js_str_val(js_cstr(name)),
+                     old_value ? js_str_val(js_cstr(old_value)) : js_null(),
+                     now ? js_str_val(js_cstr(now)) : js_null());
+            queued = 1;
+        }
+    }
+    if (!queued) return;
+    if (js_running && !ce_flushing) ce_flush();
+    else if (!ce_flush_scheduled) {
+        ce_flush_scheduled = 1;
+        js_enqueue_microtask(js_obj_val(js_new_native("", ce_flush_task, 0)), js_undef());
+    }
+}
+
+/* HTMLElement(): only for custom element classes (`super()` in their
+ * constructor, or `new MyElement()`). */
+static js_val html_element_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc; (void)callee;
+    if (ce_pending_node) {
+        mx_node_t* n = ce_pending_node;
+        ce_pending_node = NULL;
+        return js_wrap_node(n);
+    }
+    ce_def* d = js_super_new_target ? ce_by_ctor(js_super_new_target) : NULL;
+    if (!d) return js_throw_error("TypeError", "Illegal constructor");
+    mx_node_t* n = mx_dom_create_element(js_doc, d->name);
+    if (!n) return js_throw_error("TypeError", "Illegal constructor");
+    n->ce_state = 1;
+    return js_wrap_node(n);
+}
+
+static js_val ce_method(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self;
+    js_str* name = js_to_string(ARG(0));
+    char lower[96];
+    size_t k = 0;
+    for (; k < name->length && k + 1 < sizeof(lower); k++) lower[k] = mx_lower(name->data[k]);
+    lower[k] = '\0';
+    switch (callee->magic) {
+    case 0: {   /* define */
+        if (!strchr(lower, '-') || !(lower[0] >= 'a' && lower[0] <= 'z'))
+            return js_throw_error("SyntaxError", "is not a valid custom element name");
+        if (!js_is_callable(ARG(1))) return js_throw_error("TypeError", "The constructor is not a function");
+        if (ce_lookup(lower)) return js_throw_error("NotSupportedError", "this name has already been used with this registry");
+        if (ce_count >= CE_MAX) return js_undef();
+        ce_def* d = &ce_defs[ce_count];
+        d->name = js_intern_c(lower)->data;
+        d->ctor = ARG(1).u.obj;
+        js_val observed = js_get_c(ARG(1), "observedAttributes");
+        if (js_rt.ctl) return js_undef();
+        d->observed = NULL;
+        if (observed.type == JS_OBJ) {
+            js_val from = js_get(js_get_c(js_obj_val(js_global), "Array"), js_intern_c("from"));
+            js_val list = js_call(from, js_undef(), &observed, 1);
+            if (js_rt.ctl) return js_undef();
+            if (list.type == JS_OBJ) d->observed = list.u.obj;
+        }
+        ce_count++;
+        /* upgrade the elements already in the document, in tree order */
+        for (mx_node_t* e = js_doc->root; e; e = mx_dom_next(js_doc->root, e))
+            if (e->type == MX_NODE_ELEMENT && !e->ce_state && !strcmp(e->tag, d->name))
+                ce_queue(CE_UPGRADE, e, js_undef(), js_undef(), js_undef());
+        ce_flush();
+        js_val waiting = ce_waiting ? js_get_c(js_obj_val(ce_waiting), d->name) : js_undef();
+        if (waiting.type == JS_OBJ && waiting.u.obj->length >= 1)
+            js_promise_settle(waiting.u.obj->items[0].u.obj, ARG(1), 0);
+        return js_undef();
+    }
+    case 1: {   /* get */
+        ce_def* d = ce_lookup(lower);
+        return d ? js_obj_val(d->ctor) : js_undef();
+    }
+    case 2: {   /* whenDefined */
+        ce_def* d = ce_lookup(lower);
+        if (d) return js_promise_resolved(js_obj_val(d->ctor), 0);
+        if (!ce_waiting) ce_waiting = js_new_object(NULL);
+        js_val waiting = js_get_c(js_obj_val(ce_waiting), lower);
+        if (waiting.type != JS_OBJ) {
+            js_obj* pair = js_new_array(1);
+            js_array_push(pair, js_obj_val(js_promise_new()));
+            js_set_c(js_obj_val(ce_waiting), lower, js_obj_val(pair));
+            waiting = js_obj_val(pair);
+        }
+        return waiting.u.obj->items[0];
+    }
+    case 3: {   /* upgrade(root) */
+        mx_node_t* root = node_of(ARG(0));
+        for (mx_node_t* e = root; e; e = mx_dom_next(root, e))
+            if (e->type == MX_NODE_ELEMENT && !e->ce_state && ce_lookup(e->tag))
+                ce_queue(CE_UPGRADE, e, js_undef(), js_undef(), js_undef());
+        ce_flush();
+        return js_undef();
+    }
+    case 4:   /* __mxMOEnable */
+        mo_enabled = js_truthy(ARG(0));
+        return js_undef();
+    }
+    return js_undef();
+}
+
+static js_val css_supports_fn(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)callee;
+    char buffer[512];
+    if (argc >= 2) {
+        mx_copy(buffer, sizeof(buffer), "(");
+        mx_append(buffer, sizeof(buffer), js_to_string(args[0])->data);
+        mx_append(buffer, sizeof(buffer), ":");
+        mx_append(buffer, sizeof(buffer), js_to_string(args[1])->data);
+        mx_append(buffer, sizeof(buffer), ")");
+    } else {
+        mx_copy(buffer, sizeof(buffer), js_to_string(ARG(0))->data);
+        /* CSS.supports("display: grid") without parentheses */
+        const char* t = buffer;
+        while (mx_is_space(*t)) t++;
+        if (*t != '(' && strncmp(t, "not", 3) && strncmp(t, "selector(", 9)) {
+            char wrapped[516];
+            mx_copy(wrapped, sizeof(wrapped), "(");
+            mx_append(wrapped, sizeof(wrapped), buffer);
+            mx_append(wrapped, sizeof(wrapped), ")");
+            mx_copy(buffer, sizeof(buffer), wrapped);
+        }
+    }
+    return js_bool(mx_css_supports(buffer, strlen(buffer)));
+}
+
+static void ce_created(mx_node_t* e) {
+    if (ce_count && ce_lookup(e->tag)) ce_upgrade(e);
+}
+
+static void ce_reset(void) {
+    mo_enabled = 0;
+    mo_records = NULL;
+    memset(ce_defs, 0, sizeof(ce_defs));
+    ce_count = 0;
+    ce_waiting = NULL;
+    ce_head = ce_tail = NULL;
+    ce_flushing = ce_flush_scheduled = 0;
+    ce_pending_node = NULL;
+}
+
 void js_dom_init(void) {
+    ce_reset();
     for (int i = 0; i < G_COUNT; i++) getter_keys[i] = js_intern_c(getter_names[i]);
     build_getter_table();
     window_listeners = NULL;
@@ -2928,7 +3267,7 @@ void js_dom_init(void) {
         "HTMLBodyElement", "HTMLIFrameElement", "HTMLTemplateElement", "SVGElement",
         "HTMLMediaElement", "HTMLVideoElement", "HTMLLinkElement", "HTMLStyleElement"};
     for (size_t i = 0; i < sizeof(element_types) / sizeof(element_types[0]); i++)
-        global_ctor(element_types[i], illegal_ctor, 0, element_proto);
+        global_ctor(element_types[i], i ? html_element_ctor : illegal_ctor, 0, element_proto);
     global_ctor("Node", illegal_ctor, 0, node_proto);
     global_ctor("Text", illegal_ctor, 0, text_proto);
     global_ctor("CharacterData", illegal_ctor, 0, text_proto);
@@ -3105,12 +3444,14 @@ void js_dom_init(void) {
     js_define(w, "crypto", js_obj_val(crypto), PROP_HIDDEN);
 
     js_obj* custom_elements = js_new_object(js_object_proto);
-    method(custom_elements, "define", noop, 0);
-    method(custom_elements, "get", noop, 0);
-    method(custom_elements, "whenDefined", noop, 0);
+    method(custom_elements, "define", ce_method, 0);
+    method(custom_elements, "get", ce_method, 1);
+    method(custom_elements, "whenDefined", ce_method, 2);
+    method(custom_elements, "upgrade", ce_method, 3);
+    method(w, "__mxMOEnable", ce_method, 4);
     js_define(w, "customElements", js_obj_val(custom_elements), PROP_HIDDEN);
     js_obj* css = js_new_object(js_object_proto);
-    method(css, "supports", false_fn, 0);
+    method(css, "supports", css_supports_fn, 0);
     js_define(w, "CSS", js_obj_val(css), PROP_HIDDEN);
 }
 
@@ -3202,8 +3543,14 @@ static const char js_prelude[] =
  * withResolvers/try, Array toSorted/toReversed/toSpliced/with/copyWithin/
  * fromAsync, Object.groupBy, Map.groupBy, getOwnPropertyDescriptors,
  * String.raw, Set methods, JSON.parse revivers, WeakRef,
- * FinalizationRegistry, Blob, File, FormData and a small en-US Intl. */
+ * FinalizationRegistry, Blob, File, FormData and a small en-US Intl
+ * (prelude/lang.js); MutationObserver, Node constants, <template>.content,
+ * shadowRoot, form.elements, CSS.escape and structuredClone
+ * (prelude/dom.js). Sources: the prelude directory, embedded by
+ * tools/gen_prelude.py. */
+/* BEGIN GENERATED PRELUDE (tools/gen_prelude.py) */
 static const char js_lang_prelude[] =
+/* prelude/lang.js */
 "(function(){\n"
 "var G=window,def=function(o,n,f){Object.defineProperty(o,n,{value:f,writable:true,configurable:true});};\n"
 "var P=Promise,PP=P.prototype;\n"
@@ -3319,7 +3666,84 @@ static const char js_lang_prelude[] =
 "  getCanonicalLocales:function(l){return l===undefined?[]:[].concat(l);},supportedValuesOf:function(){return [];}};\n"
 " [NF,DF,CO,PR,RT,LF,SG].forEach(function(C){C.supportedLocalesOf=function(l){return l===undefined?[]:[].concat(l);};});\n"
 " G.Intl=I;}\n"
+"})();\n"
+/* prelude/dom.js */
+"(function(){\n"
+"var G=window,def=function(o,n,f){Object.defineProperty(o,n,{value:f,writable:true,configurable:true});},\n"
+" acc=function(o,n,g,s){Object.defineProperty(o,n,{get:g,set:s,configurable:true});};\n"
+"var NP=Node.prototype,EP=Element.prototype;\n"
+"var K={ELEMENT_NODE:1,ATTRIBUTE_NODE:2,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,\n"
+" DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11,DOCUMENT_POSITION_DISCONNECTED:1,DOCUMENT_POSITION_PRECEDING:2,\n"
+" DOCUMENT_POSITION_FOLLOWING:4,DOCUMENT_POSITION_CONTAINS:8,DOCUMENT_POSITION_CONTAINED_BY:16,DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC:32};\n"
+"for(var k in K){Object.defineProperty(Node,k,{value:K[k]});if(!(k in NP))Object.defineProperty(NP,k,{value:K[k]});}\n"
+"def(NP,'getRootNode',function(){var n=this;while(n.parentNode)n=n.parentNode;return n;});\n"
+"def(NP,'compareDocumentPosition',function(o){if(o===this)return 0;\n"
+" var chain=function(n){var a=[];while(n){a.unshift(n);n=n.parentNode;}return a;};var a=chain(this),b=chain(o);\n"
+" if(a[0]!==b[0])return 1|32|(a[0]<b[0]?2:4);var i=0;while(i<a.length&&i<b.length&&a[i]===b[i])i++;\n"
+" if(i===a.length)return 16|4;if(i===b.length)return 8|2;var p=a[i-1].childNodes;\n"
+" for(var j=0;j<p.length;j++){if(p[j]===a[i])return 4;if(p[j]===b[i])return 2;}return 4;});\n"
+"def(NP,'isSameNode',function(o){return this===o;});\n"
+"if(!NP.isEqualNode)def(NP,'isEqualNode',function(o){return !!o&&this.nodeType===o.nodeType&&(this.outerHTML!==undefined?this.outerHTML===o.outerHTML:this.textContent===o.textContent);});\n"
+"/* <template>.content: a fragment that holds the template's children */\n"
+"acc(EP,'content',function(){if(this.tagName!=='TEMPLATE')return this.getAttribute('content');\n"
+" var f=this.__mxContent;if(!f){f=document.createDocumentFragment();def(this,'__mxContent',f);}\n"
+" while(this.firstChild)f.appendChild(this.firstChild);return f;},function(v){if(this.tagName!=='TEMPLATE')this.setAttribute('content',v);});\n"
+"/* shadow roots: the host renders its shadow content in place of its children */\n"
+"var attach=EP.attachShadow;\n"
+"def(EP,'attachShadow',function(o){if(this.__mxShadow)throw new DOMException(\"Shadow root cannot be created on a host which already hosts a shadow tree.\",\"NotSupportedError\");\n"
+" var r=attach?attach.call(this,o):this;def(this,'__mxShadow',r);def(this,'__mxShadowMode',o&&o.mode||'open');return r;});\n"
+"acc(EP,'shadowRoot',function(){return this.__mxShadowMode==='open'?this.__mxShadow:null;});\n"
+"acc(EP,'host',function(){return this.__mxShadow===this?this:undefined;});\n"
+"acc(EP,'elements',function(){if(this.tagName!=='FORM'&&this.tagName!=='FIELDSET')return undefined;\n"
+" var l=this.querySelectorAll('input,select,textarea,button,fieldset,output,object');var me=this;\n"
+" Array.prototype.forEach.call(l,function(e){if(e.name&&!(e.name in l))l[e.name]=e;});l.namedItem=function(n){return l[n]||null;};return l;});\n"
+"if(typeof G.DOMException!=='function'){var DE=function(m,n){this.message=m||'';this.name=n||'Error';this.code=0;};DE.prototype=Object.create(Error.prototype);DE.prototype.constructor=DE;G.DOMException=DE;}\n"
+"/* CSS.escape */\n"
+"if(G.CSS)def(CSS,'escape',function(v){var s=String(v),out='';for(var i=0;i<s.length;i++){var c=s.charCodeAt(i),ch=s.charAt(i);\n"
+" if(c===0){out+='�';continue;}\n"
+" if((c>=1&&c<=31)||c===127||(i===0&&c>=48&&c<=57)||(i===1&&c>=48&&c<=57&&s.charCodeAt(0)===45)){out+='\\\\'+c.toString(16)+' ';continue;}\n"
+" if(i===0&&c===45&&s.length===1){out+='\\\\'+ch;continue;}\n"
+" if(c>=128||c===45||c===95||(c>=48&&c<=57)||(c>=65&&c<=90)||(c>=97&&c<=122)){out+=ch;continue;}out+='\\\\'+ch;}return out;});\n"
+"/* structuredClone with Map, Set, Date, RegExp, typed arrays and cycles */\n"
+"def(G,'structuredClone',function(v){var seen=new Map();var c=function(x){\n"
+" if(x===null||typeof x!=='object'){if(typeof x==='function'||typeof x==='symbol')throw new DOMException(String(x)+' could not be cloned.','DataCloneError');return x;}\n"
+" if(seen.has(x))return seen.get(x);var r;\n"
+" if(x instanceof Date)r=new Date(x.getTime());else if(x instanceof RegExp)r=new RegExp(x.source,x.flags);\n"
+" else if(x instanceof Map){r=new Map();seen.set(x,r);x.forEach(function(val,key){r.set(c(key),c(val));});return r;}\n"
+" else if(x instanceof Set){r=new Set();seen.set(x,r);x.forEach(function(val){r.add(c(val));});return r;}\n"
+" else if(typeof ArrayBuffer!=='undefined'&&ArrayBuffer.isView&&ArrayBuffer.isView(x))r=x.slice();\n"
+" else if(Array.isArray(x)){r=[];seen.set(x,r);for(var i=0;i<x.length;i++)r[i]=c(x[i]);return r;}\n"
+" else if(x instanceof Error){r=new Error(x.message);r.name=x.name;}\n"
+" else if(x.nodeType)throw new DOMException('Node could not be cloned.','DataCloneError');\n"
+" else{r={};seen.set(x,r);for(var k in x)if(Object.prototype.hasOwnProperty.call(x,k))r[k]=c(x[k]);return r;}\n"
+" seen.set(x,r);return r;};return c(v);});\n"
+"/* MutationObserver: the engine hands over raw tree changes (__mxMODeliver) */\n"
+"var regs=[];\n"
+"var MO=function(cb){if(typeof cb!=='function')throw new TypeError(\"Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.\");this._cb=cb;this._q=[];};\n"
+"def(MO.prototype,'observe',function(target,o){o=Object.assign({},o||{});\n"
+" if((o.attributeOldValue||o.attributeFilter)&&o.attributes===undefined)o.attributes=true;\n"
+" if(o.characterDataOldValue&&o.characterData===undefined)o.characterData=true;\n"
+" if(!o.childList&&!o.attributes&&!o.characterData)throw new TypeError(\"The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.\");\n"
+" for(var i=0;i<regs.length;i++)if(regs[i].mo===this&&regs[i].target===target){regs[i].o=o;return;}\n"
+" regs.push({mo:this,target:target,o:o});__mxMOEnable(true);});\n"
+"def(MO.prototype,'disconnect',function(){var me=this;regs=regs.filter(function(r){return r.mo!==me;});this._q=[];if(!regs.length)__mxMOEnable(false);});\n"
+"def(MO.prototype,'takeRecords',function(){var q=this._q;this._q=[];return q;});\n"
+"var TYPES=['childList','childList','','attributes','characterData'];\n"
+"def(G,'__mxMODeliver',function(recs){var touched=[];\n"
+" for(var i=0;i<recs.length;i++){var r=recs[i],type=TYPES[r[0]],target=r[1];\n"
+"  for(var j=0;j<regs.length;j++){var g=regs[j],o=g.o;if(!o[type])continue;\n"
+"   if(target!==g.target&&!(o.subtree&&g.target.contains&&g.target.contains(target)))continue;\n"
+"   if(type==='attributes'&&o.attributeFilter&&o.attributeFilter.indexOf(r[3])<0)continue;\n"
+"   var keepOld=(type==='attributes'&&o.attributeOldValue)||(type==='characterData'&&o.characterDataOldValue);\n"
+"   g.mo._q.push({type:type,target:target,addedNodes:r[0]===0?[r[2]]:[],removedNodes:r[0]===1?[r[2]]:[],\n"
+"    previousSibling:r[5],nextSibling:r[6],attributeName:r[3],attributeNamespace:null,oldValue:keepOld?r[4]:null});\n"
+"   if(touched.indexOf(g.mo)<0)touched.push(g.mo);}}\n"
+" for(var t=0;t<touched.length;t++){var mo=touched[t],q=mo._q;mo._q=[];if(!q.length)continue;\n"
+"  try{mo._cb.call(mo,q,mo);}catch(e){console.error(e);}}});\n"
+"Object.defineProperty(G,'__mxMODeliver',{enumerable:false});Object.defineProperty(G,'__mxMOEnable',{enumerable:false});\n"
+"G.MutationObserver=MO;G.WebKitMutationObserver=MO;\n"
 "})();\n";
+/* END GENERATED PRELUDE */
 
 static void run_prelude_source(const char* source, size_t length) {
     char error[160];
@@ -3349,11 +3773,13 @@ void mx_js_begin(mx_document_t* doc, const char* url, const mx_js_host_t* host) 
     js_core_init();
     js_runtime_init();
     js_dom_init();
+    mx_dom_mutation_hook = dom_hook;
     run_prelude();
     active = 1;
 }
 
 void mx_js_end(void) {
+    mx_dom_mutation_hook = NULL;
     if (!active) return;
     for (mx_node_t* n = js_doc ? js_doc->root : NULL; n; n = mx_dom_next(js_doc->root, n)) {
         n->js_wrapper = NULL;

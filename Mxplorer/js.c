@@ -3942,6 +3942,9 @@ js_val js_list_iterator(js_obj* values) {
     return make_generator(values, js_undef(), 0);
 }
 
+js_obj* js_construct_this_override;
+js_obj* js_super_new_target;
+
 js_val js_construct(js_val fn, js_val* args, int argc) {
     if (!js_is_callable(fn)) return js_throw_error("TypeError", "value is not a constructor");
     js_obj* ctor = fn.u.obj;
@@ -3960,11 +3963,18 @@ js_val js_construct(js_val fn, js_val* args, int argc) {
     if (ctor->func && ctor->func->arrow)
         return js_throw_error("TypeError", "value is not a constructor");
     js_val proto = js_get(js_obj_val(ctor), S_prototype);
-    js_obj* obj = js_new_object(proto.type == JS_OBJ ? proto.u.obj : js_object_proto);
-    /* objects of classes extending built-ins keep the built-in's behaviour */
-    for (js_obj* p = obj->proto; p; p = p->proto) {
-        if (p == js_error_proto) { obj->cls = CLS_ERROR; break; }
-        if (p == js_array_proto) { obj->cls = CLS_ARRAY; break; }
+    js_obj* obj;
+    if (js_construct_this_override) {   /* upgrading an existing element */
+        obj = js_construct_this_override;
+        js_construct_this_override = NULL;
+        if (proto.type == JS_OBJ) obj->proto = proto.u.obj;
+    } else {
+        obj = js_new_object(proto.type == JS_OBJ ? proto.u.obj : js_object_proto);
+        /* objects of classes extending built-ins keep the built-in's behaviour */
+        for (js_obj* p = obj->proto; p; p = p->proto) {
+            if (p == js_error_proto) { obj->cls = CLS_ERROR; break; }
+            if (p == js_array_proto) { obj->cls = CLS_ARRAY; break; }
+        }
     }
     js_val self = js_obj_val(obj);
     js_val r = call_function(fn.u.obj, self, args, argc, ctor);
@@ -4352,9 +4362,19 @@ __attribute__((noinline)) static js_val eval_call(js_node* n, js_env* env) {
         js_val this_val = env->this_val;
         if (parent && parent != js_function_proto) {
             if (parent->cls == CLS_NATIVE) {
+                js_obj* saved_new_target = js_super_new_target;
+                js_super_new_target = env->new_target ? env->new_target : ctor;
                 js_val made = parent->native(js_undef(), args, argc, parent);
+                js_super_new_target = saved_new_target;
                 JS_CHECK(made);
-                if (made.type == JS_OBJ && this_val.type == JS_OBJ) {
+                if (made.type == JS_OBJ && this_val.type == JS_OBJ && made.u.obj != this_val.u.obj &&
+                    made.u.obj->cls == CLS_NODE && made.u.obj->node) {
+                    /* custom element: this object becomes the element's wrapper */
+                    js_obj* target = this_val.u.obj;
+                    target->cls = CLS_NODE;
+                    target->node = made.u.obj->node;
+                    target->node->js_wrapper = target;
+                } else if (made.type == JS_OBJ && this_val.type == JS_OBJ && made.u.obj != this_val.u.obj) {
                     /* adopt the built-in's state */
                     js_obj* target = this_val.u.obj;
                     js_obj* src = made.u.obj;

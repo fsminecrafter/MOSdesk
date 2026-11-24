@@ -291,6 +291,10 @@ int js_array_index(js_str* key, uint32_t* index);
 /* calls and errors */
 js_val js_call(js_val fn, js_val self, js_val* args, int argc);
 js_val js_construct(js_val fn, js_val* args, int argc);
+/* custom element upgrades: the object js_construct() fills in, and the
+ * new.target a built-in base constructor sees from super() */
+extern js_obj* js_construct_this_override;
+extern js_obj* js_super_new_target;
 js_val js_throw(js_val value);
 js_val js_throw_error(const char* type, const char* message);
 js_val js_throw_type(const char* fmt, const char* detail);

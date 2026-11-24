@@ -1659,20 +1659,33 @@ static void define_from_descriptor(js_obj* o, js_str* key, js_val desc) {
         p->setter = js_is_callable(set) ? set.u.obj : NULL;
         return;
     }
+    int has_value = js_has_property(desc, js_intern_c("value"));
     js_val value = js_get_c(desc, "value");
-    if (o->cls == CLS_ARRAY) {
-        js_set(js_obj_val(o), key, value);
+    uint32_t index;
+    if (o->cls == CLS_ARRAY && js_array_index(key, &index)) {
+        if (has_value) js_set(js_obj_val(o), key, value);
         return;
     }
     if (!p) {
-        js_set(js_obj_val(o), key, value);
-        p = js_find_own(o, key);
-        if (!p) return;
-        p->flags = (js_truthy(js_get_c(desc, "enumerable")) ? 0 : PROP_HIDDEN) |
-                   (js_truthy(js_get_c(desc, "writable")) ? 0 : PROP_READONLY);
-    } else {
-        p->flags &= (uint8_t)~(PROP_ACCESSOR | PROP_READONLY);
+        /* define directly: a setter up the prototype chain must not run */
+        js_define(o, key->data, value,
+                  (uint8_t)((js_truthy(js_get_c(desc, "enumerable")) ? 0 : PROP_HIDDEN) |
+                            (js_truthy(js_get_c(desc, "writable")) ? 0 : PROP_READONLY)));
+        return;
+    }
+    /* existing property: change only the attributes the descriptor names */
+    if (has_value) {
+        p->flags &= (uint8_t)~PROP_ACCESSOR;
+        p->setter = NULL;
         p->value = value;
+    }
+    if (js_has_property(desc, js_intern_c("writable"))) {
+        if (js_truthy(js_get_c(desc, "writable"))) p->flags &= (uint8_t)~PROP_READONLY;
+        else p->flags |= PROP_READONLY;
+    }
+    if (js_has_property(desc, js_intern_c("enumerable"))) {
+        if (js_truthy(js_get_c(desc, "enumerable"))) p->flags &= (uint8_t)~PROP_HIDDEN;
+        else p->flags |= PROP_HIDDEN;
     }
 }
 
