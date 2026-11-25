@@ -1766,6 +1766,14 @@ static void define_from_descriptor(js_obj* o, js_str* key, js_val desc) {
 static js_val object_define_property(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self; (void)callee;
     if (ARG(0).type != JS_OBJ) return js_throw_error("TypeError", "Object.defineProperty called on non-object");
+    if (js_proxy_target(ARG(0).u.obj)) {
+        js_obj* o = ARG(0).u.obj;
+        js_val trap = o->data ? js_get_c(js_obj_val((js_obj*)o->data), "defineProperty") : js_undef();
+        js_val triple[3] = {js_obj_val(js_proxy_target(o)), js_str_val(js_to_string(ARG(1))), ARG(2)};
+        if (js_is_callable(trap)) js_call(trap, js_obj_val((js_obj*)o->data), triple, 3);
+        else object_define_property(js_undef(), triple, 3, callee);
+        return ARG(0);
+    }
     define_from_descriptor(ARG(0).u.obj, js_to_string(ARG(1)), ARG(2));
     return ARG(0);
 }
@@ -1782,6 +1790,13 @@ static js_val object_define_properties(js_val self, js_val* args, int argc, js_o
 static js_val object_get_own_property_descriptor(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self; (void)callee;
     if (ARG(0).type != JS_OBJ) return js_undef();
+    if (js_proxy_target(ARG(0).u.obj)) {
+        js_obj* o = ARG(0).u.obj;
+        js_val trap = o->data ? js_get_c(js_obj_val((js_obj*)o->data), "getOwnPropertyDescriptor") : js_undef();
+        js_val pair[2] = {js_obj_val(js_proxy_target(o)), js_str_val(js_to_string(ARG(1)))};
+        if (js_is_callable(trap)) return js_call(trap, js_obj_val((js_obj*)o->data), pair, 2);
+        return object_get_own_property_descriptor(js_undef(), pair, 2, callee);
+    }
     js_str* key = js_to_string(ARG(1));
     js_prop* p = js_find_own(ARG(0).u.obj, key);
     if (!p && !js_has_property(ARG(0), key)) return js_undef();
@@ -1869,6 +1884,17 @@ static js_val object_has_own(js_val self, js_val* args, int argc, js_obj* callee
     if (target.type != JS_OBJ) return js_bool(target.type == JS_STR && js_get_index(target, key).type != JS_UNDEF);
     js_obj* o = target.u.obj;
     js_str* k = js_to_string(key);
+    if (js_proxy_target(o)) {
+        js_val trap = o->data ? js_get_c(js_obj_val((js_obj*)o->data), "getOwnPropertyDescriptor") : js_undef();
+        if (js_is_callable(trap)) {
+            js_val trap_args[2] = {js_obj_val(js_proxy_target(o)), js_str_val(k)};
+            return js_bool(js_call(trap, js_obj_val((js_obj*)o->data), trap_args, 2).type == JS_OBJ);
+        }
+        js_obj* m = js_new_native("", object_has_own, 1);
+        m->magic = 1;
+        js_val pair[2] = {js_obj_val(js_proxy_target(o)), js_str_val(k)};
+        return object_has_own(js_undef(), pair, 2, m);
+    }
     if (o->cls == CLS_ARRAY || o->cls == CLS_ARGUMENTS) {
         uint32_t index;
         if (js_array_index(k, &index)) return js_bool(index < o->length);
@@ -2008,6 +2034,8 @@ static js_val function_to_string(js_val self, js_val* args, int argc, js_obj* ca
 static js_obj* this_array(js_val self) {
     if (self.type == JS_OBJ && (self.u.obj->cls == CLS_ARRAY || self.u.obj->cls == CLS_ARGUMENTS))
         return self.u.obj;
+    /* a proxied array: work on the target (copying it would lose writes) */
+    if (self.type == JS_OBJ && js_proxy_target(self.u.obj)) return this_array(js_obj_val(js_proxy_target(self.u.obj)));
     /* array-likes (NodeList-ish objects with length) */
     if (self.type == JS_OBJ || self.type == JS_STR) {
         js_val from = js_get_c(js_get_c(js_obj_val(js_global), "Array"), "from");
@@ -2092,7 +2120,9 @@ static js_val array_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
 
 static js_val array_is_array(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self; (void)callee;
-    return js_bool(ARG(0).type == JS_OBJ && ARG(0).u.obj->cls == CLS_ARRAY && !ARG(0).u.obj->typed);
+    js_obj* o = ARG(0).type == JS_OBJ ? ARG(0).u.obj : NULL;
+    while (o && js_proxy_target(o)) o = js_proxy_target(o);
+    return js_bool(o && o->cls == CLS_ARRAY && !o->typed);
 }
 
 static js_val array_from(js_val self, js_val* args, int argc, js_obj* callee) {
@@ -3291,6 +3321,7 @@ static void json_indent(sbuf* b, const js_str* gap, int depth) {
 }
 
 static int json_write(sbuf* b, js_val v, const js_str* gap, int depth, js_val replacer) {
+    while (v.type == JS_OBJ && js_proxy_target(v.u.obj)) v = js_obj_val(js_proxy_target(v.u.obj));
     if (depth > 64) {
         js_throw_error("TypeError", "Converting circular structure to JSON");
         return 0;
@@ -4103,6 +4134,24 @@ static js_val symbol_for(js_val self, js_val* args, int argc, js_obj* callee) {
     return js_str_val(js_concat(js_intern_c("@@for:"), js_to_string(ARG(0))));
 }
 
+static js_val proxy_revoke_fn(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc;
+    js_proxy_revoke((js_obj*)callee->data);
+    return js_undef();
+}
+
+static js_val proxy_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self;
+    js_val p = js_new_proxy(ARG(0), ARG(1));
+    if (js_rt.ctl || callee->magic != 1) return p;
+    js_obj* result = js_new_object(js_object_proto);   /* Proxy.revocable */
+    js_set_c(js_obj_val(result), "proxy", p);
+    js_obj* revoke = js_new_native("revoke", proxy_revoke_fn, 0);
+    revoke->data = p.u.obj;
+    js_set_c(js_obj_val(result), "revoke", js_obj_val(revoke));
+    return js_obj_val(result);
+}
+
 static js_val reflect_method(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self;
     switch (callee->magic) {
@@ -4828,6 +4877,12 @@ void js_runtime_init(void) {
     js_define(symbol, "hasInstance", js_str_val(js_intern_c("@@hasInstance")), PROP_HIDDEN);
     js_define(symbol, "toPrimitive", js_str_val(js_intern_c("@@toPrimitive")), PROP_HIDDEN);
     method(symbol, "for", symbol_for, 0);
+
+    /* Proxy */
+    js_obj* proxy = js_new_native("Proxy", proxy_ctor, 2);
+    proxy->magic = 0;
+    js_define(js_global, "Proxy", js_obj_val(proxy), PROP_HIDDEN);
+    method(proxy, "revocable", proxy_ctor, 1);
 
     /* Reflect */
     js_obj* reflect = js_new_object(js_object_proto);

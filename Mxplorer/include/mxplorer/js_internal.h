@@ -63,7 +63,8 @@ typedef struct {
 typedef enum {
     CLS_OBJECT, CLS_ARRAY, CLS_FUNCTION, CLS_NATIVE, CLS_BOUND, CLS_ERROR,
     CLS_DATE, CLS_REGEXP, CLS_NODE, CLS_STYLE, CLS_CLASSLIST, CLS_DATASET,
-    CLS_PROMISE, CLS_BOXED, CLS_ARGUMENTS, CLS_MAP, CLS_SET
+    CLS_PROMISE, CLS_BOXED, CLS_ARGUMENTS, CLS_MAP, CLS_SET,
+    CLS_PROXY       /* Proxy of a non-function (function proxies are natives) */
 } js_class;
 
 struct js_func;
@@ -276,6 +277,10 @@ void js_define_accessor(js_obj* obj, const char* key, js_native getter,
 int js_delete(js_val target, js_str* key);
 int js_has_property(js_val target, js_str* key);
 js_obj* js_own_keys(js_obj* obj, int include_hidden);
+/* Proxy: the target behind a proxy (NULL when obj is not one) */
+js_obj* js_proxy_target(js_obj* obj);
+js_val js_new_proxy(js_val target, js_val handler);
+void js_proxy_revoke(js_obj* proxy);
 
 /* conversions */
 int js_truthy(js_val v);

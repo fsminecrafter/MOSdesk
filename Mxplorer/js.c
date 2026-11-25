@@ -396,6 +396,133 @@ int js_array_index(js_str* key, uint32_t* index) {
     return 1;
 }
 
+static js_val get_from(js_obj* o, js_str* key, js_val receiver);
+
+/* ---- Proxy ----
+ * A proxy keeps its target in bound_target and its handler in data
+ * (NULL once revoked). Proxies of functions are natives that call
+ * proxy_call, so they stay callable. */
+static js_val proxy_call(js_val self, js_val* args, int argc, js_obj* callee);
+
+static int is_proxy(const js_obj* o) {
+    return o->cls == CLS_PROXY || (o->cls == CLS_NATIVE && o->native == proxy_call);
+}
+
+js_obj* js_proxy_target(js_obj* o) {
+    return o && is_proxy(o) ? o->bound_target : NULL;
+}
+
+void js_proxy_revoke(js_obj* o) {
+    if (o && is_proxy(o)) o->data = NULL;
+}
+
+/* the handler's trap, or undefined; throws when revoked */
+static js_val proxy_trap(js_obj* p, const char* name) {
+    if (!p->data) {
+        js_throw_error("TypeError", "Cannot perform operation on a revoked proxy");
+        return js_undef();
+    }
+    return js_get(js_obj_val((js_obj*)p->data), js_intern_c(name));
+}
+
+static js_val proxy_key(js_str* key) { return js_str_val(key); }
+
+static js_val proxy_get(js_obj* p, js_str* key, js_val receiver) {
+    js_val trap = proxy_trap(p, "get");
+    if (js_rt.ctl) return js_undef();
+    if (!js_is_callable(trap)) return get_from(p->bound_target, key, receiver);
+    js_val args[3] = {js_obj_val(p->bound_target), proxy_key(key), receiver};
+    return js_call(trap, js_obj_val((js_obj*)p->data), args, 3);
+}
+
+static int proxy_set(js_obj* p, js_str* key, js_val value, js_val receiver) {
+    js_val trap = proxy_trap(p, "set");
+    if (js_rt.ctl) return 1;
+    if (!js_is_callable(trap)) {
+        js_set(js_obj_val(p->bound_target), key, value);
+        return 1;
+    }
+    js_val args[4] = {js_obj_val(p->bound_target), proxy_key(key), value, receiver};
+    js_call(trap, js_obj_val((js_obj*)p->data), args, 4);
+    return 1;
+}
+
+static int proxy_has(js_obj* p, js_str* key) {
+    js_val trap = proxy_trap(p, "has");
+    if (js_rt.ctl) return 0;
+    if (!js_is_callable(trap)) return js_has_property(js_obj_val(p->bound_target), key);
+    js_val args[2] = {js_obj_val(p->bound_target), proxy_key(key)};
+    return js_truthy(js_call(trap, js_obj_val((js_obj*)p->data), args, 2));
+}
+
+static int proxy_delete(js_obj* p, js_str* key) {
+    js_val trap = proxy_trap(p, "deleteProperty");
+    if (js_rt.ctl) return 0;
+    if (!js_is_callable(trap)) return js_delete(js_obj_val(p->bound_target), key);
+    js_val args[2] = {js_obj_val(p->bound_target), proxy_key(key)};
+    return js_truthy(js_call(trap, js_obj_val((js_obj*)p->data), args, 2));
+}
+
+static js_obj* proxy_own_keys(js_obj* p, int include_hidden) {
+    js_val trap = proxy_trap(p, "ownKeys");
+    if (js_rt.ctl) return js_new_array(0);
+    if (!js_is_callable(trap)) return js_own_keys(p->bound_target, include_hidden);
+    js_val target = js_obj_val(p->bound_target);
+    js_val list = js_call(trap, js_obj_val((js_obj*)p->data), &target, 1);
+    js_obj* keys = js_new_array(0);
+    if (js_rt.ctl || list.type != JS_OBJ) return keys;
+    for (uint32_t i = 0; i < list.u.obj->length; i++) {
+        js_val k = list.u.obj->items[i];
+        if (k.type != JS_STR) continue;
+        if (!include_hidden && k.u.str->length > 2 && k.u.str->data[0] == '@' && k.u.str->data[1] == '@')
+            continue;   /* symbols */
+        js_array_push(keys, k);
+    }
+    return keys;
+}
+
+static js_val proxy_call(js_val self, js_val* args, int argc, js_obj* callee) {
+    js_val trap = proxy_trap(callee, "apply");
+    if (js_rt.ctl) return js_undef();
+    js_val target = js_obj_val(callee->bound_target);
+    if (!js_is_callable(trap)) return js_call(target, self, args, argc);
+    js_obj* list = js_new_array((uint32_t)argc);
+    for (int i = 0; i < argc; i++) js_array_push(list, args[i]);
+    js_val trap_args[3] = {target, self, js_obj_val(list)};
+    return js_call(trap, js_obj_val((js_obj*)callee->data), trap_args, 3);
+}
+
+static js_val proxy_construct(js_obj* p, js_val* args, int argc) {
+    js_val trap = proxy_trap(p, "construct");
+    if (js_rt.ctl) return js_undef();
+    js_val target = js_obj_val(p->bound_target);
+    if (!js_is_callable(trap)) return js_construct(target, args, argc);
+    js_obj* list = js_new_array((uint32_t)argc);
+    for (int i = 0; i < argc; i++) js_array_push(list, args[i]);
+    js_val trap_args[3] = {target, js_obj_val(list), js_obj_val(p)};
+    js_val r = js_call(trap, js_obj_val((js_obj*)p->data), trap_args, 3);
+    if (!js_rt.ctl && r.type != JS_OBJ) return js_throw_error("TypeError", "proxy [[Construct]] must return an object");
+    return r;
+}
+
+js_val js_new_proxy(js_val target, js_val handler) {
+    if (target.type != JS_OBJ || handler.type != JS_OBJ)
+        return js_throw_error("TypeError", "Cannot create proxy with a non-object as target or handler");
+    js_obj* t = target.u.obj;
+    js_obj* p;
+    if (js_is_callable(target)) {
+        p = js_new_native(t->name ? t->name->data : "", proxy_call, 0);
+        p->magic = 0;
+    } else {
+        p = js_new_object(t->proto);
+        p->cls = CLS_PROXY;
+    }
+    p->proto = t->proto;   /* instanceof and getPrototypeOf see the target's prototype */
+    p->bound_target = t;
+    p->data = handler.u.obj;
+    return js_obj_val(p);
+}
+
 static js_val get_from(js_obj* o, js_str* key, js_val receiver) {
     int depth = 0;
     for (js_obj* cur = o; cur && depth < 64; cur = cur->proto, depth++) {
@@ -404,6 +531,8 @@ static js_val get_from(js_obj* o, js_str* key, js_val receiver) {
             js_val v = js_dom_get(cur, key, &found);
             if (found) return v;
         }
+        if (cur->cls == CLS_PROXY || (cur->cls == CLS_NATIVE && cur->native == proxy_call))
+            return proxy_get(cur, key, receiver);
         if ((cur->cls == CLS_ARRAY || cur->cls == CLS_ARGUMENTS)) {
             if (key == S_length) return js_num(cur->length);
             uint32_t index;
@@ -543,6 +672,7 @@ js_val js_get_index(js_val target, js_val key) {
 }
 
 static int set_on(js_obj* o, js_str* key, js_val value, js_val receiver) {
+    if (is_proxy(o)) return proxy_set(o, key, value, receiver);
     if (o->cls >= CLS_NODE && o->cls <= CLS_DATASET && js_dom_set(o, key, value)) return 1;
     if (o->cls == CLS_ARRAY || o->cls == CLS_ARGUMENTS) {
         if (key == S_length) {
@@ -625,6 +755,7 @@ void js_set_index(js_val target, js_val key, js_val value) {
 int js_delete(js_val target, js_str* key) {
     if (target.type != JS_OBJ) return 1;
     js_obj* o = target.u.obj;
+    if (is_proxy(o)) return proxy_delete(o, key);
     if (o->frozen) return 0;
     if (o->cls == CLS_ARRAY) {
         uint32_t index;
@@ -651,6 +782,7 @@ int js_delete(js_val target, js_str* key) {
 int js_has_property(js_val target, js_str* key) {
     if (target.type != JS_OBJ) return 0;
     for (js_obj* o = target.u.obj; o; o = o->proto) {
+        if (is_proxy(o)) return proxy_has(o, key);
         if (o->cls == CLS_ARRAY) {
             uint32_t index;
             if (key == S_length) return 1;
@@ -667,6 +799,7 @@ int js_has_property(js_val target, js_str* key) {
 }
 
 js_obj* js_own_keys(js_obj* o, int include_hidden) {
+    if (is_proxy(o)) return proxy_own_keys(o, include_hidden);
     js_obj* keys = js_new_array(o->prop_count + o->length);
     if (o->cls == CLS_ARRAY || o->cls == CLS_ARGUMENTS) {
         for (uint32_t i = 0; i < o->length; i++)
@@ -4085,6 +4218,7 @@ js_val js_construct(js_val fn, js_val* args, int argc) {
     if (!js_is_callable(fn)) return js_throw_error("TypeError", "value is not a constructor");
     js_obj* ctor = fn.u.obj;
     while (ctor->cls == CLS_BOUND) ctor = ctor->bound_target;
+    if (ctor->cls == CLS_NATIVE && ctor->native == proxy_call) return proxy_construct(ctor, args, argc);
     if (ctor->cls == CLS_NATIVE) {
         js_rt.depth++;
         js_val r = ctor->native(js_undef(), args, argc, ctor);
