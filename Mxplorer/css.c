@@ -1181,7 +1181,7 @@ static int sup_word(const char* p, const char* end, const char* word) {
 
 /* "name: value" */
 static int supports_declaration(const char* text, size_t length) {
-    const char* colon = memchr(text, ':', length);
+    const char* colon = mx_memchr(text, ':', length);
     if (!colon) return 0;
     const char* name = text;
     const char* name_end = colon;

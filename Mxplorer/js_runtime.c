@@ -860,7 +860,7 @@ static int property_escape(re_parser* rp, re_range* out, int* count, int capacit
     const char* end = name;
     while (end < rp->end && *end != '}') end++;
     if (end >= rp->end) return 0;
-    const char* eq = memchr(name, '=', (size_t)(end - name));
+    const char* eq = mx_memchr(name, '=', (size_t)(end - name));
     if (eq) name = eq + 1;   /* Script=Latin, sc=Greek, General_Category=L */
     size_t length = (size_t)(end - name);
     const re_property* prop = NULL;
