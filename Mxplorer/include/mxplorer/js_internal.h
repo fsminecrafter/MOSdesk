@@ -209,7 +209,6 @@ typedef struct {
 } js_rt_state;
 
 extern js_rt_state js_rt;
-extern mx_arena_t js_heap;
 extern js_obj* js_global;
 extern js_obj* js_object_proto;
 extern js_obj* js_function_proto;
@@ -247,7 +246,18 @@ static inline int js_is_callable(js_val v) {
                                 v.u.obj->cls == CLS_BOUND);
 }
 
+/* js_gc.c: the garbage-collected script heap */
 void* js_alloc(size_t size);
+void js_gc_init(void);
+void js_gc_free_all(void);
+void js_gc_collect(void);
+void js_gc_inhibit(int delta);      /* +1 / -1 around code that hides pointers */
+size_t js_gc_heap_bytes(void);
+unsigned js_gc_collections(void);
+void js_gc_mark_range(const void* start, const void* end);
+void js_core_gc_roots(void);        /* js.c */
+void js_dom_gc_roots(void);         /* js_dom.c */
+void js_dom_stack_bounds(char** lo, char** hi);
 js_str* js_new_str(const char* text, size_t length);
 js_str* js_cstr(const char* text);
 js_str* js_intern(const char* text, size_t length);

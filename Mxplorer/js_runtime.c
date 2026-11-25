@@ -2381,7 +2381,8 @@ static js_val array_sort(js_val self, js_val* args, int argc, js_obj* callee) {
     js_val fn = ARG(0);
     uint32_t n = a->length;
     /* merge sort (stable) */
-    js_val* tmp = (js_val*)malloc(sizeof(js_val) * (n ? n : 1));
+    /* in the script heap: the comparator can run a collection */
+    js_val* tmp = (js_val*)js_alloc(sizeof(js_val) * (n ? n : 1));
     if (!tmp) return self;
     for (uint32_t width = 1; width < n && !js_rt.ctl; width *= 2) {
         for (uint32_t lo = 0; lo < n && !js_rt.ctl; lo += 2 * width) {
@@ -2398,7 +2399,6 @@ static js_val array_sort(js_val self, js_val* args, int argc, js_obj* callee) {
             for (k = lo; k < hi; k++) a->items[k] = tmp[k];
         }
     }
-    free(tmp);
     return self;
 }
 
