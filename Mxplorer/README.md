@@ -23,14 +23,22 @@ layout engine and JavaScript interpreter.
   `min()`/`max()`/`clamp()`, all colour syntaxes including `light-dark()`,
   box model, borders and radii, flexbox, grid, absolute/fixed/relative
   positioning, floats (approximate), overflow clipping, opacity, text styles.
-- **JavaScript:** a tree-walking ES2020 interpreter: classes, closures,
-  destructuring, spread, template literals, optional chaining, generators,
-  async/await and Promises, RegExp, JSON, Date, Map/Set, ES modules with import
-  maps and `import()`. Browser APIs: DOM, events (capture/bubble, inline
-  handlers), timers, `requestAnimationFrame`, `fetch`, `XMLHttpRequest`,
-  `localStorage`, cookies, `location`, `history`, observers. Scripts run on
-  their own 1 MiB stack and a heap that grows as needed (it stops while
-  less than 96 MiB of memory is free) and a time limit.
+- **JavaScript:** a tree-walking ES2024-level interpreter: classes (private
+  fields and `#x in obj`), closures, destructuring, spread, template literals,
+  optional chaining, real generators and async/await (coroutines on their own
+  small stacks, so `yield` and `await` suspend), async generators and
+  `for await`, Promises, Proxy, RegExp (lookbehind, named groups, `\p{...}`),
+  JSON, Date, Map/Set (hashed), Symbol, ES modules with import maps and
+  `import()`, a small en-US `Intl`, and the newer built-ins (`toSorted`,
+  `Object.groupBy`, Set methods, `Promise.withResolvers`, `structuredClone`,
+  ...). Browser APIs: DOM, events (capture/bubble, inline handlers), custom
+  elements, MutationObserver, timers, `requestAnimationFrame`, `fetch`,
+  `XMLHttpRequest`, `localStorage`, cookies, `location`, `history`,
+  observers, `DOMParser`, constructable stylesheets, `CSS.supports`,
+  `document.currentScript`. Scripts run on their own 1 MiB stack and a heap
+  that grows as needed (it stops while less than 96 MiB of memory is free)
+  and a time limit. `prelude/*.js` holds the parts written in JavaScript;
+  `tools/gen_prelude.py` embeds them into `js_dom.c`.
 - **Pictures and videos:** Minimal-OS `.img` pictures in `<img>` (sized
   from the file, scaled smoothly, transparency kept) and `.vid` videos in
   `<video>` (`src` or `<source>`, `controls`, `autoplay`, `loop`, `muted`,
@@ -55,7 +63,7 @@ Settings live in `0:/data/mxplorer-settings.txt` and
 only for the session: the kernel's TLS 1.3 client does not verify
 certificates, so never use it for private data.
 
-Not supported yet: PNG/JPEG/GIF pictures, `<audio>`, canvas, web fonts, WebSockets, POST
+Not supported yet: WebP/SVG pictures, `<audio>`, canvas, web fonts, WebSockets, POST
 requests (forms are sent as GET), certificate checks. Switching tabs reloads
 the page from its cache, so script state is not kept.
 
