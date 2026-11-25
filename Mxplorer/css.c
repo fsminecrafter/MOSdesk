@@ -1163,13 +1163,157 @@ static int list_matches(const css_selector_list_t* list, mx_node_t* e) {
     return 0;
 }
 
-int mx_css_matches(mx_node_t* element, const char* selectors) {
-    if (!element || element->type != MX_NODE_ELEMENT) return 0;
+
+/* ---- @supports and CSS.supports() ---- */
+
+static int supports_expr(const char** p, const char* end);
+
+static const char* sup_ws(const char* p, const char* end) {
+    while (p < end && mx_is_space(*p)) p++;
+    return p;
+}
+
+static int sup_word(const char* p, const char* end, const char* word) {
+    size_t n = strlen(word);
+    return (size_t)(end - p) > n && mx_strneq_nocase(p, word, n) &&
+           (mx_is_space(p[n]) || p[n] == '(');
+}
+
+/* "name: value" */
+static int supports_declaration(const char* text, size_t length) {
+    const char* colon = mx_memchr(text, ':', length);
+    if (!colon) return 0;
+    const char* name = text;
+    const char* name_end = colon;
+    while (name < name_end && mx_is_space(*name)) name++;
+    while (name_end > name && mx_is_space(name_end[-1])) name_end--;
+    const char* value = colon + 1;
+    const char* value_end = text + length;
+    while (value < value_end && mx_is_space(*value)) value++;
+    while (value_end > value && mx_is_space(value_end[-1])) value_end--;
+    if (name_end - name >= 2 && name[0] == '-' && name[1] == '-') return 1;   /* custom property */
+    if (value_end == value) return 0;
+    uint16_t id = property_id(name, (size_t)(name_end - name));
+    if (id < 2) return 0;
+    if (id == P_DISPLAY) {
+        static const char* const ok[] = {"none", "block", "inline", "inline-block", "flex",
+                                         "inline-flex", "grid", "inline-grid", "contents",
+                                         "list-item", "table", "table-row", "table-cell",
+                                         "flow-root", "inline-table"};
+        for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
+            if ((size_t)(value_end - value) == strlen(ok[i]) && mx_strneq_nocase(value, ok[i], strlen(ok[i])))
+                return 1;
+        return 0;
+    }
+    return 1;
+}
+
+/* one "( ... )", "not ...", "selector(...)" */
+static int supports_term(const char** p, const char* end) {
+    const char* s = sup_ws(*p, end);
+    if (sup_word(s, end, "not")) {
+        *p = s + 3;
+        return !supports_term(p, end);
+    }
+    int is_selector = (size_t)(end - s) > 9 && mx_strneq_nocase(s, "selector(", 9);
+    const char* open = is_selector ? s + 8 : s;
+    if (open >= end || *open != '(') {
+        *p = end;
+        return 0;
+    }
+    int depth = 0;
+    const char* close = open;
+    for (; close < end; close++) {
+        if (*close == '(') depth++;
+        else if (*close == ')' && --depth == 0) break;
+    }
+    *p = close < end ? close + 1 : end;
+    const char* inner = open + 1;
+    size_t inner_length = (size_t)(close - inner);
+    if (is_selector) {
+        char buffer[256];
+        if (inner_length >= sizeof(buffer)) return 0;
+        memcpy(buffer, inner, inner_length);
+        buffer[inner_length] = '\0';
+        return mx_css_compile(buffer) != NULL;
+    }
+    const char* t = sup_ws(inner, close);
+    if (t < close && (*t == '(' || sup_word(t, close, "not") ||
+                      ((size_t)(close - t) > 9 && mx_strneq_nocase(t, "selector(", 9)))) {
+        const char* q = inner;
+        return supports_expr(&q, close);
+    }
+    return supports_declaration(inner, inner_length);
+}
+
+static int supports_expr(const char** p, const char* end) {
+    int result = supports_term(p, end);
+    for (;;) {
+        const char* s = sup_ws(*p, end);
+        if (sup_word(s, end, "and")) {
+            *p = s + 3;
+            int next = supports_term(p, end);
+            result = result && next;
+        } else if (sup_word(s, end, "or")) {
+            *p = s + 2;
+            int next = supports_term(p, end);
+            result = result || next;
+        } else {
+            return result;
+        }
+    }
+}
+
+int mx_css_supports(const char* condition, size_t length) {
+    const char* p = condition;
+    return supports_expr(&p, condition + length);
+}
+
+/* Scripts call matches()/querySelector() with the same few selectors over and
+ * over (querySelectorAll asks once per element). Parsing each time filled the
+ * stylesheet arena until every query failed as "not a valid selector", so
+ * parsed lists are kept here until the next mx_css_reset. */
+#define SELECTOR_CACHE 256
+typedef struct {
+    char* text;
+    uint32_t hash;
+    uint32_t generation;
+    css_selector_list_t* list;   /* NULL: the selector is invalid */
+} selector_cache_t;
+static selector_cache_t selector_cache[SELECTOR_CACHE];
+
+const void* mx_css_compile(const char* selectors) {
+    if (!selectors) return NULL;
+    size_t length = strlen(selectors);
+    uint32_t h = mx_hash(selectors, length);
+    selector_cache_t* slot = &selector_cache[h % SELECTOR_CACHE];
+    if (slot->text && slot->generation == css_generation && slot->hash == h &&
+        !strcmp(slot->text, selectors))
+        return slot->list;
     int error = 0;
-    css_selector_list_t* list =
-        parse_selector_list(selectors, strlen(selectors), &error);
+    css_selector_list_t* list = parse_selector_list(selectors, length, &error);
+    if (error) list = NULL;   /* querySelector throws when any part is invalid */
+    char* text = mx_arena_strndup(&css_arena, selectors, length);
+    if (text) {
+        slot->text = text;
+        slot->hash = h;
+        slot->generation = css_generation;
+        slot->list = list;
+    }
+    return list;
+}
+
+int mx_css_matches_compiled(mx_node_t* element, const void* compiled) {
+    if (!compiled) return -1;
+    if (!element || element->type != MX_NODE_ELEMENT) return 0;
+    return list_matches((const css_selector_list_t*)compiled, element);
+}
+
+int mx_css_matches(mx_node_t* element, const char* selectors) {
+    const void* list = mx_css_compile(selectors);
     if (!list) return -1;
-    return list_matches(list, element);
+    if (!element || element->type != MX_NODE_ELEMENT) return 0;
+    return list_matches((const css_selector_list_t*)list, element);
 }
 
 /* ====================================================================== */
@@ -1508,9 +1652,7 @@ static void parse_sheet(const char* s, size_t length, int origin) {
             if (!strcmp(name, "media")) {
                 include = media_matches(s + i, prelude_end - i);
             } else if (!strcmp(name, "supports")) {
-                const char* cond = s + i;
-                size_t cn = prelude_end - i;
-                include = !(cn > 4 && mx_starts_with_nocase(skip_ws(cond), "not"));
+                include = mx_css_supports(s + i, prelude_end - i);
             } else if (!strcmp(name, "layer") || !strcmp(name, "document") ||
                        !strcmp(name, "-moz-document") || !strcmp(name, "container") ||
                        !strcmp(name, "scope")) {

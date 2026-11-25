@@ -31,6 +31,8 @@ void mx_js_end(void);
 int mx_js_active(void);
 /* Runs a script; errors go to the console. Returns 1 on success. */
 int mx_js_run(const char* source, size_t length, const char* name);
+/* document.currentScript while a classic script runs (NULL otherwise). */
+void mx_js_set_current_script(mx_node_t* script);
 /* Runs an ES module whose address is `url` (imports resolve against it). */
 int mx_js_run_module(const char* source, size_t length, const char* url,
                      const char* name);

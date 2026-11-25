@@ -95,7 +95,7 @@ static void* scope_alloc(size_t size) {
 /* Strings                                                                */
 /* ====================================================================== */
 
-static uint32_t str_hash(const char* text, size_t length) {
+uint32_t js_hash_bytes(const char* text, size_t length) {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < length; i++) {
         h ^= (uint8_t)text[i];
@@ -107,9 +107,13 @@ static uint32_t str_hash(const char* text, size_t length) {
 js_str* js_new_str(const char* text, size_t length) {
     js_str* s = (js_str*)js_alloc(sizeof(js_str) + length + 1);
     s->length = (uint32_t)length;
+    s->capacity = (uint32_t)length + 1;
+    s->owned = 0;
+    s->ascii = 0;
     if (length) memcpy(s->data, text, length);
     s->data[length] = '\0';
-    s->hash = str_hash(s->data, length);
+    s->hash = js_hash_bytes(s->data, length);
+    s->hashed = 1;
     return s;
 }
 
@@ -125,7 +129,7 @@ typedef struct intern_entry {
 static intern_entry* intern_table[INTERN_SIZE];
 
 js_str* js_intern(const char* text, size_t length) {
-    uint32_t h = str_hash(text, length);
+    uint32_t h = js_hash_bytes(text, length);
     intern_entry** slot = &intern_table[h % INTERN_SIZE];
     for (intern_entry* e = *slot; e; e = e->next)
         if (e->str->hash == h && e->str->length == length &&
@@ -148,15 +152,50 @@ js_str* js_concat(js_str* a, js_str* b) {
     if (!b->length) return a;
     js_str* s = (js_str*)js_alloc(sizeof(js_str) + a->length + b->length + 1);
     s->length = a->length + b->length;
+    s->capacity = s->length + 1;
+    s->owned = 0;
+    s->ascii = a->ascii == 1 && b->ascii == 1 ? 1 : 0;
     memcpy(s->data, a->data, a->length);
     memcpy(s->data + a->length, b->data, b->length);
     s->data[s->length] = '\0';
-    s->hash = str_hash(s->data, s->length);
+    s->hashed = 0;   /* hashed when first used as a key */
+    return s;
+}
+
+/* `name += value` as a statement on a string variable. The result becomes a
+ * string builder with spare room that only this variable holds (reading the
+ * variable anywhere else clears `owned`), so a loop that builds a string
+ * appends in place instead of copying the whole string every time. */
+static inline js_val share_val(js_val v) {
+    if (v.type == JS_STR) v.u.str->owned = 0;
+    return v;
+}
+
+static js_str* append_owned(js_str* a, js_str* b) {
+    uint32_t total = a->length + b->length;
+    if (a->owned && a->capacity > total) {
+        memcpy(a->data + a->length, b->data, b->length);
+        a->length = total;
+        a->data[total] = '\0';
+        a->hashed = 0;
+        if (b->ascii != 1) a->ascii = 0;
+        return a;
+    }
+    uint32_t capacity = total < 64 ? total + 1 : total * 2;
+    js_str* s = (js_str*)js_alloc(sizeof(js_str) + capacity);
+    s->length = total;
+    s->capacity = capacity;
+    s->owned = 1;
+    s->hashed = 0;
+    s->ascii = a->ascii == 1 && b->ascii == 1 ? 1 : 0;
+    memcpy(s->data, a->data, a->length);
+    memcpy(s->data + a->length, b->data, b->length);
+    s->data[total] = '\0';
     return s;
 }
 
 int js_str_eq(const js_str* a, const js_str* b) {
-    return a == b || (a->hash == b->hash && a->length == b->length &&
+    return a == b || (a->length == b->length && js_str_hash((js_str*)a) == js_str_hash((js_str*)b) &&
                       !memcmp(a->data, b->data, a->length));
 }
 
@@ -175,7 +214,7 @@ static js_str *K_var, *K_let, *K_const, *K_function, *K_return, *K_if,
     *K_throw, *K_try, *K_catch, *K_finally, *K_switch, *K_case, *K_true,
     *K_false, *K_null, *K_undefined, *K_class, *K_extends, *K_super,
     *K_static, *K_get, *K_set, *K_async, *K_await, *K_yield, *K_import,
-    *K_export, *K_debugger, *K_with, *K_arguments;
+    *K_export, *K_debugger, *K_with, *K_arguments, *K_to_primitive;
 
 static void init_names(void) {
 #define N(var, text) var = js_intern_c(text)
@@ -198,7 +237,7 @@ static void init_names(void) {
     N(K_super, "super"); N(K_static, "static"); N(K_get, "get");
     N(K_set, "set"); N(K_async, "async"); N(K_await, "await");
     N(K_yield, "yield"); N(K_import, "import"); N(K_export, "export");
-    N(K_debugger, "debugger"); N(K_with, "with"); N(K_arguments, "arguments");
+    N(K_debugger, "debugger"); N(K_with, "with"); N(K_arguments, "arguments"); N(K_to_primitive, "@@toPrimitive");
 #undef N
 }
 
@@ -256,10 +295,46 @@ void js_array_set_length(js_obj* a, uint32_t length) {
     a->length = length;
 }
 
+/* Objects with many properties (the global object, prototypes, big
+ * dictionaries) get a hash index so lookups stop scanning every property. */
+#define PROP_INDEX_MIN 10u
+
+static void prop_index_insert(js_obj* o, uint32_t i) {
+    uint32_t mask = o->prop_index_cap - 1;
+    uint32_t h = js_str_hash(o->props[i].key) & mask;
+    while (o->prop_index[h]) h = (h + 1) & mask;
+    o->prop_index[h] = i + 1;
+}
+
+static void prop_index_build(js_obj* o) {
+    uint32_t cap = 16;
+    while (cap < o->prop_count * 2 + 2) cap <<= 1;
+    uint32_t* slots = (uint32_t*)js_alloc(sizeof(uint32_t) * cap);
+    if (!slots) { o->prop_index = NULL; return; }
+    memset(slots, 0, sizeof(uint32_t) * cap);
+    o->prop_index = slots;
+    o->prop_index_cap = cap;
+    for (uint32_t i = 0; i < o->prop_count; i++) prop_index_insert(o, i);
+}
+
 js_prop* js_find_own(js_obj* o, js_str* key) {
+    if (o->prop_count >= PROP_INDEX_MIN) {
+        if (!o->prop_index) prop_index_build(o);
+        if (o->prop_index) {
+            uint32_t mask = o->prop_index_cap - 1;
+            for (uint32_t h = js_str_hash(key) & mask;; h = (h + 1) & mask) {
+                uint32_t slot = o->prop_index[h];
+                if (!slot) return NULL;
+                js_prop* p = &o->props[slot - 1];
+                if (p->key == key || (p->key->length == key->length && js_str_hash(p->key) == js_str_hash(key) &&
+                                      !memcmp(p->key->data, key->data, key->length)))
+                    return p;
+            }
+        }
+    }
     for (uint32_t i = 0; i < o->prop_count; i++) {
         js_prop* p = &o->props[i];
-        if (p->key == key || (p->key->hash == key->hash && p->key->length == key->length &&
+        if (p->key == key || (p->key->length == key->length && js_str_hash(p->key) == js_str_hash(key) &&
                               !memcmp(p->key->data, key->data, key->length)))
             return p;
     }
@@ -278,6 +353,10 @@ static js_prop* add_prop(js_obj* o, js_str* key) {
     memset(p, 0, sizeof(*p));
     p->key = key;
     p->value = js_undef();
+    if (o->prop_index) {
+        if (o->prop_count * 2 + 2 > o->prop_index_cap) prop_index_build(o);
+        else prop_index_insert(o, o->prop_count - 1);
+    }
     return p;
 }
 
@@ -317,6 +396,133 @@ int js_array_index(js_str* key, uint32_t* index) {
     return 1;
 }
 
+static js_val get_from(js_obj* o, js_str* key, js_val receiver);
+
+/* ---- Proxy ----
+ * A proxy keeps its target in bound_target and its handler in data
+ * (NULL once revoked). Proxies of functions are natives that call
+ * proxy_call, so they stay callable. */
+static js_val proxy_call(js_val self, js_val* args, int argc, js_obj* callee);
+
+static int is_proxy(const js_obj* o) {
+    return o->cls == CLS_PROXY || (o->cls == CLS_NATIVE && o->native == proxy_call);
+}
+
+js_obj* js_proxy_target(js_obj* o) {
+    return o && is_proxy(o) ? o->bound_target : NULL;
+}
+
+void js_proxy_revoke(js_obj* o) {
+    if (o && is_proxy(o)) o->data = NULL;
+}
+
+/* the handler's trap, or undefined; throws when revoked */
+static js_val proxy_trap(js_obj* p, const char* name) {
+    if (!p->data) {
+        js_throw_error("TypeError", "Cannot perform operation on a revoked proxy");
+        return js_undef();
+    }
+    return js_get(js_obj_val((js_obj*)p->data), js_intern_c(name));
+}
+
+static js_val proxy_key(js_str* key) { return js_str_val(key); }
+
+static js_val proxy_get(js_obj* p, js_str* key, js_val receiver) {
+    js_val trap = proxy_trap(p, "get");
+    if (js_rt.ctl) return js_undef();
+    if (!js_is_callable(trap)) return get_from(p->bound_target, key, receiver);
+    js_val args[3] = {js_obj_val(p->bound_target), proxy_key(key), receiver};
+    return js_call(trap, js_obj_val((js_obj*)p->data), args, 3);
+}
+
+static int proxy_set(js_obj* p, js_str* key, js_val value, js_val receiver) {
+    js_val trap = proxy_trap(p, "set");
+    if (js_rt.ctl) return 1;
+    if (!js_is_callable(trap)) {
+        js_set(js_obj_val(p->bound_target), key, value);
+        return 1;
+    }
+    js_val args[4] = {js_obj_val(p->bound_target), proxy_key(key), value, receiver};
+    js_call(trap, js_obj_val((js_obj*)p->data), args, 4);
+    return 1;
+}
+
+static int proxy_has(js_obj* p, js_str* key) {
+    js_val trap = proxy_trap(p, "has");
+    if (js_rt.ctl) return 0;
+    if (!js_is_callable(trap)) return js_has_property(js_obj_val(p->bound_target), key);
+    js_val args[2] = {js_obj_val(p->bound_target), proxy_key(key)};
+    return js_truthy(js_call(trap, js_obj_val((js_obj*)p->data), args, 2));
+}
+
+static int proxy_delete(js_obj* p, js_str* key) {
+    js_val trap = proxy_trap(p, "deleteProperty");
+    if (js_rt.ctl) return 0;
+    if (!js_is_callable(trap)) return js_delete(js_obj_val(p->bound_target), key);
+    js_val args[2] = {js_obj_val(p->bound_target), proxy_key(key)};
+    return js_truthy(js_call(trap, js_obj_val((js_obj*)p->data), args, 2));
+}
+
+static js_obj* proxy_own_keys(js_obj* p, int include_hidden) {
+    js_val trap = proxy_trap(p, "ownKeys");
+    if (js_rt.ctl) return js_new_array(0);
+    if (!js_is_callable(trap)) return js_own_keys(p->bound_target, include_hidden);
+    js_val target = js_obj_val(p->bound_target);
+    js_val list = js_call(trap, js_obj_val((js_obj*)p->data), &target, 1);
+    js_obj* keys = js_new_array(0);
+    if (js_rt.ctl || list.type != JS_OBJ) return keys;
+    for (uint32_t i = 0; i < list.u.obj->length; i++) {
+        js_val k = list.u.obj->items[i];
+        if (k.type != JS_STR) continue;
+        if (!include_hidden && k.u.str->length > 2 && k.u.str->data[0] == '@' && k.u.str->data[1] == '@')
+            continue;   /* symbols */
+        js_array_push(keys, k);
+    }
+    return keys;
+}
+
+static js_val proxy_call(js_val self, js_val* args, int argc, js_obj* callee) {
+    js_val trap = proxy_trap(callee, "apply");
+    if (js_rt.ctl) return js_undef();
+    js_val target = js_obj_val(callee->bound_target);
+    if (!js_is_callable(trap)) return js_call(target, self, args, argc);
+    js_obj* list = js_new_array((uint32_t)argc);
+    for (int i = 0; i < argc; i++) js_array_push(list, args[i]);
+    js_val trap_args[3] = {target, self, js_obj_val(list)};
+    return js_call(trap, js_obj_val((js_obj*)callee->data), trap_args, 3);
+}
+
+static js_val proxy_construct(js_obj* p, js_val* args, int argc) {
+    js_val trap = proxy_trap(p, "construct");
+    if (js_rt.ctl) return js_undef();
+    js_val target = js_obj_val(p->bound_target);
+    if (!js_is_callable(trap)) return js_construct(target, args, argc);
+    js_obj* list = js_new_array((uint32_t)argc);
+    for (int i = 0; i < argc; i++) js_array_push(list, args[i]);
+    js_val trap_args[3] = {target, js_obj_val(list), js_obj_val(p)};
+    js_val r = js_call(trap, js_obj_val((js_obj*)p->data), trap_args, 3);
+    if (!js_rt.ctl && r.type != JS_OBJ) return js_throw_error("TypeError", "proxy [[Construct]] must return an object");
+    return r;
+}
+
+js_val js_new_proxy(js_val target, js_val handler) {
+    if (target.type != JS_OBJ || handler.type != JS_OBJ)
+        return js_throw_error("TypeError", "Cannot create proxy with a non-object as target or handler");
+    js_obj* t = target.u.obj;
+    js_obj* p;
+    if (js_is_callable(target)) {
+        p = js_new_native(t->name ? t->name->data : "", proxy_call, 0);
+        p->magic = 0;
+    } else {
+        p = js_new_object(t->proto);
+        p->cls = CLS_PROXY;
+    }
+    p->proto = t->proto;   /* instanceof and getPrototypeOf see the target's prototype */
+    p->bound_target = t;
+    p->data = handler.u.obj;
+    return js_obj_val(p);
+}
+
 static js_val get_from(js_obj* o, js_str* key, js_val receiver) {
     int depth = 0;
     for (js_obj* cur = o; cur && depth < 64; cur = cur->proto, depth++) {
@@ -325,6 +531,8 @@ static js_val get_from(js_obj* o, js_str* key, js_val receiver) {
             js_val v = js_dom_get(cur, key, &found);
             if (found) return v;
         }
+        if (cur->cls == CLS_PROXY || (cur->cls == CLS_NATIVE && cur->native == proxy_call))
+            return proxy_get(cur, key, receiver);
         if ((cur->cls == CLS_ARRAY || cur->cls == CLS_ARGUMENTS)) {
             if (key == S_length) return js_num(cur->length);
             uint32_t index;
@@ -378,28 +586,33 @@ __attribute__((noinline, cold)) static js_val throw_nullish_access(js_val target
     return js_throw_error("TypeError", message);
 }
 
+/* one-character strings are shared instead of allocated per s[i] */
+static js_str* single_char(char c) {
+    static js_str* table[256];
+    static uint32_t generation_seen;
+    extern uint32_t js_core_generation;
+    if (generation_seen != js_core_generation) {
+        memset(table, 0, sizeof(table));
+        generation_seen = js_core_generation;
+    }
+    unsigned char k = (unsigned char)c;
+    if (!table[k]) table[k] = js_intern(&c, 1);
+    return table[k];
+}
+
 js_val js_get(js_val target, js_str* key) {
     switch (target.type) {
     case JS_OBJ:
         return get_from(target.u.obj, key, target);
     case JS_STR: {
         js_str* s = target.u.str;
-        if (key == S_length) {
-            /* UTF-16-ish length: count code points */
-            uint32_t n = 0;
-            for (uint32_t i = 0; i < s->length; i++)
-                if (((unsigned char)s->data[i] & 0xC0) != 0x80) n++;
-            return js_num(n);
-        }
+        if (key == S_length) return js_num(js_str_cp_length(s));   /* code points */
         uint32_t index;
         if (js_array_index(key, &index)) {
-            uint32_t cp = 0, i = 0;
-            while (i < s->length) {
-                uint32_t start = i++;
-                while (i < s->length && ((unsigned char)s->data[i] & 0xC0) == 0x80) i++;
-                if (cp++ == index) return js_str_val(js_new_str(s->data + start, i - start));
-            }
-            return js_undef();
+            uint32_t start, end;
+            if (!js_str_char_at(s, index, &start, &end)) return js_undef();
+            return js_str_val(end - start == 1 ? single_char(s->data[start])
+                                               : js_new_str(s->data + start, end - start));
         }
         return get_from(js_string_proto, key, target);
     }
@@ -437,6 +650,16 @@ static js_str* key_of(js_val key) {
 }
 
 js_val js_get_index(js_val target, js_val key) {
+    if (target.type == JS_STR && key.type == JS_NUM) {
+        double n = key.u.num;
+        if (n >= 0 && n == (double)(uint32_t)n) {
+            uint32_t start, end;
+            js_str* s = target.u.str;
+            if (!js_str_char_at(s, (uint32_t)n, &start, &end)) return js_undef();
+            return js_str_val(end - start == 1 ? single_char(s->data[start])
+                                               : js_new_str(s->data + start, end - start));
+        }
+    }
     if (target.type == JS_OBJ && key.type == JS_NUM &&
         (target.u.obj->cls == CLS_ARRAY || target.u.obj->cls == CLS_ARGUMENTS)) {
         double n = key.u.num;
@@ -449,6 +672,7 @@ js_val js_get_index(js_val target, js_val key) {
 }
 
 static int set_on(js_obj* o, js_str* key, js_val value, js_val receiver) {
+    if (is_proxy(o)) return proxy_set(o, key, value, receiver);
     if (o->cls >= CLS_NODE && o->cls <= CLS_DATASET && js_dom_set(o, key, value)) return 1;
     if (o->cls == CLS_ARRAY || o->cls == CLS_ARGUMENTS) {
         if (key == S_length) {
@@ -531,6 +755,7 @@ void js_set_index(js_val target, js_val key, js_val value) {
 int js_delete(js_val target, js_str* key) {
     if (target.type != JS_OBJ) return 1;
     js_obj* o = target.u.obj;
+    if (is_proxy(o)) return proxy_delete(o, key);
     if (o->frozen) return 0;
     if (o->cls == CLS_ARRAY) {
         uint32_t index;
@@ -547,6 +772,7 @@ int js_delete(js_val target, js_str* key) {
             memmove(&o->props[i], &o->props[i + 1],
                     sizeof(js_prop) * (o->prop_count - i - 1));
             o->prop_count--;
+            o->prop_index = NULL;   /* rebuilt on the next lookup */
             return 1;
         }
     }
@@ -556,6 +782,7 @@ int js_delete(js_val target, js_str* key) {
 int js_has_property(js_val target, js_str* key) {
     if (target.type != JS_OBJ) return 0;
     for (js_obj* o = target.u.obj; o; o = o->proto) {
+        if (is_proxy(o)) return proxy_has(o, key);
         if (o->cls == CLS_ARRAY) {
             uint32_t index;
             if (key == S_length) return 1;
@@ -572,6 +799,7 @@ int js_has_property(js_val target, js_str* key) {
 }
 
 js_obj* js_own_keys(js_obj* o, int include_hidden) {
+    if (is_proxy(o)) return proxy_own_keys(o, include_hidden);
     js_obj* keys = js_new_array(o->prop_count + o->length);
     if (o->cls == CLS_ARRAY || o->cls == CLS_ARGUMENTS) {
         for (uint32_t i = 0; i < o->length; i++)
@@ -584,9 +812,43 @@ js_obj* js_own_keys(js_obj* o, int include_hidden) {
             for (uint32_t i = 0; i < list.u.obj->length; i++)
                 js_array_push(keys, list.u.obj->items[i]);
     }
+    /* integer keys first in ascending order, then the others in the order
+     * they were added; symbols (stored as "@@..." keys) only when hidden
+     * keys are asked for */
+    uint32_t first_index = keys->length, index_count = 0;
     for (uint32_t i = 0; i < o->prop_count; i++) {
-        if (!include_hidden && (o->props[i].flags & PROP_HIDDEN)) continue;
-        js_array_push(keys, js_str_val(o->props[i].key));
+        js_prop* p = &o->props[i];
+        uint32_t index;
+        if (!include_hidden && (p->flags & PROP_HIDDEN)) continue;
+        if (js_array_index(p->key, &index)) {
+            js_array_push(keys, js_str_val(p->key));
+            index_count++;
+        }
+    }
+    if (index_count > 1) {
+        for (uint32_t i = first_index + 1; i < keys->length; i++) {
+            js_val v = keys->items[i];
+            uint32_t key;
+            js_array_index(v.u.str, &key);
+            uint32_t j = i;
+            while (j > first_index) {
+                uint32_t prev;
+                js_array_index(keys->items[j - 1].u.str, &prev);
+                if (prev <= key) break;
+                keys->items[j] = keys->items[j - 1];
+                j--;
+            }
+            keys->items[j] = v;
+        }
+    }
+    for (uint32_t i = 0; i < o->prop_count; i++) {
+        js_prop* p = &o->props[i];
+        uint32_t index;
+        if (!include_hidden && (p->flags & PROP_HIDDEN)) continue;
+        if (index_count && js_array_index(p->key, &index)) continue;
+        if (!include_hidden && p->key->length > 2 && p->key->data[0] == '@' && p->key->data[1] == '@')
+            continue;
+        js_array_push(keys, js_str_val(p->key));
     }
     return keys;
 }
@@ -605,10 +867,22 @@ int js_truthy(js_val v) {
     }
 }
 
-js_val js_to_primitive(js_val v, int hint_number) {
+/* hint: 0 string, 1 number, 2 default (+, ==): valueOf first except Dates */
+js_val js_to_primitive(js_val v, int hint) {
     if (v.type != JS_OBJ) return v;
     js_obj* o = v.u.obj;
     if (o->cls == CLS_BOXED) return o->primitive;
+    js_val exotic = js_get(v, K_to_primitive);
+    if (js_rt.ctl) return js_undef();
+    if (js_is_callable(exotic)) {
+        js_val name = js_str_val(js_intern_c(hint == 0 ? "string" : hint == 1 ? "number" : "default"));
+        js_val r = js_call(exotic, v, &name, 1);
+        if (js_rt.ctl) return js_undef();
+        if (r.type == JS_OBJ) return js_throw_error("TypeError", "Cannot convert object to primitive value");
+        return r;
+    }
+    if (hint == 2) hint = o->cls == CLS_DATE ? 0 : 1;
+    int hint_number = hint == 1;
     if (o->cls == CLS_DATE && !hint_number) {
         js_val fn = js_get(v, S_toString);
         if (js_is_callable(fn)) return js_call(fn, v, NULL, 0);
@@ -700,8 +974,8 @@ int js_loose_equals(js_val a, js_val b) {
     int a_nullish = a.type == JS_NULL || a.type == JS_UNDEF;
     int b_nullish = b.type == JS_NULL || b.type == JS_UNDEF;
     if (a_nullish || b_nullish) return a_nullish && b_nullish;
-    if (a.type == JS_OBJ) a = js_to_primitive(a, 1);
-    if (b.type == JS_OBJ) b = js_to_primitive(b, 1);
+    if (a.type == JS_OBJ) a = js_to_primitive(a, 2);
+    if (b.type == JS_OBJ) b = js_to_primitive(b, 2);
     if (a.type == JS_STR && b.type == JS_STR) return js_str_eq(a.u.str, b.u.str);
     return js_to_number(a) == js_to_number(b);
 }
@@ -774,6 +1048,7 @@ enum { T_EOF, T_NUM, T_STR, T_TEMPLATE, T_IDENT, T_PUNCT, T_REGEX, T_PRIVATE };
 typedef struct {
     uint8_t type;
     uint8_t newline_before;
+    uint8_t regex_after;  /* closing ) or }: a following '/' starts a regex */
     uint32_t punct;
     int line;
     js_str* str;          /* identifier / string / regex body / template raw */
@@ -791,7 +1066,17 @@ typedef struct {
     uint32_t count, capacity;
     char error[160];
     int error_line;
+    /* open brackets: 1 = ( of if/for/while/with, 2 = block {, 0 = other */
+    uint8_t open_kind[1024];
+    int open_depth;
 } lexer_t;
+
+/* PACK("op") for string literals folds to a constant even at -Os, where the
+ * pack() call would run on every operator the interpreter dispatches. */
+#define PACK(s) ((uint32_t)(uint8_t)(s)[0] | \
+                 (sizeof(s) > 2 ? (uint32_t)(uint8_t)(s)[1 % sizeof(s)] << 8 : 0u) | \
+                 (sizeof(s) > 3 ? (uint32_t)(uint8_t)(s)[2 % sizeof(s)] << 16 : 0u) | \
+                 (sizeof(s) > 4 ? (uint32_t)(uint8_t)(s)[3 % sizeof(s)] << 24 : 0u))
 
 static uint32_t pack(const char* p) {
     uint32_t v = 0;
@@ -930,11 +1215,45 @@ js_str* js_decode_escapes(const char* text, size_t length) {
  * strings, comments and nested templates. */
 static size_t scan_template(const char* s, size_t n, size_t i, int* lines);
 
+/* Inside ${...}: a '/' starts a regular expression when the code before it
+ * cannot end an operand (same idea as regex_allowed, on characters). */
+static int scan_regex_start(const char* s, size_t from, size_t i) {
+    size_t k = i;
+    while (k > from && (s[k - 1] == ' ' || s[k - 1] == '\t' || s[k - 1] == '\n' || s[k - 1] == '\r')) k--;
+    if (k == from) return 1;
+    char p = s[k - 1];
+    if (strchr("(,=:[!&|?{};+-*%<>~^", p)) return 1;
+    /* keywords such as return/typeof that precede an expression */
+    static const char* const words[] = {"return", "typeof", "case", "in", "of", "void", "delete",
+                                        "throw", "new", "else", "do", "await", "yield"};
+    for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); w++) {
+        size_t len = strlen(words[w]);
+        if (k - from >= len && !memcmp(s + k - len, words[w], len) &&
+            (k - from == len || !ident_part((unsigned char)s[k - len - 1])))
+            return 1;
+    }
+    return 0;
+}
+
 static size_t scan_code(const char* s, size_t n, size_t i, int* lines) {
     int depth = 0;
+    size_t from = i;
     while (i < n) {
         char c = s[i];
         if (c == '\n') (*lines)++;
+        if (c == '/' && i + 1 < n && s[i + 1] != '/' && s[i + 1] != '*' && scan_regex_start(s, from, i)) {
+            int in_class = 0;
+            i++;
+            while (i < n && s[i] != '\n') {
+                if (s[i] == '\\') i++;
+                else if (s[i] == '[') in_class = 1;
+                else if (s[i] == ']') in_class = 0;
+                else if (s[i] == '/' && !in_class) break;
+                i++;
+            }
+            i++;
+            continue;
+        }
         if (c == '"' || c == '\'') {
             i++;
             while (i < n && s[i] != c) {
@@ -990,6 +1309,7 @@ static size_t scan_template(const char* s, size_t n, size_t i, int* lines) {
 }
 
 static int regex_allowed(lexer_t* lx);
+static void track_bracket(lexer_t* lx, js_token* t);
 
 /* Called after the new token was pushed: look at the one before it. */
 static int regex_allowed(lexer_t* lx) {
@@ -1005,9 +1325,52 @@ static int regex_allowed(lexer_t* lx) {
                s == K_throw || s == K_case || s == K_do || s == K_else ||
                s == K_await || s == K_yield;
     }
-    if (t->type == T_PUNCT)
-        return t->punct != pack(")") && t->punct != pack("]") && t->punct != pack("}");
+    if (t->type == T_PUNCT) {
+        if (t->punct == PACK(")") || t->punct == PACK("}")) return t->regex_after;
+        return t->punct != PACK("]") && t->punct != PACK("++") && t->punct != PACK("--");
+    }
     return 1;
+}
+
+/* Keeps the bracket stack for regex_allowed: `if (x) /re/.test(y)` and
+ * `function f() {} /re/` start regular expressions, `(a) / b` and
+ * `{a: 1} / 2`-like expressions divide. */
+static void track_bracket(lexer_t* lx, js_token* t) {
+    uint32_t p = t->punct;
+    js_token* prev = lx->count >= 2 ? &lx->tokens[lx->count - 2] : NULL;
+    if (p == PACK("(") || p == PACK("[") || p == PACK("{")) {
+        uint8_t kind = 0;
+        if (p == PACK("(") && prev && prev->type == T_IDENT &&
+            (prev->str == K_if || prev->str == K_for || prev->str == K_while || prev->str == K_with))
+            kind = 1;
+        if (p == PACK("{")) {
+            /* a block unless it follows something that makes it an object literal */
+            kind = 2;
+            if (prev && prev->type == T_PUNCT) {
+                uint32_t q = prev->punct;
+                if (q == PACK("(") || q == PACK(",") || q == PACK(":") || q == PACK("=") ||
+                    q == PACK("[") || q == PACK("?") || q == PACK("||") || q == PACK("&&") ||
+                    q == PACK("??") || q == PACK("+") || q == PACK("-") || q == PACK("!") ||
+                    q == PACK("...") || q == PACK("==") || q == PACK("===") || q == PACK("!=") ||
+                    q == PACK("!=="))
+                    kind = 0;
+            } else if (prev && prev->type == T_IDENT && (prev->str == K_return || prev->str == K_typeof ||
+                                                         prev->str == K_in || prev->str == K_of ||
+                                                         prev->str == K_case || prev->str == K_yield ||
+                                                         prev->str == K_await)) {
+                kind = 0;
+            }
+        }
+        if (lx->open_depth < (int)sizeof(lx->open_kind)) lx->open_kind[lx->open_depth] = kind;
+        lx->open_depth++;
+    } else if (p == PACK(")") || p == PACK("]") || p == PACK("}")) {
+        uint8_t kind = 0;
+        if (lx->open_depth > 0) {
+            lx->open_depth--;
+            if (lx->open_depth < (int)sizeof(lx->open_kind)) kind = lx->open_kind[lx->open_depth];
+        }
+        t->regex_after = (p == PACK(")") && kind == 1) || (p == PACK("}") && kind == 2);
+    }
 }
 
 static int lex(lexer_t* lx) {
@@ -1149,8 +1512,16 @@ static int lex(lexer_t* lx) {
         if (c == '"' || c == '\'') {
             size_t start = ++lx->pos;
             while (lx->pos < n && s[lx->pos] != c) {
-                if (s[lx->pos] == '\\') lx->pos++;
-                else if (s[lx->pos] == '\n') break;
+                if (s[lx->pos] == '\\') {
+                    lx->pos++;
+                    if (lx->pos < n && s[lx->pos] == '\n') lx->line++;
+                    if (lx->pos + 1 < n && s[lx->pos] == '\r' && s[lx->pos + 1] == '\n') {
+                        lx->pos++;   /* line continuation with CRLF */
+                        lx->line++;
+                    }
+                } else if (s[lx->pos] == '\n') {
+                    break;
+                }
                 lx->pos++;
             }
             if (lx->pos >= n || s[lx->pos] != c) {
@@ -1208,8 +1579,12 @@ static int lex(lexer_t* lx) {
         }
         t->type = T_PUNCT;
         int matched = 0;
+        static uint8_t punct_length[sizeof(puncts) / sizeof(puncts[0])];
+        if (!punct_length[0])
+            for (size_t i = 0; i < sizeof(puncts) / sizeof(puncts[0]); i++) punct_length[i] = (uint8_t)strlen(puncts[i]);
         for (size_t i = 0; i < sizeof(puncts) / sizeof(puncts[0]); i++) {
-            size_t len = strlen(puncts[i]);
+            size_t len = punct_length[i];
+            if (puncts[i][0] != c) continue;
             if (lx->pos + len <= n && !memcmp(s + lx->pos, puncts[i], len)) {
                 /* "?." followed by a digit is "?" then a number */
                 if (len == 2 && puncts[i][0] == '?' && puncts[i][1] == '.' &&
@@ -1218,11 +1593,16 @@ static int lex(lexer_t* lx) {
                 t->punct = pack(puncts[i]);
                 lx->pos += len;
                 matched = 1;
+                track_bracket(lx, t);
                 break;
             }
         }
         if (!matched) {
-            mx_copy(lx->error, sizeof(lx->error), "Invalid or unexpected token");
+            mx_copy(lx->error, sizeof(lx->error), "Invalid or unexpected token  near: ");
+            size_t used = strlen(lx->error), k = 0;
+            while (lx->pos + k < n && k < 24 && used + 1 < sizeof(lx->error) && s[lx->pos + k] != '\n')
+                lx->error[used++] = s[lx->pos + k++];
+            lx->error[used] = '\0';
             lx->error_line = lx->line;
             return 0;
         }
@@ -1297,9 +1677,14 @@ static js_token* next(parser_t* p) {
     return t;
 }
 
-static int is_punct(js_token* t, const char* text) {
+static int is_punct_s(js_token* t, const char* text) {
     return t->type == T_PUNCT && t->punct == pack(text);
 }
+
+static inline int is_punct_p(const js_token* t, uint32_t packed) {
+    return t->type == T_PUNCT && t->punct == packed;
+}
+#define is_punct(t, literal) is_punct_p((t), PACK(literal))
 
 static int is_kw(js_token* t, js_str* kw) {
     return t->type == T_IDENT && t->str == kw;
@@ -1331,7 +1716,7 @@ static void fail(parser_t* p, const char* message, js_token* at) {
 }
 
 static int accept(parser_t* p, const char* text) {
-    if (is_punct(peek(p), text)) {
+    if (is_punct_s(peek(p), text)) {
         next(p);
         return 1;
     }
@@ -1458,6 +1843,9 @@ static js_node* parse_template(parser_t* p, js_token* t) {
         if (i == length || (s[i] == '$' && i + 1 < length && s[i + 1] == '{')) {
             js_node* text = node(p, N_STR);
             text->str = decode_string(s + start, i - start);
+            js_node* raw = node(p, N_STR);   /* String.raw / tag functions */
+            raw->str = js_new_str(s + start, i - start);
+            text->b = raw;
             list_push(&parts, text);
             if (i == length) break;
             size_t expr_start = i + 2;
@@ -1603,7 +1991,7 @@ static js_node* to_pattern(parser_t* p, js_node* e) {
     case N_OBJECT_PAT: case N_REST:
         return e;
     case N_ASSIGN:
-        if (e->op == pack("=")) {
+        if (e->op == 0) {   /* plain `=`: a default value */
             js_node* d = node(p, N_ASSIGN_PAT);
             d->line = e->line;
             d->a = to_pattern(p, e->a);
@@ -1854,8 +2242,8 @@ static int arrow_ahead(parser_t* p) {
     for (; i < p->count; i++) {
         js_token* t = &p->tokens[i];
         if (t->type != T_PUNCT) continue;
-        if (t->punct == pack("(") || t->punct == pack("[") || t->punct == pack("{")) depth++;
-        else if (t->punct == pack(")") || t->punct == pack("]") || t->punct == pack("}")) {
+        if (t->punct == PACK("(") || t->punct == PACK("[") || t->punct == PACK("{")) depth++;
+        else if (t->punct == PACK(")") || t->punct == PACK("]") || t->punct == PACK("}")) {
             depth--;
             if (!depth) {
                 return i + 1 < p->count && is_punct(&p->tokens[i + 1], "=>") &&
@@ -1893,6 +2281,14 @@ static js_node* parse_primary(parser_t* p) {
         return n;
     case T_IDENT: {
         js_str* s = t->str;
+        if (s->length > 1 && s->data[0] == '#' && is_kw(peek_at(p, 1), K_in)) {
+            /* `#field in object`: private fields are keys named "#field" */
+            next(p);
+            n = node(p, N_STR);
+            n->str = s;
+            n->line = t->line + p->line_offset;
+            return n;
+        }
         if (s == K_function) {
             next(p);
             int generator = accept(p, "*");
@@ -2133,7 +2529,7 @@ static js_node* parse_postfix(parser_t* p) {
     if ((is_punct(t, "++") || is_punct(t, "--")) && !t->newline_before) {
         next(p);
         js_node* u = node(p, N_UPDATE);
-        u->op = t->punct == pack("++") ? '+' : '-';
+        u->op = t->punct == PACK("++") ? '+' : '-';
         u->flag = 0;   /* postfix */
         u->a = e;
         return u;
@@ -2146,7 +2542,7 @@ static js_node* parse_unary(parser_t* p) {
     if (t->type == T_PUNCT) {
         const char* ops[] = {"!", "~", "+", "-"};
         for (int i = 0; i < 4; i++)
-            if (is_punct(t, ops[i])) {
+            if (is_punct_s(t, ops[i])) {
                 next(p);
                 js_node* u = node(p, N_UNARY);
                 u->op = (uint8_t)ops[i][0];
@@ -2156,7 +2552,7 @@ static js_node* parse_unary(parser_t* p) {
         if (is_punct(t, "++") || is_punct(t, "--")) {
             next(p);
             js_node* u = node(p, N_UPDATE);
-            u->op = t->punct == pack("++") ? '+' : '-';
+            u->op = t->punct == PACK("++") ? '+' : '-';
             u->flag = 1;
             u->a = parse_unary(p);
             return u;
@@ -2195,8 +2591,11 @@ static int binary_precedence(parser_t* p, js_token* t) {
         {"<=", 8}, {">=", 8}, {"<<", 9}, {">>", 9}, {">>>", 9}, {"+", 10},
         {"-", 10}, {"*", 11}, {"/", 11}, {"%", 11}, {"**", 12},
     };
+    static uint32_t packed[sizeof(table) / sizeof(table[0])];
+    if (!packed[0])
+        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) packed[i] = pack(table[i].op);
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
-        if (t->punct == pack(table[i].op)) return table[i].prec;
+        if (t->punct == packed[i]) return table[i].prec;
     return 0;
 }
 
@@ -2211,9 +2610,9 @@ static js_node* parse_binary(parser_t* p, int min_prec) {
         js_node* right = parse_binary(p, right_assoc ? prec : prec + 1);
         js_node* b;
         if (t->type == T_PUNCT &&
-            (t->punct == pack("&&") || t->punct == pack("||") || t->punct == pack("??"))) {
+            (t->punct == PACK("&&") || t->punct == PACK("||") || t->punct == PACK("??"))) {
             b = node(p, N_LOGICAL);
-            b->op = t->punct == pack("&&") ? '&' : t->punct == pack("||") ? '|' : '?';
+            b->op = t->punct == PACK("&&") ? '&' : t->punct == PACK("||") ? '|' : '?';
         } else {
             b = node(p, N_BINARY);
             if (t->type == T_IDENT) b->op = t->str == K_in ? 'i' : 'I';
@@ -2258,8 +2657,11 @@ static js_node* parse_assignment(parser_t* p) {
     js_node* left = parse_conditional(p);
     js_token* t = peek(p);
     if (t->type != T_PUNCT) return left;
+    static uint32_t assign_packed[sizeof(assign_ops) / sizeof(assign_ops[0])];
+    if (!assign_packed[0])
+        for (size_t i = 0; i < sizeof(assign_ops) / sizeof(assign_ops[0]); i++) assign_packed[i] = pack(assign_ops[i]);
     for (size_t i = 0; i < sizeof(assign_ops) / sizeof(assign_ops[0]); i++) {
-        if (t->punct != pack(assign_ops[i])) continue;
+        if (t->punct != assign_packed[i]) continue;
         next(p);
         js_node* a = node(p, N_ASSIGN);
         a->line = t->line + p->line_offset;
@@ -2940,6 +3342,7 @@ static js_val lookup_identifier(js_env* env, js_str* name, int typeof_check) {
     js_var* v = env_lookup(env, name);
     if (v) {
         if (!v->initialized) return throw_reference(name, 1);
+        if (v->value.type == JS_STR) v->value.u.str->owned = 0;   /* now shared */
         return v->value;
     }
     if (name == K_arguments) {
@@ -3069,6 +3472,7 @@ typedef struct gen_collector {
     struct gen_collector* prev;
 } gen_collector;
 static gen_collector* current_gen;
+static js_str* current_label;
 #define GEN_MAX_YIELDS 20000
 
 static js_obj* generator_proto;
@@ -3129,9 +3533,534 @@ static js_val make_generator(js_obj* values, js_val return_value, int is_async) 
     return js_obj_val(it);
 }
 
+/* ---- coroutines: lazy generators and suspending async functions ----
+ *
+ * A generator or async function body runs on its own small stack, so it can
+ * stop at a `yield` or at an `await` of a pending promise and continue later
+ * exactly where it was. Without this (other CPUs, or when no stack can be
+ * allocated) generators fall back to running eagerly (gen_collector above)
+ * and `await` to draining microtasks. */
+#if defined(__x86_64__)
+#define JS_HAVE_CORO 1
+__attribute__((visibility("hidden"))) void js_coro_switch(void** save_sp, void* to_sp);
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    "js_coro_switch:\n"
+    "    pushq %rbp\n"
+    "    pushq %rbx\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    movq %rsp, (%rdi)\n"
+    "    movq %rsi, %rsp\n"
+    "    popq %r15\n"
+    "    popq %r14\n"
+    "    popq %r13\n"
+    "    popq %r12\n"
+    "    popq %rbx\n"
+    "    popq %rbp\n"
+    "    ret\n");
+/* Calls fn(arg) with the stack pointer at `top`. */
+__attribute__((visibility("hidden"))) void js_call_on_stack(void* arg, void (*fn)(void*), void* top);
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    "js_call_on_stack:\n"
+    "    pushq %rbp\n"
+    "    movq %rsp, %rbp\n"
+    "    movq %rdx, %rsp\n"
+    "    call *%rsi\n"
+    "    movq %rbp, %rsp\n"
+    "    popq %rbp\n"
+    "    ret\n");
+#else
+#define JS_HAVE_CORO 0
+#endif
+
+/* Only the generator or async function's own body runs on its stack: every
+ * function it calls runs on the resumer's (big) stack, just below where the
+ * resumer is waiting, so a small stack is enough however deep that code
+ * goes. */
+#define CORO_STACK_SIZE (64u * 1024u)
+#define CORO_STACK_MARGIN (16u * 1024u)
+#define CORO_MAX_LIVE 1024
+#define CORO_POOL 16
+
+enum { SUSPEND_NONE, SUSPEND_YIELD, SUSPEND_AWAIT };
+
+typedef struct agen_request {
+    int mode;                   /* 0 next, 1 throw, 2 return */
+    js_val value;
+    js_obj* promise;
+    struct agen_request* next;
+} agen_request;
+
+typedef struct js_coro {
+    char* stack;
+    void* sp;                   /* coroutine's stack pointer while suspended */
+    void* caller_sp;            /* resumer's stack pointer while running */
+    js_obj* fo;
+    js_env* env;
+    js_obj* new_target;
+    uint8_t is_async, is_generator, started, running, done, suspend;
+    int resume_mode;            /* how it was resumed: 0 value, 1 throw, 2 return */
+    js_val transfer;            /* value passed in (resume) or out (yield) */
+    js_val result;              /* return value once done */
+    int depth_delta;
+    const char* source;
+    char* big_base;             /* the resumer's stack, for calls made from the body */
+    long big_limit;
+    js_obj* promise;            /* async function: its result */
+    agen_request* queue;        /* async generator: pending next() calls */
+    struct js_coro* next_live;
+} js_coro;
+
+static js_coro* current_coro;
+static js_coro* live_coros;     /* malloc'd; freed when the page goes */
+static int live_coro_count;
+static char* stack_pool[CORO_POOL];
+static int stack_pool_count;
+static js_obj* coro_gen_proto;
+static js_obj* coro_agen_proto;
+
+static js_val run_body(js_obj* fo, js_env* env, js_obj* new_target, js_val self);
+
+static void coro_release_stack(js_coro* c) {
+    if (!c->stack) return;
+    if (stack_pool_count < CORO_POOL) stack_pool[stack_pool_count++] = c->stack;
+    else free(c->stack);
+    c->stack = NULL;
+}
+
+/* Frees every coroutine of the previous page (their stacks point into the
+ * script heap, which is gone). */
+static void coro_reset(void) {
+    for (js_coro* c = live_coros; c;) {
+        js_coro* next = c->next_live;
+        coro_release_stack(c);
+        free(c);
+        c = next;
+    }
+    live_coros = NULL;
+    live_coro_count = 0;
+    current_coro = NULL;
+    coro_gen_proto = coro_agen_proto = NULL;
+}
+
+static void coro_entry(void) {
+    js_coro* c = current_coro;
+    c->result = run_body(c->fo, c->env, c->new_target, c->env->this_val);
+    c->done = 1;
+    c->suspend = SUSPEND_NONE;
+#if JS_HAVE_CORO
+    js_coro_switch(&c->sp, c->caller_sp);
+#endif
+    for (;;) {}
+}
+
+static js_coro* coro_create(js_obj* fo, js_env* env, js_obj* new_target) {
+#if JS_HAVE_CORO
+    if (live_coro_count >= CORO_MAX_LIVE) {
+        /* drop finished ones from the list first */
+        js_coro** link = &live_coros;
+        while (*link) {
+            js_coro* c = *link;
+            if (c->done && !c->running) {
+                *link = c->next_live;
+                coro_release_stack(c);
+                free(c);
+                live_coro_count--;
+            } else {
+                link = &c->next_live;
+            }
+        }
+        if (live_coro_count >= CORO_MAX_LIVE) return NULL;
+    }
+    char* stack = stack_pool_count ? stack_pool[--stack_pool_count] : (char*)malloc(CORO_STACK_SIZE);
+    if (!stack) return NULL;
+    js_coro* c = (js_coro*)calloc(1, sizeof(js_coro));
+    if (!c) {
+        free(stack);
+        return NULL;
+    }
+    c->stack = stack;
+    c->fo = fo;
+    c->env = env;
+    c->new_target = new_target;
+    c->transfer = c->result = js_undef();
+    /* first switch: pop six registers, then `ret` into coro_entry with the
+     * stack aligned as for a call */
+    uintptr_t top = ((uintptr_t)(stack + CORO_STACK_SIZE)) & ~(uintptr_t)15u;
+    void** sp = (void**)top;
+    *--sp = NULL;                       /* coro_entry's return address */
+    *--sp = (void*)coro_entry;
+    for (int i = 0; i < 6; i++) *--sp = NULL;
+    c->sp = sp;
+    c->next_live = live_coros;
+    live_coros = c;
+    live_coro_count++;
+    env->captured = 1;                  /* never pooled: the body keeps using it */
+    return c;
+#else
+    (void)fo; (void)env; (void)new_target;
+    return NULL;
+#endif
+}
+
+/* Runs `c` until it yields, awaits or finishes. */
+static void coro_run(js_coro* c) {
+#if JS_HAVE_CORO
+    char* saved_base = js_rt.stack_base;
+    long saved_limit = js_rt.stack_limit;
+    int depth = js_rt.depth;
+    const char* saved_source = js_rt.source;
+    int saved_line = js_rt.line;
+    int saved_allowed = scope_allowed;
+    js_str* saved_label = current_label;
+    gen_collector* saved_gen = current_gen;
+    js_coro* prev = current_coro;
+    current_coro = c;
+    current_gen = NULL;
+    current_label = NULL;
+    c->running = 1;
+    c->started = 1;
+    c->suspend = SUSPEND_NONE;
+    c->big_base = saved_base;
+    c->big_limit = saved_limit;
+    js_rt.stack_base = (char*)(((uintptr_t)(c->stack + CORO_STACK_SIZE)) & ~(uintptr_t)15u);
+    js_rt.stack_limit = (long)(CORO_STACK_SIZE - CORO_STACK_MARGIN);
+    js_rt.depth = depth + c->depth_delta;
+    if (c->source) js_rt.source = c->source;
+    scope_allowed = 0;
+    js_coro_switch(&c->caller_sp, c->sp);
+    c->running = 0;
+    c->depth_delta = js_rt.depth - depth;
+    c->source = js_rt.source;
+    js_rt.stack_base = saved_base;
+    js_rt.stack_limit = saved_limit;
+    js_rt.depth = depth;
+    js_rt.source = saved_source;
+    js_rt.line = saved_line;
+    scope_allowed = saved_allowed;
+    current_label = saved_label;
+    current_gen = saved_gen;
+    current_coro = prev;
+    if (c->done) coro_release_stack(c);
+#else
+    (void)c;
+#endif
+}
+
+static void coro_suspend(js_coro* c, int kind) {
+#if JS_HAVE_CORO
+    c->suspend = (uint8_t)kind;
+    js_coro_switch(&c->sp, c->caller_sp);
+#else
+    (void)c; (void)kind;
+#endif
+}
+
+static js_val iter_result(js_val value, int done) {
+    js_obj* r = js_new_object(js_object_proto);
+    js_set(js_obj_val(r), js_intern_c("value"), value);
+    js_set(js_obj_val(r), js_intern_c("done"), js_bool(done));
+    return js_obj_val(r);
+}
+
+/* async functions: settle the result promise once the body is done */
+static void async_finish(js_coro* c) {
+    if (!c->done || !c->promise) return;
+    js_obj* p = c->promise;
+    c->promise = NULL;
+    if (js_rt.ctl == CTL_THROW) {
+        js_val error = js_rt.value;
+        js_rt.ctl = CTL_NONE;
+        js_promise_settle(p, error, 1);
+    } else {
+        js_rt.ctl = CTL_NONE;
+        js_promise_settle(p, c->result, 0);
+    }
+}
+
+/* async generators: answer the oldest next() after a yield or the end */
+static void agen_after(js_coro* c) {
+    if (!c->done && c->suspend == SUSPEND_AWAIT) return;
+    agen_request* req = c->queue;
+    if (!req) return;
+    c->queue = req->next;
+    if (c->done) {
+        if (js_rt.ctl == CTL_THROW) {
+            js_val error = js_rt.value;
+            js_rt.ctl = CTL_NONE;
+            js_promise_settle(req->promise, error, 1);
+        } else {
+            js_rt.ctl = CTL_NONE;
+            js_promise_settle(req->promise, iter_result(c->result, 1), 0);
+            c->result = js_undef();
+        }
+    } else {
+        js_promise_settle(req->promise, iter_result(c->transfer, 0), 0);
+    }
+}
+
+static void agen_pump(js_coro* c) {
+    while (c->queue && !c->running) {
+        if (!c->done && c->suspend == SUSPEND_AWAIT) return;
+        agen_request* req = c->queue;
+        if (!c->done && !c->started && req->mode) {
+            c->done = 1;
+            coro_release_stack(c);
+        }
+        if (c->done) {
+            c->queue = req->next;
+            if (req->mode == 1) js_promise_settle(req->promise, req->value, 1);
+            else js_promise_settle(req->promise, iter_result(req->mode == 2 ? req->value : js_undef(), 1), 0);
+            continue;
+        }
+        c->resume_mode = req->mode;
+        c->transfer = req->value;
+        coro_run(c);
+        agen_after(c);
+    }
+}
+
+static js_val coro_await_cb(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self;
+    js_coro* c = (js_coro*)callee->data;
+    if (!c || c->done || c->running || c->suspend != SUSPEND_AWAIT) return js_undef();
+    c->resume_mode = callee->magic;
+    c->transfer = argc > 0 ? args[0] : js_undef();
+    coro_run(c);
+    if (c->is_generator) {
+        agen_after(c);
+        agen_pump(c);
+    } else {
+        async_finish(c);
+    }
+    return js_undef();
+}
+
+/* `await v` */
+static js_val coro_await(js_val v) {
+    js_coro* c = current_coro;
+    if (!c || !c->is_async || current_gen) return await_value(v);
+    js_val p = v;
+    if (v.type != JS_OBJ || v.u.obj->cls != CLS_PROMISE) {
+        p = js_promise_resolved(v, 0);   /* adopts thenables */
+        if (js_rt.ctl) return js_undef();
+    }
+    js_obj* ok = js_new_native("", coro_await_cb, 1);
+    ok->data = c;
+    ok->magic = 0;
+    js_obj* err = js_new_native("", coro_await_cb, 1);
+    err->data = c;
+    err->magic = 1;
+    js_promise_then(p, js_obj_val(ok), js_obj_val(err));
+    coro_suspend(c, SUSPEND_AWAIT);
+    if (c->resume_mode == 1) return js_throw(c->transfer);
+    return c->transfer;
+}
+
+/* `yield v` inside a coroutine generator */
+static js_val coro_yield(js_coro* c, js_val v) {
+    if (c->is_async) {
+        v = coro_await(v);
+        if (js_rt.ctl) return js_undef();
+    }
+    c->transfer = v;
+    coro_suspend(c, SUSPEND_YIELD);
+    if (c->resume_mode == 1) return js_throw(c->transfer);
+    if (c->resume_mode == 2) {
+        js_val r = c->transfer;
+        if (c->is_async) {
+            r = coro_await(r);
+            if (js_rt.ctl) return js_undef();
+        }
+        js_rt.ctl = CTL_RETURN;   /* runs finally blocks on the way out */
+        js_rt.value = r;
+        return js_undef();
+    }
+    return c->transfer;
+}
+
+/* `yield* iterable` inside a coroutine generator */
+static js_val coro_yield_star(js_coro* c, js_val iterable) {
+    js_val method = js_undef();
+    if (c->is_async) method = js_get_c(iterable, "@@asyncIterator");
+    if (!js_is_callable(method)) method = js_get_c(iterable, "@@iterator");
+    if (js_rt.ctl) return js_undef();
+    if (!js_is_callable(method)) return js_throw_error("TypeError", "yield* operand is not iterable");
+    js_val it = js_call(method, iterable, NULL, 0);
+    if (js_rt.ctl) return js_undef();
+    js_val next = js_get_c(it, "next");
+    if (js_rt.ctl) return js_undef();
+    js_val sent = js_undef();
+    int mode = 0;
+    for (;;) {
+        js_val fn = next;
+        if (mode == 1) fn = js_get_c(it, "throw");
+        else if (mode == 2) fn = js_get_c(it, "return");
+        if (js_rt.ctl) return js_undef();
+        if (!js_is_callable(fn)) {
+            if (mode == 1) return js_throw(sent);
+            if (mode == 2) {
+                js_rt.ctl = CTL_RETURN;
+                js_rt.value = sent;
+                return js_undef();
+            }
+            return js_throw_error("TypeError", "iterator.next is not a function");
+        }
+        js_val r = js_call(fn, it, &sent, 1);
+        if (js_rt.ctl) return js_undef();
+        if (c->is_async) {
+            r = coro_await(r);
+            if (js_rt.ctl) return js_undef();
+        }
+        if (r.type != JS_OBJ) return js_throw_error("TypeError", "Iterator result is not an object");
+        int done = js_truthy(js_get_c(r, "done"));
+        js_val value = js_get_c(r, "value");
+        if (js_rt.ctl) return js_undef();
+        if (done) {
+            if (mode == 2) {
+                js_rt.ctl = CTL_RETURN;
+                js_rt.value = value;
+                return js_undef();
+            }
+            return value;
+        }
+        c->transfer = value;
+        coro_suspend(c, SUSPEND_YIELD);
+        mode = c->resume_mode;
+        sent = c->transfer;
+    }
+}
+
+static js_coro* this_coro(js_val self) {
+    if (self.type == JS_OBJ && self.u.obj->magic == 0x7c0 && self.u.obj->data) return (js_coro*)self.u.obj->data;
+    js_throw_error("TypeError", "next method called on incompatible receiver");
+    return NULL;
+}
+
+static js_val coro_gen_next(js_val self, js_val* args, int argc, js_obj* callee) {
+    js_coro* c = this_coro(self);
+    if (!c) return js_undef();
+    int mode = callee->magic;
+    js_val arg = argc > 0 ? args[0] : js_undef();
+    if (c->running) return js_throw_error("TypeError", "Generator is already running");
+    if (!c->done && !c->started && mode) {
+        c->done = 1;
+        coro_release_stack(c);
+    }
+    if (c->done) {
+        if (mode == 1) return js_throw(arg);
+        return iter_result(mode == 2 ? arg : js_undef(), 1);
+    }
+    c->resume_mode = mode;
+    c->transfer = arg;
+    coro_run(c);
+    if (js_rt.ctl) return js_undef();
+    if (c->done) {
+        js_val r = c->result;
+        c->result = js_undef();
+        return iter_result(r, 1);
+    }
+    return iter_result(c->transfer, 0);
+}
+
+static js_val coro_agen_next(js_val self, js_val* args, int argc, js_obj* callee) {
+    js_coro* c = this_coro(self);
+    if (!c) return js_undef();
+    agen_request* req = (agen_request*)js_alloc(sizeof(agen_request));
+    req->mode = callee->magic;
+    req->value = argc > 0 ? args[0] : js_undef();
+    req->promise = js_promise_new();
+    req->next = NULL;
+    agen_request** tail = &c->queue;
+    while (*tail) tail = &(*tail)->next;
+    *tail = req;
+    js_obj* promise = req->promise;
+    agen_pump(c);
+    return js_obj_val(promise);
+}
+
+static js_val return_self(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)args; (void)argc; (void)callee;
+    return self;
+}
+
+static js_val make_coro_generator(js_coro* c, js_obj* fo) {
+    js_obj** protop = c->is_async ? &coro_agen_proto : &coro_gen_proto;
+    if (!*protop) {
+        js_obj* proto = js_new_object(js_object_proto);
+        js_native fn = c->is_async ? coro_agen_next : coro_gen_next;
+        static const char* const names[] = {"next", "throw", "return"};
+        for (int i = 0; i < 3; i++) {
+            js_obj* m = js_new_native(names[i], fn, 1);
+            m->magic = (int16_t)i;
+            js_define(proto, names[i], js_obj_val(m), PROP_HIDDEN);
+        }
+        js_define_native(proto, c->is_async ? "@@asyncIterator" : "@@iterator", return_self, 0);
+        js_define(proto, "@@toStringTag", js_str_val(js_intern_c(c->is_async ? "AsyncGenerator" : "Generator")), PROP_HIDDEN);
+        *protop = proto;
+    }
+    (void)fo;
+    js_obj* it = js_new_object(*protop);
+    it->magic = 0x7c0;
+    it->data = c;
+    return js_obj_val(it);
+}
+
+#if JS_HAVE_CORO
+typedef struct {
+    js_obj* fo;
+    js_val self;
+    js_val* args;
+    int argc;
+    js_obj* new_target;
+    js_val result;
+} big_call;
+
+static void big_call_run(void* p) {
+    big_call* b = (big_call*)p;
+    b->result = call_function(b->fo, b->self, b->args, b->argc, b->new_target);
+}
+
+static int on_coro_stack(js_coro* c) {
+    char probe;
+    return c->stack && &probe >= c->stack && &probe < c->stack + CORO_STACK_SIZE;
+}
+
+static js_val call_on_big_stack(js_coro* c, js_obj* fo, js_val self, js_val* args, int argc,
+                                js_obj* new_target) {
+    big_call b = {fo, self, args, argc, new_target, js_undef()};
+    char* coro_base = js_rt.stack_base;
+    long coro_limit = js_rt.stack_limit;
+    /* the resumer waits inside js_coro_switch at caller_sp; below it is free */
+    char* top = (char*)(((uintptr_t)c->caller_sp - 512u) & ~(uintptr_t)15u);
+    long used_above = c->big_base > top ? (long)(c->big_base - top) : 0;
+    js_rt.stack_base = c->big_base;
+    js_rt.stack_limit = c->big_limit;
+    if (used_above >= c->big_limit) {
+        js_rt.stack_base = coro_base;
+        js_rt.stack_limit = coro_limit;
+        return js_throw_error("RangeError", "Maximum call stack size exceeded");
+    }
+    js_call_on_stack(&b, big_call_run, top);
+    js_rt.stack_base = coro_base;
+    js_rt.stack_limit = coro_limit;
+    return b.result;
+}
+#endif
+
 static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
                             js_obj* new_target) {
     if (js_rt.ctl) return js_undef();
+#if JS_HAVE_CORO
+    if (current_coro && current_coro->running && on_coro_stack(current_coro))
+        return call_on_big_stack(current_coro, fo, self, args, argc, new_target);
+#endif
     if (stack_exhausted() || js_rt.depth > 1000) {
         return js_throw_error("RangeError", "Maximum call stack size exceeded");
     }
@@ -3154,7 +4083,7 @@ static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
         return js_throw_error("TypeError", "Class constructor cannot be invoked without 'new'");
     size_t saved_top = scope_top;
     int saved_allowed = scope_allowed;
-    int use_stack = !f->has_closures && !f->uses_arguments;
+    int use_stack = !f->has_closures && !f->uses_arguments && !f->generator && !f->is_async;
     scope_allowed = use_stack;
     uint32_t capacity = (uint32_t)(f->param_count + f->var_count + f->function_count + 2);
     js_env* env = new_env(fo->env, capacity, use_stack);
@@ -3197,29 +4126,34 @@ static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
         bind_pattern(param, i < argc ? args[i] : js_undef(), env, VAR_LET, 1);
     }
     js_val result = js_undef();
+    if ((f->generator || f->is_async) && !js_rt.ctl) {
+        js_coro* c = coro_create(fo, env, new_target);
+        if (c) {
+            c->is_async = f->is_async;
+            c->is_generator = f->generator;
+            js_rt.depth--;
+            js_rt.source = saved_source;
+            scope_top = saved_top;
+            scope_allowed = saved_allowed;
+            if (f->generator) return make_coro_generator(c, fo);
+            /* async function: runs now until its first await */
+            js_obj* promise = js_promise_new();
+            c->promise = promise;
+            coro_run(c);
+            async_finish(c);
+            return js_obj_val(promise);
+        }
+    }
     gen_collector collector;
+    js_coro* outer_coro = current_coro;
     if (f->generator) {
         collector.values = js_new_array(0);
         collector.prev = current_gen;
         current_gen = &collector;
     }
-    if (!js_rt.ctl) {
-        hoist(f, env);
-        if (new_target && f->is_class_constructor && !f->derived)
-            init_class_fields(fo, self);
-        if (f->expression_body) {
-            result = eval(f->body, env);
-        } else if (f->body) {
-            js_node* body = f->body;
-            for (uint32_t i = 0; i < body->count && !js_rt.ctl; i++) exec(body->list[i], env);
-            if (js_rt.ctl == CTL_RETURN) {
-                result = js_rt.value;
-                js_rt.ctl = CTL_NONE;
-            } else if (js_rt.ctl == CTL_BREAK || js_rt.ctl == CTL_CONTINUE) {
-                js_rt.ctl = CTL_NONE;
-            }
-        }
-    }
+    if (f->generator || f->is_async) current_coro = NULL;   /* eager fallback */
+    if (!js_rt.ctl) result = run_body(fo, env, new_target, self);
+    current_coro = outer_coro;
     if (new_target && f->derived && !js_rt.ctl) {
         /* derived constructors return the object super() made */
         js_val this_now = env->this_val;
@@ -3246,6 +4180,29 @@ static js_val call_function(js_obj* fo, js_val self, js_val* args, int argc,
     return result;
 }
 
+/* Hoists and runs a function body in its prepared scope. */
+static js_val run_body(js_obj* fo, js_env* env, js_obj* new_target, js_val self) {
+    js_func* f = fo->func;
+    js_val result = js_undef();
+    hoist(f, env);
+    if (new_target && f->is_class_constructor && !f->derived)
+        init_class_fields(fo, self);
+    if (js_rt.ctl) return result;
+    if (f->expression_body) {
+        result = eval(f->body, env);
+    } else if (f->body) {
+        js_node* body = f->body;
+        for (uint32_t i = 0; i < body->count && !js_rt.ctl; i++) exec(body->list[i], env);
+        if (js_rt.ctl == CTL_RETURN) {
+            result = js_rt.value;
+            js_rt.ctl = CTL_NONE;
+        } else if (js_rt.ctl == CTL_BREAK || js_rt.ctl == CTL_CONTINUE) {
+            js_rt.ctl = CTL_NONE;
+        }
+    }
+    return result;
+}
+
 /* An iterator ({next, return, throw, [Symbol.iterator]}) over a snapshot
  * of values: what Array.prototype.values(), Map.prototype.entries() and
  * the like return. It is a finished generator's object, which already
@@ -3254,10 +4211,14 @@ js_val js_list_iterator(js_obj* values) {
     return make_generator(values, js_undef(), 0);
 }
 
+js_obj* js_construct_this_override;
+js_obj* js_super_new_target;
+
 js_val js_construct(js_val fn, js_val* args, int argc) {
     if (!js_is_callable(fn)) return js_throw_error("TypeError", "value is not a constructor");
     js_obj* ctor = fn.u.obj;
     while (ctor->cls == CLS_BOUND) ctor = ctor->bound_target;
+    if (ctor->cls == CLS_NATIVE && ctor->native == proxy_call) return proxy_construct(ctor, args, argc);
     if (ctor->cls == CLS_NATIVE) {
         js_rt.depth++;
         js_val r = ctor->native(js_undef(), args, argc, ctor);
@@ -3272,11 +4233,18 @@ js_val js_construct(js_val fn, js_val* args, int argc) {
     if (ctor->func && ctor->func->arrow)
         return js_throw_error("TypeError", "value is not a constructor");
     js_val proto = js_get(js_obj_val(ctor), S_prototype);
-    js_obj* obj = js_new_object(proto.type == JS_OBJ ? proto.u.obj : js_object_proto);
-    /* objects of classes extending built-ins keep the built-in's behaviour */
-    for (js_obj* p = obj->proto; p; p = p->proto) {
-        if (p == js_error_proto) { obj->cls = CLS_ERROR; break; }
-        if (p == js_array_proto) { obj->cls = CLS_ARRAY; break; }
+    js_obj* obj;
+    if (js_construct_this_override) {   /* upgrading an existing element */
+        obj = js_construct_this_override;
+        js_construct_this_override = NULL;
+        if (proto.type == JS_OBJ) obj->proto = proto.u.obj;
+    } else {
+        obj = js_new_object(proto.type == JS_OBJ ? proto.u.obj : js_object_proto);
+        /* objects of classes extending built-ins keep the built-in's behaviour */
+        for (js_obj* p = obj->proto; p; p = p->proto) {
+            if (p == js_error_proto) { obj->cls = CLS_ERROR; break; }
+            if (p == js_array_proto) { obj->cls = CLS_ARRAY; break; }
+        }
     }
     js_val self = js_obj_val(obj);
     js_val r = call_function(fn.u.obj, self, args, argc, ctor);
@@ -3319,7 +4287,7 @@ static void bind_pattern(js_node* pattern, js_val value, js_env* env, int kind,
             if (kind == VAR_VAR) {
                 /* var inside blocks lands in the function scope */
                 js_var* outer = env_lookup(env, pattern->str);
-                if (outer) outer->value = value;
+                if (outer) outer->value = share_val(value);
             }
         } else {
             assign_identifier(env, pattern->str, value);
@@ -3415,41 +4383,41 @@ static void bind_pattern(js_node* pattern, js_val value, js_env* env, int kind,
 static double js_pow(double base, double exponent);
 
 static js_val arithmetic(uint32_t op, js_val a, js_val b) {
-    if (op == pack("+")) {
+    if (op == PACK("+")) {
         if (a.type == JS_NUM && b.type == JS_NUM) return js_num(a.u.num + b.u.num);
-        js_val pa = js_to_primitive(a, 0);
+        js_val pa = js_to_primitive(a, 2);
         JS_CHECK(pa);
-        js_val pb = js_to_primitive(b, 0);
+        js_val pb = js_to_primitive(b, 2);
         JS_CHECK(pb);
         if (pa.type == JS_STR || pb.type == JS_STR)
             return js_str_val(js_concat(js_to_string(pa), js_to_string(pb)));
         return js_num(js_to_number(pa) + js_to_number(pb));
     }
-    if (op == pack("==")) return js_bool(js_loose_equals(a, b));
-    if (op == pack("!=")) return js_bool(!js_loose_equals(a, b));
-    if (op == pack("===")) return js_bool(js_strict_equals(a, b));
-    if (op == pack("!==")) return js_bool(!js_strict_equals(a, b));
-    if (op == pack("<") || op == pack(">") || op == pack("<=") || op == pack(">=")) {
+    if (op == PACK("==")) return js_bool(js_loose_equals(a, b));
+    if (op == PACK("!=")) return js_bool(!js_loose_equals(a, b));
+    if (op == PACK("===")) return js_bool(js_strict_equals(a, b));
+    if (op == PACK("!==")) return js_bool(!js_strict_equals(a, b));
+    if (op == PACK("<") || op == PACK(">") || op == PACK("<=") || op == PACK(">=")) {
         js_val pa = js_to_primitive(a, 1), pb = js_to_primitive(b, 1);
         if (pa.type == JS_STR && pb.type == JS_STR) {
             int c = strcmp(pa.u.str->data, pb.u.str->data);
-            if (op == pack("<")) return js_bool(c < 0);
-            if (op == pack(">")) return js_bool(c > 0);
-            if (op == pack("<=")) return js_bool(c <= 0);
+            if (op == PACK("<")) return js_bool(c < 0);
+            if (op == PACK(">")) return js_bool(c > 0);
+            if (op == PACK("<=")) return js_bool(c <= 0);
             return js_bool(c >= 0);
         }
         double x = js_to_number(pa), y = js_to_number(pb);
-        if (op == pack("<")) return js_bool(x < y);
-        if (op == pack(">")) return js_bool(x > y);
-        if (op == pack("<=")) return js_bool(x <= y);
+        if (op == PACK("<")) return js_bool(x < y);
+        if (op == PACK(">")) return js_bool(x > y);
+        if (op == PACK("<=")) return js_bool(x <= y);
         return js_bool(x >= y);
     }
     double x = js_to_number(a), y = js_to_number(b);
     JS_CHECK(x);
-    if (op == pack("-")) return js_num(x - y);
-    if (op == pack("*")) return js_num(x * y);
-    if (op == pack("/")) return js_num(x / y);
-    if (op == pack("%")) {
+    if (op == PACK("-")) return js_num(x - y);
+    if (op == PACK("*")) return js_num(x * y);
+    if (op == PACK("/")) return js_num(x / y);
+    if (op == PACK("%")) {
         if (y == 0 || x != x || y != y) return js_num(0.0 / 0.0);
         if (x == (long long)x && y == (long long)y && x >= -9e15 && x <= 9e15 && y >= -9e15 && y <= 9e15) {
             long long r = (long long)x % (long long)y;
@@ -3460,14 +4428,14 @@ static js_val arithmetic(uint32_t op, js_val a, js_val b) {
         double t = q < 0 ? -(double)(long long)(-q) : (double)(long long)q;
         return js_num(x - t * y);
     }
-    if (op == pack("**")) return js_num(js_pow(x, y));
+    if (op == PACK("**")) return js_num(js_pow(x, y));
     int32_t ix = js_to_int32(a), iy = js_to_int32(b);
-    if (op == pack("&")) return js_num(ix & iy);
-    if (op == pack("|")) return js_num(ix | iy);
-    if (op == pack("^")) return js_num(ix ^ iy);
-    if (op == pack("<<")) return js_num((int32_t)((uint32_t)ix << (iy & 31)));
-    if (op == pack(">>")) return js_num(ix >> (iy & 31));
-    if (op == pack(">>>")) return js_num((double)((uint32_t)ix >> (iy & 31)));
+    if (op == PACK("&")) return js_num(ix & iy);
+    if (op == PACK("|")) return js_num(ix | iy);
+    if (op == PACK("^")) return js_num(ix ^ iy);
+    if (op == PACK("<<")) return js_num((int32_t)((uint32_t)ix << (iy & 31)));
+    if (op == PACK(">>")) return js_num(ix >> (iy & 31));
+    if (op == PACK(">>>")) return js_num((double)((uint32_t)ix >> (iy & 31)));
     return js_undef();
 }
 
@@ -3664,9 +4632,19 @@ __attribute__((noinline)) static js_val eval_call(js_node* n, js_env* env) {
         js_val this_val = env->this_val;
         if (parent && parent != js_function_proto) {
             if (parent->cls == CLS_NATIVE) {
+                js_obj* saved_new_target = js_super_new_target;
+                js_super_new_target = env->new_target ? env->new_target : ctor;
                 js_val made = parent->native(js_undef(), args, argc, parent);
+                js_super_new_target = saved_new_target;
                 JS_CHECK(made);
-                if (made.type == JS_OBJ && this_val.type == JS_OBJ) {
+                if (made.type == JS_OBJ && this_val.type == JS_OBJ && made.u.obj != this_val.u.obj &&
+                    made.u.obj->cls == CLS_NODE && made.u.obj->node) {
+                    /* custom element: this object becomes the element's wrapper */
+                    js_obj* target = this_val.u.obj;
+                    target->cls = CLS_NODE;
+                    target->node = made.u.obj->node;
+                    target->node->js_wrapper = target;
+                } else if (made.type == JS_OBJ && this_val.type == JS_OBJ && made.u.obj != this_val.u.obj) {
                     /* adopt the built-in's state */
                     js_obj* target = this_val.u.obj;
                     js_obj* src = made.u.obj;
@@ -3740,6 +4718,30 @@ __attribute__((noinline)) static js_val eval_update(js_node* n, js_env* env) {
     double updated = n->op == '+' ? value + 1 : value - 1;
     put_reference(n->a, env, object, key, js_num(updated));
     return js_num(n->flag ? updated : value);
+}
+
+/* `name += rhs;` where name is a string variable in scope: see append_owned.
+ * Returns 0 to let the generic path handle it. */
+__attribute__((noinline)) static int append_statement(js_node* n, js_env* env) {
+    js_str* name = n->a->str;
+    js_var* v = env_lookup(env, name);
+    if (!v || !v->initialized || v->kind == VAR_CONST || v->value.type != JS_STR) return 0;
+    js_str* old = v->value.u.str;
+    js_val rhs = eval(n->b, env);
+    if (js_rt.ctl) return 1;
+    js_str* tail;
+    if (rhs.type == JS_STR) tail = rhs.u.str;
+    else if (rhs.type == JS_OBJ) {
+        js_val p = js_to_primitive(rhs, 2);
+        if (js_rt.ctl) return 1;
+        tail = js_to_string(p);
+    } else tail = js_to_string(rhs);
+    if (js_rt.ctl) return 1;
+    js_str* result = append_owned(old, tail);
+    v = env_lookup(env, name);   /* the scope may have grown meanwhile */
+    if (v) v->value = js_str_val(result);
+    else { result->owned = 0; assign_identifier(env, name, js_str_val(result)); }
+    return 1;
 }
 
 __attribute__((noinline)) static js_val eval_assign(js_node* n, js_env* env) {
@@ -3870,28 +4872,45 @@ __attribute__((noinline)) static js_val eval_unary(js_node* n, js_env* env) {
         return js_undef();
     }
 
+#define TAGGED_CACHE 512
+static struct { js_node* node; js_obj* strings; } tagged_cache[TAGGED_CACHE];
+
 __attribute__((noinline)) static js_val eval_tagged(js_node* n, js_env* env) {
         js_val fn = eval(n->a, env);
         JS_CHECK(fn);
-        js_obj* strings = js_new_array(0);
-        js_obj* raw = js_new_array(0);
+        /* the strings array is the same object every time this tag runs
+         * (lit-html and others cache templates by it) */
+        uint32_t slot = (uint32_t)(((uintptr_t)n >> 4) * 2654435761u) % TAGGED_CACHE;
+        js_obj* strings = tagged_cache[slot].node == n ? tagged_cache[slot].strings : NULL;
+        if (!strings) {
+            strings = js_new_array(0);
+            js_obj* raw = js_new_array(0);
+            for (uint32_t i = 0; i < n->b->count; i += 2) {
+                js_node* part = n->b->list[i];
+                js_array_push(strings, js_str_val(part->str));
+                js_array_push(raw, js_str_val(part->b ? part->b->str : part->str));
+            }
+            js_define(strings, "raw", js_obj_val(raw), PROP_HIDDEN);
+            raw->frozen = strings->frozen = 1;
+            tagged_cache[slot].node = n;
+            tagged_cache[slot].strings = strings;
+        }
         js_val* args = (js_val*)js_alloc(sizeof(js_val) * (n->b->count / 2 + 2));
         int argc = 1;
-        for (uint32_t i = 0; i < n->b->count; i++) {
-            if (i % 2 == 0) {
-                js_array_push(strings, js_str_val(n->b->list[i]->str));
-                js_array_push(raw, js_str_val(n->b->list[i]->str));
-            } else {
-                args[argc++] = eval(n->b->list[i], env);
-                JS_CHECK(fn);
-            }
+        for (uint32_t i = 1; i < n->b->count; i += 2) {
+            args[argc++] = eval(n->b->list[i], env);
+            JS_CHECK(fn);
         }
-        js_define(strings, "raw", js_obj_val(raw), PROP_HIDDEN);
         args[0] = js_obj_val(strings);
         return js_call(fn, js_undef(), args, argc);
     }
 
 __attribute__((noinline)) static js_val eval_yield(js_node* n, js_env* env) {
+        if (!current_gen && current_coro && current_coro->is_generator) {
+            js_val v = n->a ? eval(n->a, env) : js_undef();
+            JS_CHECK(v);
+            return n->flag ? coro_yield_star(current_coro, v) : coro_yield(current_coro, v);
+        }
         if (!current_gen) return js_throw_error("SyntaxError", "yield is only valid in generator functions");
         js_val v = n->a ? eval(n->a, env) : js_undef();
         JS_CHECK(v);
@@ -4020,7 +5039,7 @@ static js_val eval(js_node* n, js_env* env) {
     case N_AWAIT: {
         js_val v = eval(n->a, env);
         JS_CHECK(v);
-        return await_value(v);
+        return coro_await(v);
     }
     case N_YIELD: return eval_yield(n, env);
     case N_IMPORT_CALL: return eval_import_call(n, env);
@@ -4200,7 +5219,7 @@ static void exec_block(js_node* n, js_env* env) {
  * values of `let`. */
 static js_env* iteration_scope(js_env* loop_env, js_env* parent) {
     js_env* fresh = new_env(parent, loop_env->count + 1, scope_allowed);
-    for (uint32_t i = 0; i < loop_env->count; i++) fresh->vars[i] = loop_env->vars[i];
+    for (uint32_t i = 0; i < loop_env->count; i++) { fresh->vars[i] = loop_env->vars[i]; share_val(fresh->vars[i].value); }
     fresh->count = loop_env->count;
     return fresh;
 }
@@ -4225,7 +5244,92 @@ static int loop_continue(js_node* label_owner, js_str* own_label) {
     return js_rt.ctl == CTL_NONE;
 }
 
-static js_str* current_label;
+
+/* for (x of iterable) / for await (x of iterable): asks the iterator for
+ * one value at a time (generators can be endless) and closes it with
+ * return() when the loop is left early. */
+static void exec_for_of_iterator(js_node* n, js_env* env, js_str* label, js_val subject) {
+    int is_await = n->flag;
+    js_val method = js_undef();
+    int sync_source = 0;
+    if (is_await) method = js_get_c(subject, "@@asyncIterator");
+    if (js_rt.ctl) return;
+    if (!js_is_callable(method)) {
+        method = js_get_c(subject, "@@iterator");
+        sync_source = 1;
+    }
+    if (js_rt.ctl) return;
+    js_val it;
+    if (js_is_callable(method)) {
+        it = js_call(method, subject, NULL, 0);
+    } else if (subject.type == JS_OBJ && is_await) {
+        /* array-likes */
+        js_val from = js_get(js_get_c(js_obj_val(js_global), "Array"), js_intern_c("from"));
+        js_val arr = js_call(from, js_undef(), &subject, 1);
+        if (js_rt.ctl) return;
+        it = js_list_iterator(arr.type == JS_OBJ ? arr.u.obj : js_new_array(0));
+    } else {
+        js_throw_error("TypeError", "object is not iterable");
+        return;
+    }
+    if (js_rt.ctl) return;
+    js_val next = js_get_c(it, "next");
+    if (js_rt.ctl) return;
+    if (!js_is_callable(next)) {
+        js_throw_error("TypeError", "iterator.next is not a function");
+        return;
+    }
+    js_node* left = n->a;
+    int kind = left->type == N_VAR ? left->op : -1;
+    js_node* pattern = left->type == N_VAR ? left->list[0]->a : left;
+    for (;;) {
+        if (!step()) return;
+        js_val r = js_call(next, it, NULL, 0);
+        if (js_rt.ctl) return;
+        if (is_await && !sync_source) {
+            r = coro_await(r);
+            if (js_rt.ctl) return;
+        }
+        if (r.type != JS_OBJ) {
+            js_throw_error("TypeError", "Iterator result is not an object");
+            return;
+        }
+        if (js_truthy(js_get_c(r, "done"))) return;
+        js_val item = js_get_c(r, "value");
+        if (js_rt.ctl) return;
+        if (is_await && sync_source) {
+            item = coro_await(item);
+            if (js_rt.ctl) return;
+        }
+        size_t saved = scope_top;
+        js_env* scope = env;
+        if (kind == VAR_LET || kind == VAR_CONST) scope = new_env(env, 2, scope_allowed);
+        bind_pattern(pattern, item, scope, kind >= 0 ? kind : VAR_VAR,
+                     kind == VAR_LET || kind == VAR_CONST);
+        if (!js_rt.ctl) exec(n->c, scope);
+        if (scope != env && scope->on_stack) scope_top = saved;
+        if (scope != env) env_release(scope);
+        int leaving = js_rt.ctl == CTL_BREAK || js_rt.ctl == CTL_RETURN || js_rt.ctl == CTL_THROW ||
+                      (js_rt.ctl == CTL_CONTINUE && js_rt.label && js_rt.label != label);
+        if (leaving) {
+            js_ctl ctl = js_rt.ctl;
+            js_val value = js_rt.value;
+            js_str* saved_label = js_rt.label;
+            js_rt.ctl = CTL_NONE;
+            js_val ret = js_get_c(it, "return");
+            if (!js_rt.ctl && js_is_callable(ret)) {
+                js_val done = js_call(ret, it, NULL, 0);
+                if (!js_rt.ctl && is_await && !sync_source) coro_await(done);
+            }
+            if (js_rt.ctl != CTL_THROW || ctl == CTL_THROW) {
+                js_rt.ctl = ctl;
+                js_rt.value = value;
+                js_rt.label = saved_label;
+            }
+        }
+        if (!loop_continue(n, label)) return;
+    }
+}
 
 static void exec_for_in_of(js_node* n, js_env* env, js_str* label) {
     js_val subject = eval(n->b, env);
@@ -4241,8 +5345,12 @@ static void exec_for_in_of(js_node* n, js_env* env, js_str* label) {
             if (o->cls == CLS_NODE) break;
         }
     } else {
-        if (subject.type == JS_OBJ && (subject.u.obj->cls == CLS_ARRAY || subject.u.obj->cls == CLS_ARGUMENTS)) {
+        if (subject.type == JS_OBJ && (subject.u.obj->cls == CLS_ARRAY || subject.u.obj->cls == CLS_ARGUMENTS) &&
+            !n->flag) {
             items = subject.u.obj;
+        } else if (subject.type == JS_OBJ || n->flag) {
+            exec_for_of_iterator(n, env, label, subject);
+            return;
         } else {
             js_val from = js_get(js_get_c(js_obj_val(js_global), "Array"), js_intern_c("from"));
             js_val arr = js_call(from, js_undef(), &subject, 1);
@@ -4281,6 +5389,9 @@ static void exec(js_node* n, js_env* env) {
     switch (n->type) {
     case N_EXPR_STMT:
         js_rt.line = n->line;
+        if (n->a->type == N_ASSIGN && n->a->op == 1 && n->a->a->type == N_IDENT &&
+            append_statement(n->a, env))
+            return;
         eval(n->a, env);
         return;
     case N_VAR:
@@ -4478,14 +5589,14 @@ js_val js_exec_program(js_node* program) {
     for (int i = 0; i < f->var_count; i++) {
         js_var* v = env_lookup(js_global_env, f->vars[i]);
         if (v && !js_find_own(js_global, f->vars[i]))
-            js_set(js_obj_val(js_global), f->vars[i], v->value);
+            js_set(js_obj_val(js_global), f->vars[i], share_val(v->value));
     }
     /* drop them from the scope so the global object stays authoritative */
     uint32_t kept = 0;
     for (uint32_t i = 0; i < js_global_env->count; i++) {
         js_var* v = &js_global_env->vars[i];
         if (v->kind == VAR_VAR) {
-            js_set(js_obj_val(js_global), v->name, v->value);
+            js_set(js_obj_val(js_global), v->name, share_val(v->value));
             continue;
         }
         js_global_env->vars[kept++] = *v;
@@ -4580,7 +5691,7 @@ static void export_pattern_names(js_node* pattern, js_obj* ns, js_env* env) {
     switch (pattern->type) {
     case N_IDENT: {
         js_var* v = env_lookup(env, pattern->str);
-        js_set(js_obj_val(ns), pattern->str, v ? v->value : js_undef());
+        js_set(js_obj_val(ns), pattern->str, v ? share_val(v->value) : js_undef());
         break;
     }
     case N_ASSIGN_PAT: case N_REST:
@@ -4685,7 +5796,7 @@ static void exec_module(js_node* program, module_record* rec) {
         if (s->op == 3 && !s->c)
             for (uint32_t k = 0; k < s->count; k++) {
                 js_var* v = env_lookup(env, s->list[k]->str);
-                js_set(js_obj_val(ns), s->list[k]->b->str, v ? v->value : js_undef());
+                js_set(js_obj_val(ns), s->list[k]->b->str, v ? share_val(v->value) : js_undef());
             }
         if (s->op == 2 && s->a && s->a->type == N_VAR)
             for (uint32_t k = 0; k < s->a->count; k++) export_pattern_names(s->a->list[k]->a, ns, env);
@@ -4751,7 +5862,10 @@ js_val js_load_module(const char* url) {
 /* ====================================================================== */
 
 void js_core_init(void);
+uint32_t js_core_generation = 1;
+
 void js_core_init(void) {
+    js_core_generation++;   /* caches of strings from the last page are stale */
     memset(intern_table, 0, sizeof(intern_table));
     init_names();
     if (!scope_stack) scope_stack = (char*)malloc(JS_SCOPE_STACK);
@@ -4760,6 +5874,8 @@ void js_core_init(void) {
     current_label = NULL;
     current_gen = NULL;
     generator_proto = NULL;
+    coro_reset();
+    memset(tagged_cache, 0, sizeof(tagged_cache));
     modules = NULL;
     import_map = js_undef();
     parse_as_module = 0;

@@ -190,11 +190,22 @@ void js_dom_mutated(void) {
 /* Wrappers                                                               */
 /* ====================================================================== */
 
+#define TAG_PROTOS 96
+static struct { char tag[16]; js_obj* proto; } tag_protos[TAG_PROTOS];
+static int tag_proto_count;
+
+static js_obj* element_proto_for(const char* tag) {
+    if (tag)
+        for (int i = 0; i < tag_proto_count; i++)
+            if (tag_protos[i].tag[0] == tag[0] && !strcmp(tag_protos[i].tag, tag)) return tag_protos[i].proto;
+    return element_proto;
+}
+
 js_val js_wrap_node(mx_node_t* node) {
     if (!node) return js_null();
     if (node->js_wrapper) return js_obj_val((js_obj*)node->js_wrapper);
     js_obj* proto = node->type == MX_NODE_DOCUMENT ? document_proto :
-                    node->type == MX_NODE_ELEMENT ? element_proto : text_proto;
+                    node->type == MX_NODE_ELEMENT ? element_proto_for(node->tag) : text_proto;
     js_obj* o = js_new_object(proto);
     o->cls = CLS_NODE;
     o->node = node;
@@ -463,7 +474,7 @@ enum {
     G_TEXT,
     /* <video> (HTMLMediaElement); media.c plays them */
     G_PAUSED, G_CURRENT_TIME, G_DURATION, G_ENDED, G_MUTED, G_VIDEO_WIDTH,
-    G_VIDEO_HEIGHT, G_COUNT
+    G_VIDEO_HEIGHT, G_CURRENT_SCRIPT, G_COUNT
 };
 
 static const char* const getter_names[G_COUNT] = {
@@ -486,16 +497,19 @@ static const char* const getter_names[G_COUNT] = {
     "referrer", "domain", "characterSet", "compatMode", "contentEditable",
     "isContentEditable", "label", "text",
     "paused", "currentTime", "duration", "ended", "muted", "videoWidth",
-    "videoHeight",
+    "videoHeight", "currentScript",
 };
 
 static js_str* getter_keys[G_COUNT];
+static mx_node_t* current_script;   /* document.currentScript */
+
+void mx_js_set_current_script(mx_node_t* script) { current_script = script; }
 static int16_t getter_table[512];   /* open addressing on the key hash */
 
 static void build_getter_table(void) {
     for (int i = 0; i < 512; i++) getter_table[i] = -1;
     for (int i = 0; i < G_COUNT; i++) {
-        uint32_t slot = getter_keys[i]->hash & 511u;
+        uint32_t slot = js_str_hash(getter_keys[i]) & 511u;
         int duplicate = 0;
         while (getter_table[slot] >= 0) {
             if (js_str_eq(getter_keys[getter_table[slot]], getter_keys[i])) duplicate = 1;
@@ -506,7 +520,7 @@ static void build_getter_table(void) {
 }
 
 static int getter_id(js_str* key) {
-    uint32_t slot = key->hash & 511u;
+    uint32_t slot = js_str_hash(key) & 511u;
     while (getter_table[slot] >= 0) {
         js_str* candidate = getter_keys[getter_table[slot]];
         if (candidate == key || js_str_eq(candidate, key)) return getter_table[slot];
@@ -854,7 +868,13 @@ static js_val document_getter(int id, int* found) {
     case G_URL: return js_str_val(js_cstr(page_url));
     case G_LOCATION: return js_obj_val(location_obj);
     case G_DEFAULT_VIEW: return js_obj_val(js_global);
-    case G_ACTIVE_ELEMENT: return js_wrap_node(js_doc->body);
+    case G_ACTIVE_ELEMENT: {
+        mx_node_t* f = mx_html_focused();
+        int connected = 0;
+        for (mx_node_t* p = f; p; p = p->parent) connected |= p == js_doc->root;
+        return js_wrap_node(connected ? f : js_doc->body);
+    }
+    case G_CURRENT_SCRIPT: return current_script ? js_wrap_node(current_script) : js_null();
     case G_FORMS: return collect_tags("form");
     case G_IMAGES: return collect_tags("img");
     case G_SCRIPTS: return collect_tags("script");
@@ -986,8 +1006,14 @@ js_val js_dom_get(js_obj* obj, js_str* key, int* found) {
 }
 
 static void set_inner_html(mx_node_t* n, const char* html) {
-    mx_dom_remove_children(n);
-    mx_dom_parse_fragment(js_doc, n, html, strlen(html));
+    if (n->type == MX_NODE_ELEMENT && (mx_dom_is(n, "script") || mx_dom_is(n, "style") ||
+                                       mx_dom_is(n, "textarea") || mx_dom_is(n, "title"))) {
+        /* raw text: `script.innerHTML = "if (a<b) ..."` is code, not markup */
+        mx_dom_set_text_content(js_doc, n, html);
+    } else {
+        mx_dom_remove_children(n);
+        mx_dom_parse_fragment(js_doc, n, html, strlen(html));
+    }
     js_dom_mutated();
 }
 
@@ -1264,13 +1290,14 @@ static js_val el_replace_child(js_val self, js_val* args, int argc, js_obj* call
 
 static js_val el_replace_with(js_val self, js_val* args, int argc, js_obj* callee) {
     mx_node_t* n = this_node(self);
-    if (!n || !n->parent) return js_undef();
-    mx_node_t* parent = n->parent;
-    if (callee->magic) {   /* replaceChildren */
+    if (n && callee->magic) {   /* replaceChildren */
         mx_dom_remove_children(n);
         for (int i = 0; i < argc; i++) insert(n, as_insertable(args[i]), NULL);
+        js_dom_mutated();
         return js_undef();
     }
+    if (!n || !n->parent) return js_undef();
+    mx_node_t* parent = n->parent;
     for (int i = 0; i < argc; i++) insert(parent, as_insertable(args[i]), n);
     mx_dom_remove(n);
     js_dom_mutated();
@@ -1373,18 +1400,18 @@ static js_val el_attribute(js_val self, js_val* args, int argc, js_obj* callee) 
 
 static js_val query(mx_node_t* root, js_val selector, int all) {
     js_str* s = js_to_string(selector);
+    const void* compiled = mx_css_compile(s->data);
+    if (!compiled) {
+        char message[200];
+        mx_copy(message, sizeof(message), "Failed to execute 'querySelector': '");
+        mx_append(message, sizeof(message), s->data);
+        mx_append(message, sizeof(message), "' is not a valid selector.");
+        return js_throw_error("SyntaxError", message);
+    }
     js_obj* list = all ? node_list() : NULL;
     for (mx_node_t* n = root->first ? mx_dom_next(root, root) : NULL; n; n = mx_dom_next(root, n)) {
         if (n->type != MX_NODE_ELEMENT) continue;
-        int m = mx_css_matches(n, s->data);
-        if (m < 0) {
-            char message[200];
-            mx_copy(message, sizeof(message), "Failed to execute 'querySelector': '");
-            mx_append(message, sizeof(message), s->data);
-            mx_append(message, sizeof(message), "' is not a valid selector.");
-            return js_throw_error("SyntaxError", message);
-        }
-        if (!m) continue;
+        if (!mx_css_matches_compiled(n, compiled)) continue;
         if (!all) return js_wrap_node(n);
         js_array_push(list, js_wrap_node(n));
     }
@@ -1450,12 +1477,10 @@ static js_val el_query(js_val self, js_val* args, int argc, js_obj* callee) {
         return js_bool(m);
     }
     case 7: {   /* closest */
-        js_str* s = js_to_string(ARG(0));
-        for (mx_node_t* e = n; e && e->type == MX_NODE_ELEMENT; e = e->parent) {
-            int m = mx_css_matches(e, s->data);
-            if (m < 0) return js_throw_error("SyntaxError", "is not a valid selector");
-            if (m) return js_wrap_node(e);
-        }
+        const void* compiled = mx_css_compile(js_to_string(ARG(0))->data);
+        if (!compiled) return js_throw_error("SyntaxError", "is not a valid selector");
+        for (mx_node_t* e = n; e && e->type == MX_NODE_ELEMENT; e = e->parent)
+            if (mx_css_matches_compiled(e, compiled)) return js_wrap_node(e);
         return js_null();
     }
     }
@@ -1464,12 +1489,16 @@ static js_val el_query(js_val self, js_val* args, int argc, js_obj* callee) {
 
 /* ---- creation ---- */
 
+static void ce_created(mx_node_t* e);
+
 static js_val doc_create(js_val self, js_val* args, int argc, js_obj* callee) {
     (void)self;
     switch (callee->magic) {
     case 0: {   /* createElement */
         js_str* tag = js_to_string(ARG(0));
-        return js_wrap_node(mx_dom_create_element(js_doc, tag->data));
+        mx_node_t* e = mx_dom_create_element(js_doc, tag->data);
+        if (e) ce_created(e);
+        return js_wrap_node(e);
     }
     case 1: {   /* createTextNode */
         js_str* text = js_to_string(ARG(0));
@@ -1549,7 +1578,26 @@ static js_val el_misc(js_val self, js_val* args, int argc, js_obj* callee) {
     case 0:   /* click */
         if (n) mx_js_dispatch(n, "click", NULL);
         return js_undef();
-    case 1:   /* focus, blur, select, noop methods */
+    case 1:   /* select, noop methods */
+        return js_undef();
+    case 20:   /* focus */
+        if (n && n != mx_html_focused() && n->type == MX_NODE_ELEMENT) {
+            mx_node_t* previous = mx_html_focused();
+            mx_html_set_focus(n);
+            if (previous) {
+                mx_js_dispatch(previous, "blur", NULL);
+                mx_js_dispatch(previous, "focusout", NULL);
+            }
+            mx_js_dispatch(n, "focus", NULL);
+            mx_js_dispatch(n, "focusin", NULL);
+        }
+        return js_undef();
+    case 21:   /* blur */
+        if (n && n == mx_html_focused()) {
+            mx_html_set_focus(NULL);
+            mx_js_dispatch(n, "blur", NULL);
+            mx_js_dispatch(n, "focusout", NULL);
+        }
         return js_undef();
     case 2:   /* checkValidity, reportValidity */
         return js_bool(1);
@@ -2737,37 +2785,75 @@ static js_val image_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
 
 /* ---- dynamic scripts ---- */
 
+const char* js_page_url(void);
+
+static int script_type_ok(mx_node_t* script, int* module) {
+    const char* type = mx_dom_attr(script, "type");
+    *module = type && mx_streq_nocase(type, "module");
+    return !type || !*type || mx_streq_nocase(type, "text/javascript") ||
+           mx_streq_nocase(type, "application/javascript") || mx_streq_nocase(type, "text/ecmascript") ||
+           mx_streq_nocase(type, "application/ecmascript") || *module;
+}
+
+/* An inserted <script src>: fetched and run as its own task, like browsers
+ * do, so the code that inserted it can still add onload handlers. */
+static void run_external_script(mx_node_t* script) {
+    int module = 0;
+    script_type_ok(script, &module);
+    const char* src = mx_dom_attr(script, "src");
+    char url[2048];
+    mx_html_resolve(src ? src : "", url, sizeof(url));
+    char* body = NULL;
+    size_t length = 0;
+    if (!js_host.fetch || !js_host.fetch(js_host.user, url, "script", &body, &length)) {
+        mx_js_dispatch(script, "error", NULL);
+        return;
+    }
+    const char* base = strrchr(url, '/');
+    char name[48];
+    mx_copy(name, sizeof(name), base && base[1] ? base + 1 : url);
+    char* q = strchr(name, '?');
+    if (q) *q = '\0';
+    const char* saved = js_rt.source;
+    mx_node_t* saved_script = current_script;
+    current_script = module ? NULL : script;
+    if (module) mx_js_run_module(body, length, url, js_intern_c(name)->data);
+    else mx_js_run(body, length, js_intern_c(name)->data);
+    current_script = saved_script;
+    js_rt.source = saved;
+    free(body);
+    mx_js_dispatch(script, "load", NULL);
+}
+
+static js_val script_task(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc;
+    if (callee->node) run_external_script(callee->node);
+    return js_undef();
+}
+
 static void run_script_node(mx_node_t* script) {
     if (script->checked) return;
+    int module = 0;
+    if (!script_type_ok(script, &module)) return;
     script->checked = 1;
-    const char* type = mx_dom_attr(script, "type");
-    if (type && *type && !mx_streq_nocase(type, "text/javascript") &&
-        !mx_streq_nocase(type, "application/javascript") && !mx_streq_nocase(type, "module"))
-        return;
     const char* src = mx_dom_attr(script, "src");
     if (src && *src) {
-        char url[2048];
-        mx_html_resolve(src, url, sizeof(url));
-        char* body = NULL;
-        size_t length = 0;
-        if (!js_host.fetch || !js_host.fetch(js_host.user, url, "script", &body, &length)) {
-            mx_js_dispatch(script, "error", NULL);
-            return;
-        }
-        const char* base = strrchr(url, '/');
-        char name[48];
-        mx_copy(name, sizeof(name), base && base[1] ? base + 1 : url);
-        const char* saved = js_rt.source;
-        mx_js_run(body, length, js_intern_c(name)->data);
-        js_rt.source = saved;
-        free(body);
-        mx_js_dispatch(script, "load", NULL);
+        js_obj* task = js_new_native("", script_task, 0);
+        task->node = script;
+        js_val set_timeout = js_get_c(js_obj_val(js_global), "setTimeout");
+        js_val call_args[2] = {js_obj_val(task), js_num(0)};
+        if (js_is_callable(set_timeout)) js_call(set_timeout, js_undef(), call_args, 2);
+        else run_external_script(script);
         return;
     }
     char* text = mx_dom_text_content(js_doc, script);
     if (*text) {
         const char* saved = js_rt.source;
-        mx_js_run(text, strlen(text), "inserted script");
+        mx_node_t* saved_script = current_script;
+        current_script = module ? NULL : script;
+        if (module) mx_js_run_module(text, strlen(text), js_page_url(), "inserted module");
+        else mx_js_run(text, strlen(text), "inserted script");
+        current_script = saved_script;
         js_rt.source = saved;
     }
 }
@@ -2809,7 +2895,341 @@ static js_val illegal_ctor(js_val self, js_val* args, int argc, js_obj* callee) 
     return js_throw_error("TypeError", "Illegal constructor");
 }
 
+/* ====================================================================== */
+/* Tree changes: MutationObserver records and custom elements             */
+/* ====================================================================== */
+
+static int mo_enabled;          /* a MutationObserver is observing something */
+static js_obj* mo_records;      /* records waiting for the microtask */
+
+#define CE_MAX 128
+typedef struct {
+    const char* name;           /* lower case */
+    js_obj* ctor;
+    js_obj* observed;           /* observedAttributes, or NULL */
+} ce_def;
+static ce_def ce_defs[CE_MAX];
+static int ce_count;
+static js_obj* ce_waiting;      /* name -> [promise, resolve] for whenDefined */
+
+enum { CE_UPGRADE, CE_CONNECTED, CE_DISCONNECTED, CE_ATTR };
+typedef struct ce_reaction {
+    int type;
+    mx_node_t* node;
+    js_val name, old_value, new_value;
+    struct ce_reaction* next;
+} ce_reaction;
+static ce_reaction* ce_head;
+static ce_reaction* ce_tail;
+static int ce_flushing, ce_flush_scheduled;
+static int removing_connected;
+static mx_node_t* ce_pending_node;   /* the element HTMLElement() should return */
+
+static int node_connected(const mx_node_t* n) {
+    while (n && n->parent) n = n->parent;
+    return js_doc && n == js_doc->root;
+}
+
+static ce_def* ce_lookup(const char* tag) {
+    if (!tag || !strchr(tag, '-')) return NULL;
+    for (int i = 0; i < ce_count; i++)
+        if (!strcmp(ce_defs[i].name, tag)) return &ce_defs[i];
+    return NULL;
+}
+
+static ce_def* ce_by_ctor(js_obj* ctor) {
+    for (int i = 0; i < ce_count; i++)
+        if (ce_defs[i].ctor == ctor) return &ce_defs[i];
+    return NULL;
+}
+
+static void ce_queue(int type, mx_node_t* node, js_val name, js_val old_value, js_val new_value) {
+    ce_reaction* r = (ce_reaction*)js_alloc(sizeof(ce_reaction));
+    r->type = type;
+    r->node = node;
+    r->name = name;
+    r->old_value = old_value;
+    r->new_value = new_value;
+    r->next = NULL;
+    if (ce_tail) ce_tail->next = r;
+    else ce_head = r;
+    ce_tail = r;
+}
+
+static void ce_call(mx_node_t* node, const char* method_name, js_val* args, int argc) {
+    js_val self = js_wrap_node(node);
+    js_val fn = js_get_c(self, method_name);
+    if (!js_rt.ctl && js_is_callable(fn)) js_call(fn, self, args, argc);
+    if (js_rt.ctl == CTL_THROW) js_report_exception();
+    js_rt.ctl = CTL_NONE;
+}
+
+static int ce_observes(ce_def* d, const char* name) {
+    if (!d->observed) return 0;
+    for (uint32_t i = 0; i < d->observed->length; i++) {
+        js_val v = d->observed->items[i];
+        if (v.type == JS_STR && mx_streq_nocase(v.u.str->data, name)) return 1;
+    }
+    return 0;
+}
+
+static void ce_upgrade(mx_node_t* node) {
+    ce_def* d = ce_lookup(node->tag);
+    if (!d || node->ce_state) return;
+    node->ce_state = 1;
+    js_val self = js_wrap_node(node);
+    ce_pending_node = node;
+    js_construct_this_override = self.u.obj;
+    js_construct(js_obj_val(d->ctor), NULL, 0);
+    js_construct_this_override = NULL;
+    ce_pending_node = NULL;
+    if (js_rt.ctl == CTL_THROW) {
+        js_report_exception();
+        js_rt.ctl = CTL_NONE;
+        node->ce_state = 2;
+        return;
+    }
+    js_rt.ctl = CTL_NONE;
+    for (mx_attr_t* a = node->attrs; a; a = a->next)
+        if (ce_observes(d, a->name)) {
+            js_val args[3] = {js_str_val(js_cstr(a->name)), js_null(), js_str_val(js_cstr(a->value ? a->value : ""))};
+            ce_call(node, "attributeChangedCallback", args, 3);
+        }
+    if (node_connected(node)) ce_call(node, "connectedCallback", NULL, 0);
+}
+
+static void ce_flush(void) {
+    if (ce_flushing) return;
+    ce_flushing = 1;
+    while (ce_head) {
+        ce_reaction* r = ce_head;
+        ce_head = r->next;
+        if (!ce_head) ce_tail = NULL;
+        switch (r->type) {
+        case CE_UPGRADE: ce_upgrade(r->node); break;
+        case CE_CONNECTED:
+            if (r->node->ce_state == 1 && node_connected(r->node)) ce_call(r->node, "connectedCallback", NULL, 0);
+            break;
+        case CE_DISCONNECTED:
+            if (r->node->ce_state == 1) ce_call(r->node, "disconnectedCallback", NULL, 0);
+            break;
+        case CE_ATTR: {
+            js_val args[3] = {r->name, r->old_value, r->new_value};
+            if (r->node->ce_state == 1) ce_call(r->node, "attributeChangedCallback", args, 3);
+            break;
+        }
+        }
+    }
+    ce_flushing = 0;
+}
+
+static js_val ce_flush_task(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc; (void)callee;
+    ce_flush_scheduled = 0;
+    ce_flush();
+    return js_undef();
+}
+
+static js_val mo_deliver_task(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc; (void)callee;
+    js_obj* records = mo_records;
+    mo_records = NULL;
+    if (!records || !records->length) return js_undef();
+    js_val deliver = js_get_c(js_obj_val(js_global), "__mxMODeliver");
+    if (js_is_callable(deliver)) {
+        js_val list = js_obj_val(records);
+        js_call(deliver, js_undef(), &list, 1);
+    }
+    return js_undef();
+}
+
+static void mo_record(int kind, mx_node_t* target, mx_node_t* node, const char* name, const char* old_value) {
+    if (!mo_records) {
+        mo_records = js_new_array(0);
+        js_enqueue_microtask(js_obj_val(js_new_native("", mo_deliver_task, 0)), js_undef());
+    }
+    js_obj* r = js_new_array(7);
+    js_array_push(r, js_num(kind));
+    js_array_push(r, js_wrap_node(target));
+    js_array_push(r, node ? js_wrap_node(node) : js_null());
+    js_array_push(r, name ? js_str_val(js_cstr(name)) : js_null());
+    js_array_push(r, old_value ? js_str_val(js_cstr(old_value)) : js_null());
+    js_array_push(r, node && node->prev ? js_wrap_node(node->prev) : js_null());
+    js_array_push(r, node && node->next ? js_wrap_node(node->next) : js_null());
+    js_array_push(mo_records, js_obj_val(r));
+}
+
+static void dom_hook(int kind, mx_node_t* target, mx_node_t* node, const char* name, const char* old_value) {
+    if (!js_doc || js_rt.out_of_memory) return;
+    if (mo_enabled) {
+        if (kind == MX_MUT_ADDED || kind == MX_MUT_REMOVING) mo_record(kind == MX_MUT_ADDED ? 0 : 1, target, node, NULL, NULL);
+        else if (kind == MX_MUT_ATTR) mo_record(3, target, NULL, name, old_value);
+        else if (kind == MX_MUT_TEXT) mo_record(4, target, NULL, NULL, old_value);
+    }
+    if (!ce_count) return;
+    int queued = 0;
+    if (kind == MX_MUT_ADDED && node->type != MX_NODE_TEXT) {
+        int connected = node_connected(target);
+        for (mx_node_t* e = node; e; e = mx_dom_next(node, e)) {
+            if (e->type != MX_NODE_ELEMENT || !ce_lookup(e->tag)) continue;
+            if (!e->ce_state) ce_queue(CE_UPGRADE, e, js_undef(), js_undef(), js_undef());
+            else if (connected) ce_queue(CE_CONNECTED, e, js_undef(), js_undef(), js_undef());
+            queued = 1;
+        }
+    } else if (kind == MX_MUT_REMOVING) {
+        removing_connected = node_connected(target);
+    } else if (kind == MX_MUT_REMOVED && removing_connected) {
+        for (mx_node_t* e = node; e; e = mx_dom_next(node, e))
+            if (e->type == MX_NODE_ELEMENT && e->ce_state == 1) {
+                ce_queue(CE_DISCONNECTED, e, js_undef(), js_undef(), js_undef());
+                queued = 1;
+            }
+    } else if (kind == MX_MUT_ATTR && target->ce_state == 1) {
+        ce_def* d = ce_lookup(target->tag);
+        if (d && ce_observes(d, name)) {
+            const char* now = mx_dom_attr(target, name);
+            ce_queue(CE_ATTR, target, js_str_val(js_cstr(name)),
+                     old_value ? js_str_val(js_cstr(old_value)) : js_null(),
+                     now ? js_str_val(js_cstr(now)) : js_null());
+            queued = 1;
+        }
+    }
+    if (!queued) return;
+    if (js_running && !ce_flushing) ce_flush();
+    else if (!ce_flush_scheduled) {
+        ce_flush_scheduled = 1;
+        js_enqueue_microtask(js_obj_val(js_new_native("", ce_flush_task, 0)), js_undef());
+    }
+}
+
+/* HTMLElement(): only for custom element classes (`super()` in their
+ * constructor, or `new MyElement()`). */
+static js_val html_element_ctor(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)args; (void)argc; (void)callee;
+    if (ce_pending_node) {
+        mx_node_t* n = ce_pending_node;
+        ce_pending_node = NULL;
+        return js_wrap_node(n);
+    }
+    ce_def* d = js_super_new_target ? ce_by_ctor(js_super_new_target) : NULL;
+    if (!d) return js_throw_error("TypeError", "Illegal constructor");
+    mx_node_t* n = mx_dom_create_element(js_doc, d->name);
+    if (!n) return js_throw_error("TypeError", "Illegal constructor");
+    n->ce_state = 1;
+    return js_wrap_node(n);
+}
+
+static js_val ce_method(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self;
+    js_str* name = js_to_string(ARG(0));
+    char lower[96];
+    size_t k = 0;
+    for (; k < name->length && k + 1 < sizeof(lower); k++) lower[k] = mx_lower(name->data[k]);
+    lower[k] = '\0';
+    switch (callee->magic) {
+    case 0: {   /* define */
+        if (!strchr(lower, '-') || !(lower[0] >= 'a' && lower[0] <= 'z'))
+            return js_throw_error("SyntaxError", "is not a valid custom element name");
+        if (!js_is_callable(ARG(1))) return js_throw_error("TypeError", "The constructor is not a function");
+        if (ce_lookup(lower)) return js_throw_error("NotSupportedError", "this name has already been used with this registry");
+        if (ce_count >= CE_MAX) return js_undef();
+        ce_def* d = &ce_defs[ce_count];
+        d->name = js_intern_c(lower)->data;
+        d->ctor = ARG(1).u.obj;
+        js_val observed = js_get_c(ARG(1), "observedAttributes");
+        if (js_rt.ctl) return js_undef();
+        d->observed = NULL;
+        if (observed.type == JS_OBJ) {
+            js_val from = js_get(js_get_c(js_obj_val(js_global), "Array"), js_intern_c("from"));
+            js_val list = js_call(from, js_undef(), &observed, 1);
+            if (js_rt.ctl) return js_undef();
+            if (list.type == JS_OBJ) d->observed = list.u.obj;
+        }
+        ce_count++;
+        /* upgrade the elements already in the document, in tree order */
+        for (mx_node_t* e = js_doc->root; e; e = mx_dom_next(js_doc->root, e))
+            if (e->type == MX_NODE_ELEMENT && !e->ce_state && !strcmp(e->tag, d->name))
+                ce_queue(CE_UPGRADE, e, js_undef(), js_undef(), js_undef());
+        ce_flush();
+        js_val waiting = ce_waiting ? js_get_c(js_obj_val(ce_waiting), d->name) : js_undef();
+        if (waiting.type == JS_OBJ && waiting.u.obj->length >= 1)
+            js_promise_settle(waiting.u.obj->items[0].u.obj, ARG(1), 0);
+        return js_undef();
+    }
+    case 1: {   /* get */
+        ce_def* d = ce_lookup(lower);
+        return d ? js_obj_val(d->ctor) : js_undef();
+    }
+    case 2: {   /* whenDefined */
+        ce_def* d = ce_lookup(lower);
+        if (d) return js_promise_resolved(js_obj_val(d->ctor), 0);
+        if (!ce_waiting) ce_waiting = js_new_object(NULL);
+        js_val waiting = js_get_c(js_obj_val(ce_waiting), lower);
+        if (waiting.type != JS_OBJ) {
+            js_obj* pair = js_new_array(1);
+            js_array_push(pair, js_obj_val(js_promise_new()));
+            js_set_c(js_obj_val(ce_waiting), lower, js_obj_val(pair));
+            waiting = js_obj_val(pair);
+        }
+        return waiting.u.obj->items[0];
+    }
+    case 3: {   /* upgrade(root) */
+        mx_node_t* root = node_of(ARG(0));
+        for (mx_node_t* e = root; e; e = mx_dom_next(root, e))
+            if (e->type == MX_NODE_ELEMENT && !e->ce_state && ce_lookup(e->tag))
+                ce_queue(CE_UPGRADE, e, js_undef(), js_undef(), js_undef());
+        ce_flush();
+        return js_undef();
+    }
+    case 4:   /* __mxMOEnable */
+        mo_enabled = js_truthy(ARG(0));
+        return js_undef();
+    }
+    return js_undef();
+}
+
+static js_val css_supports_fn(js_val self, js_val* args, int argc, js_obj* callee) {
+    (void)self; (void)callee;
+    char buffer[512];
+    if (argc >= 2) {
+        mx_copy(buffer, sizeof(buffer), "(");
+        mx_append(buffer, sizeof(buffer), js_to_string(args[0])->data);
+        mx_append(buffer, sizeof(buffer), ":");
+        mx_append(buffer, sizeof(buffer), js_to_string(args[1])->data);
+        mx_append(buffer, sizeof(buffer), ")");
+    } else {
+        mx_copy(buffer, sizeof(buffer), js_to_string(ARG(0))->data);
+        /* CSS.supports("display: grid") without parentheses */
+        const char* t = buffer;
+        while (mx_is_space(*t)) t++;
+        if (*t != '(' && strncmp(t, "not", 3) && strncmp(t, "selector(", 9)) {
+            char wrapped[516];
+            mx_copy(wrapped, sizeof(wrapped), "(");
+            mx_append(wrapped, sizeof(wrapped), buffer);
+            mx_append(wrapped, sizeof(wrapped), ")");
+            mx_copy(buffer, sizeof(buffer), wrapped);
+        }
+    }
+    return js_bool(mx_css_supports(buffer, strlen(buffer)));
+}
+
+static void ce_created(mx_node_t* e) {
+    if (ce_count && ce_lookup(e->tag)) ce_upgrade(e);
+}
+
+static void ce_reset(void) {
+    mo_enabled = 0;
+    mo_records = NULL;
+    memset(ce_defs, 0, sizeof(ce_defs));
+    ce_count = 0;
+    ce_waiting = NULL;
+    ce_head = ce_tail = NULL;
+    ce_flushing = ce_flush_scheduled = 0;
+    ce_pending_node = NULL;
+}
+
 void js_dom_init(void) {
+    ce_reset();
     for (int i = 0; i < G_COUNT; i++) getter_keys[i] = js_intern_c(getter_names[i]);
     build_getter_table();
     window_listeners = NULL;
@@ -2867,8 +3287,8 @@ void js_dom_init(void) {
     method(ep, "getClientRects", el_geometry, 1);
     method(ep, "scrollIntoView", el_geometry, 2);
     method(ep, "click", el_misc, 0);
-    method(ep, "focus", el_misc, 1);
-    method(ep, "blur", el_misc, 1);
+    method(ep, "focus", el_misc, 20);
+    method(ep, "blur", el_misc, 21);
     method(ep, "select", el_misc, 1);
     method(ep, "setSelectionRange", el_misc, 1);
     method(ep, "scrollTo", el_misc, 1);
@@ -2923,14 +3343,58 @@ void js_dom_init(void) {
     if (at.type == JS_OBJ) method(js_array_proto, "item", at.u.obj->native, 0);
 
     /* constructors for instanceof checks */
-    static const char* const element_types[] = {
-        "Element", "HTMLElement", "HTMLDivElement", "HTMLInputElement", "HTMLAnchorElement",
-        "HTMLButtonElement", "HTMLFormElement", "HTMLImageElement", "HTMLSelectElement",
-        "HTMLTextAreaElement", "HTMLScriptElement", "HTMLCanvasElement", "HTMLSpanElement",
-        "HTMLBodyElement", "HTMLIFrameElement", "HTMLTemplateElement", "SVGElement",
-        "HTMLMediaElement", "HTMLVideoElement", "HTMLLinkElement", "HTMLStyleElement"};
-    for (size_t i = 0; i < sizeof(element_types) / sizeof(element_types[0]); i++)
-        global_ctor(element_types[i], illegal_ctor, 0, element_proto);
+    /* each element interface has its own prototype (picked by tag name in
+     * js_wrap_node), so `x instanceof HTMLIFrameElement` is only true for
+     * iframes and pages can patch e.g. HTMLInputElement.prototype */
+    static const struct { const char* name; const char* tags; int parent; } element_types[] = {
+        {"Element", NULL, -1}, {"HTMLElement", NULL, -1},
+        {"HTMLDivElement", "div", 1}, {"HTMLInputElement", "input", 1},
+        {"HTMLAnchorElement", "a", 1}, {"HTMLButtonElement", "button", 1},
+        {"HTMLFormElement", "form", 1}, {"HTMLImageElement", "img", 1},
+        {"HTMLSelectElement", "select", 1}, {"HTMLTextAreaElement", "textarea", 1},
+        {"HTMLScriptElement", "script", 1}, {"HTMLCanvasElement", "canvas", 1},
+        {"HTMLSpanElement", "span", 1}, {"HTMLBodyElement", "body", 1},
+        {"HTMLIFrameElement", "iframe", 1}, {"HTMLTemplateElement", "template", 1},
+        {"SVGElement", "svg g path circle rect line polyline polygon ellipse text tspan use defs "
+                       "symbol lineargradient radialgradient stop clippath mask pattern image", 1},
+        {"HTMLMediaElement", NULL, 1}, {"HTMLVideoElement", "video", 17},
+        {"HTMLAudioElement", "audio", 17}, {"HTMLLinkElement", "link", 1},
+        {"HTMLStyleElement", "style", 1}, {"HTMLParagraphElement", "p", 1},
+        {"HTMLHeadingElement", "h1 h2 h3 h4 h5 h6", 1}, {"HTMLUListElement", "ul", 1},
+        {"HTMLOListElement", "ol", 1}, {"HTMLLIElement", "li", 1},
+        {"HTMLTableElement", "table", 1}, {"HTMLTableRowElement", "tr", 1},
+        {"HTMLTableCellElement", "td th", 1}, {"HTMLTableSectionElement", "thead tbody tfoot", 1},
+        {"HTMLLabelElement", "label", 1}, {"HTMLOptionElement", "option", 1},
+        {"HTMLHeadElement", "head", 1}, {"HTMLHtmlElement", "html", 1},
+        {"HTMLMetaElement", "meta", 1}, {"HTMLTitleElement", "title", 1},
+        {"HTMLDialogElement", "dialog", 1}, {"HTMLDetailsElement", "details", 1},
+        {"HTMLPreElement", "pre", 1}, {"HTMLBRElement", "br", 1}, {"HTMLHRElement", "hr", 1},
+        {"HTMLSourceElement", "source", 1}, {"HTMLPictureElement", "picture", 1},
+        {"HTMLFieldSetElement", "fieldset", 1}, {"HTMLSlotElement", "slot", 1},
+        {"HTMLQuoteElement", "blockquote q", 1}, {"HTMLOptGroupElement", "optgroup", 1},
+        {"HTMLProgressElement", "progress", 1}, {"HTMLOutputElement", "output", 1}};
+    js_obj* type_protos[sizeof(element_types) / sizeof(element_types[0])];
+    tag_proto_count = 0;
+    for (size_t i = 0; i < sizeof(element_types) / sizeof(element_types[0]); i++) {
+        js_obj* proto = element_proto;
+        if (element_types[i].parent >= 0) {
+            proto = js_new_object(type_protos[element_types[i].parent]);
+            js_define(proto, "@@toStringTag", js_str_val(js_intern_c(element_types[i].name)), PROP_HIDDEN);
+        }
+        type_protos[i] = proto;
+        global_ctor(element_types[i].name, i ? html_element_ctor : illegal_ctor, 0, proto);
+        for (const char* t = element_types[i].tags; t && *t;) {
+            const char* end = strchr(t, ' ');
+            size_t n = end ? (size_t)(end - t) : strlen(t);
+            if (tag_proto_count < TAG_PROTOS && n < sizeof(tag_protos[0].tag)) {
+                memcpy(tag_protos[tag_proto_count].tag, t, n);
+                tag_protos[tag_proto_count].tag[n] = '\0';
+                tag_protos[tag_proto_count++].proto = proto;
+            }
+            t += n;
+            while (*t == ' ') t++;
+        }
+    }
     global_ctor("Node", illegal_ctor, 0, node_proto);
     global_ctor("Text", illegal_ctor, 0, text_proto);
     global_ctor("CharacterData", illegal_ctor, 0, text_proto);
@@ -3091,8 +3555,8 @@ void js_dom_init(void) {
     io->data = io;   /* marks the intersection variant */
     global_ctor("ResizeObserver", observer_method, 0, NULL);
     global_ctor("PerformanceObserver", observer_method, 0, NULL);
-    global_ctor("Image", image_ctor, 0, element_proto);
-    global_ctor("Option", image_ctor, 1, element_proto);
+    global_ctor("Image", image_ctor, 0, element_proto_for("img"));
+    global_ctor("Option", image_ctor, 1, element_proto_for("option"));
     global_ctor("URL", url_ctor, 0, NULL);
     global_ctor("URLSearchParams", params_method, 0, NULL);
 
@@ -3107,12 +3571,14 @@ void js_dom_init(void) {
     js_define(w, "crypto", js_obj_val(crypto), PROP_HIDDEN);
 
     js_obj* custom_elements = js_new_object(js_object_proto);
-    method(custom_elements, "define", noop, 0);
-    method(custom_elements, "get", noop, 0);
-    method(custom_elements, "whenDefined", noop, 0);
+    method(custom_elements, "define", ce_method, 0);
+    method(custom_elements, "get", ce_method, 1);
+    method(custom_elements, "whenDefined", ce_method, 2);
+    method(custom_elements, "upgrade", ce_method, 3);
+    method(w, "__mxMOEnable", ce_method, 4);
     js_define(w, "customElements", js_obj_val(custom_elements), PROP_HIDDEN);
     js_obj* css = js_new_object(js_object_proto);
-    method(css, "supports", false_fn, 0);
+    method(css, "supports", css_supports_fn, 0);
     js_define(w, "CSS", js_obj_val(css), PROP_HIDDEN);
 }
 
@@ -3198,17 +3664,275 @@ static const char js_prelude[] =
 " if(cp&&!cp[Symbol.iterator])cp[Symbol.iterator]=function(){var a=[];for(var i=0;i<this.length;i++)a.push(this.item(i));return a[Symbol.iterator]();};}catch(e){}\n"
 "})();\n";
 
-static void run_prelude(void) {
+/* Newer language built-ins and spec-exact Promise combinators, written in
+ * JavaScript on top of the native core: Promise.all/allSettled/race/any
+ * that wait for pending promises, finally() that keeps the value or error,
+ * withResolvers/try, Array toSorted/toReversed/toSpliced/with/copyWithin/
+ * fromAsync, Object.groupBy, Map.groupBy, getOwnPropertyDescriptors,
+ * String.raw, Set methods, JSON.parse revivers, WeakRef,
+ * FinalizationRegistry, Blob, File, FormData and a small en-US Intl
+ * (prelude/lang.js); MutationObserver, Node constants, <template>.content,
+ * shadowRoot, form.elements, CSS.escape and structuredClone
+ * (prelude/dom.js). Sources: the prelude directory, embedded by
+ * tools/gen_prelude.py. */
+/* BEGIN GENERATED PRELUDE (tools/gen_prelude.py) */
+static const char js_lang_prelude[] =
+/* prelude/lang.js */
+"(function(){\n"
+"var G=window,def=function(o,n,f){Object.defineProperty(o,n,{value:f,writable:true,configurable:true});};\n"
+"var P=Promise,PP=P.prototype;\n"
+"def(PP,'finally',function(f){var C=this;if(typeof f!=='function')return this.then(f,f);\n"
+" return this.then(function(v){return P.resolve(f()).then(function(){return v;});},\n"
+"  function(e){return P.resolve(f()).then(function(){throw e;});});});\n"
+"var each=function(list,fn){var a=Array.from(list);for(var i=0;i<a.length;i++)fn(a[i],i);return a.length;};\n"
+"def(P,'all',function(list){return new P(function(res,rej){var out=[],left=0,n=each(list,function(x,i){left++;\n"
+" P.resolve(x).then(function(v){out[i]=v;if(--left===0)res(out);},rej);});out.length=n;if(!left)res(out);});});\n"
+"def(P,'allSettled',function(list){return new P(function(res){var out=[],left=0,n=each(list,function(x,i){left++;\n"
+" P.resolve(x).then(function(v){out[i]={status:'fulfilled',value:v};if(--left===0)res(out);},\n"
+"  function(e){out[i]={status:'rejected',reason:e};if(--left===0)res(out);});});out.length=n;if(!left)res(out);});});\n"
+"def(P,'race',function(list){return new P(function(res,rej){each(list,function(x){P.resolve(x).then(res,rej);});});});\n"
+"def(P,'any',function(list){return new P(function(res,rej){var errs=[],left=0,n=each(list,function(x,i){left++;\n"
+" P.resolve(x).then(res,function(e){errs[i]=e;if(--left===0){var a=new AggregateError(errs,'All promises were rejected');a.errors=errs;rej(a);}});});\n"
+" if(!n){var a=new AggregateError([],'All promises were rejected');a.errors=[];rej(a);}});});\n"
+"def(P,'withResolvers',function(){var o={};o.promise=new P(function(a,b){o.resolve=a;o.reject=b;});return o;});\n"
+"def(P,'try',function(f){var args=[].slice.call(arguments,1);return new P(function(r){r(f.apply(undefined,args));});});\n"
+"var AP=Array.prototype;\n"
+"def(AP,'toSorted',function(c){return this.slice().sort(c);});\n"
+"def(AP,'toReversed',function(){return this.slice().reverse();});\n"
+"def(AP,'toSpliced',function(){var a=this.slice();a.splice.apply(a,arguments);return a;});\n"
+"def(AP,'with',function(i,v){var n=this.length;i=Math.trunc(+i)||0;if(i<0)i+=n;if(i<0||i>=n)throw new RangeError('Invalid index : '+i);var a=this.slice();a[i]=v;return a;});\n"
+"def(AP,'copyWithin',function(t,s,e){var n=this.length,rel=function(x,d){x=x===undefined?d:Math.trunc(+x)||0;return x<0?Math.max(n+x,0):Math.min(x,n);};\n"
+" t=rel(t,0);s=rel(s,0);e=rel(e,n);var c=Math.min(e-s,n-t),tmp=this.slice(s,s+c);for(var i=0;i<c;i++)this[t+i]=tmp[i];return this;});\n"
+"def(Array,'fromAsync',async function(src,map,self){var out=[],i=0;\n"
+" if(src&&typeof src[Symbol.asyncIterator]==='function'){for await(var v of src)out.push(map?await map.call(self,v,i++):v);}\n"
+" else{var a=Array.from(src);for(var k=0;k<a.length;k++){var w=await a[k];out.push(map?await map.call(self,w,k):w);}}return out;});\n"
+"var groupBy=function(items,fn,map){var o=map?new Map():Object.create(null),i=0;each(items,function(x){var k=fn(x,i++);\n"
+" if(map){if(!o.has(k))o.set(k,[]);o.get(k).push(x);}else{if(!(k in o))o[k]=[];o[k].push(x);}});return o;};\n"
+"def(Object,'groupBy',function(a,f){return groupBy(a,f,false);});\n"
+"def(Map,'groupBy',function(a,f){return groupBy(a,f,true);});\n"
+"def(Object,'getOwnPropertyDescriptors',function(o){var r={},k=Reflect.ownKeys(o);for(var i=0;i<k.length;i++){var d=Object.getOwnPropertyDescriptor(o,k[i]);if(d)r[k[i]]=d;}return r;});\n"
+"def(String,'raw',function(s){var raw=s.raw,out='';for(var i=0;i<raw.length;i++){out+=raw[i];if(i+1<raw.length&&i+1<arguments.length)out+=arguments[i+1];}return out;});\n"
+"def(String.prototype,'isWellFormed',function(){return true;});\n"
+"def(String.prototype,'toWellFormed',function(){return String(this);});\n"
+"/* symbols are strings inside the engine (\"@@sym:desc:n\"); give them a prototype */\n"
+"var symDesc=function(s){s=String(s);var m=/^@@sym:([\\s\\S]*):\\d+$/.exec(s);if(m)return m[1];m=/^@@for:([\\s\\S]*)$/.exec(s);if(m)return m[1];\n"
+" return s.slice(0,2)==='@@'?'Symbol.'+s.slice(2):undefined;};\n"
+"if(!Symbol.prototype){var SyP={};def(SyP,'toString',function(){return 'Symbol('+(symDesc(this)||'')+')';});\n"
+" def(SyP,'valueOf',function(){return this;});Object.defineProperty(SyP,'description',{get:function(){return symDesc(this);},configurable:true});\n"
+" def(Symbol,'prototype',SyP);def(SyP,'constructor',Symbol);}\n"
+"Object.defineProperty(String.prototype,'description',{get:function(){return symDesc(this);},configurable:true});\n"
+"def(Symbol,'keyFor',function(s){var m=/^@@for:([\\s\\S]*)$/.exec(String(s));return m?m[1]:undefined;});\n"
+"var SP=Set.prototype,setOf=function(x){return x instanceof Set?x:new Set(x.keys?Array.from(x.keys()):x);};\n"
+"def(SP,'union',function(o){var r=new Set(this);setOf(o).forEach(function(v){r.add(v);});return r;});\n"
+"def(SP,'intersection',function(o){var s=setOf(o),r=new Set();this.forEach(function(v){if(s.has(v))r.add(v);});return r;});\n"
+"def(SP,'difference',function(o){var s=setOf(o),r=new Set();this.forEach(function(v){if(!s.has(v))r.add(v);});return r;});\n"
+"def(SP,'symmetricDifference',function(o){var s=setOf(o),me=this,r=new Set();this.forEach(function(v){if(!s.has(v))r.add(v);});s.forEach(function(v){if(!me.has(v))r.add(v);});return r;});\n"
+"def(SP,'isSubsetOf',function(o){var s=setOf(o),ok=true;this.forEach(function(v){if(!s.has(v))ok=false;});return ok;});\n"
+"def(SP,'isSupersetOf',function(o){var me=this,ok=true;setOf(o).forEach(function(v){if(!me.has(v))ok=false;});return ok;});\n"
+"def(SP,'isDisjointFrom',function(o){var s=setOf(o),ok=true;this.forEach(function(v){if(s.has(v))ok=false;});return ok;});\n"
+"var parse=JSON.parse;\n"
+"def(JSON,'parse',function(text,reviver){var v=parse(text);if(typeof reviver!=='function')return v;\n"
+" var walk=function(holder,key){var val=holder[key];if(val&&typeof val==='object'){var ks=Array.isArray(val)?Object.keys(val):Object.keys(val);\n"
+"  for(var i=0;i<ks.length;i++){var nv=walk(val,ks[i]);if(nv===undefined)delete val[ks[i]];else val[ks[i]]=nv;}}\n"
+"  return reviver.call(holder,key,val);};return walk({'':v},'');});\n"
+"if(!G.WeakRef){var WR=function(t){if(t===null||(typeof t!=='object'&&typeof t!=='function'))throw new TypeError('WeakRef: invalid target');this._t=t;};\n"
+" def(WR.prototype,'deref',function(){return this._t;});G.WeakRef=WR;}\n"
+"if(!G.FinalizationRegistry){var FR=function(cb){this._cb=cb;};def(FR.prototype,'register',function(){});def(FR.prototype,'unregister',function(){return false;});G.FinalizationRegistry=FR;}\n"
+"if(!G.Blob){var B=function(parts,opt){var s='';parts=parts||[];for(var i=0;i<parts.length;i++){var p=parts[i];s+=p instanceof B?p._s:\n"
+"  (p&&p.byteLength!==undefined&&typeof TextDecoder!=='undefined')?new TextDecoder().decode(p):String(p);}\n"
+"  this._s=s;this.type=opt&&opt.type?String(opt.type).toLowerCase():'';this.size=typeof TextEncoder!=='undefined'?new TextEncoder().encode(s).length:s.length;};\n"
+" def(B.prototype,'text',function(){return Promise.resolve(this._s);});\n"
+" def(B.prototype,'arrayBuffer',function(){return Promise.resolve(new TextEncoder().encode(this._s).buffer);});\n"
+" def(B.prototype,'slice',function(a,b,t){return new B([this._s.slice(a,b)],{type:t||''});});\n"
+" G.Blob=B;var F=function(parts,name,opt){B.call(this,parts,opt);this.name=String(name);this.lastModified=(opt&&opt.lastModified)||Date.now();};\n"
+" F.prototype=Object.create(B.prototype);F.prototype.constructor=F;G.File=F;}\n"
+"if(!G.FormData){var FD=function(form){this._e=[];if(form&&form.elements){for(var i=0;i<form.elements.length;i++){var el=form.elements[i];\n"
+"  if(!el.name||el.disabled)continue;var t=(el.type||'').toLowerCase();if((t==='checkbox'||t==='radio')&&!el.checked)continue;\n"
+"  if(t==='submit'||t==='button'||t==='reset'||t==='file')continue;this._e.push([el.name,String(el.value)]);}}};\n"
+" var fp=FD.prototype;def(fp,'append',function(k,v){this._e.push([String(k),v instanceof Blob?v:String(v)]);});\n"
+" def(fp,'set',function(k,v){this.delete(k);this.append(k,v);});\n"
+" def(fp,'get',function(k){for(var i=0;i<this._e.length;i++)if(this._e[i][0]===String(k))return this._e[i][1];return null;});\n"
+" def(fp,'getAll',function(k){return this._e.filter(function(e){return e[0]===String(k);}).map(function(e){return e[1];});});\n"
+" def(fp,'has',function(k){return this.get(k)!==null;});\n"
+" def(fp,'delete',function(k){this._e=this._e.filter(function(e){return e[0]!==String(k);});});\n"
+" def(fp,'forEach',function(f,t){var me=this;this._e.forEach(function(e){f.call(t,e[1],e[0],me);});});\n"
+" def(fp,'entries',function(){return this._e.map(function(e){return [e[0],e[1]];})[Symbol.iterator]();});\n"
+" def(fp,'keys',function(){return this._e.map(function(e){return e[0];})[Symbol.iterator]();});\n"
+" def(fp,'values',function(){return this._e.map(function(e){return e[1];})[Symbol.iterator]();});\n"
+" def(fp,Symbol.iterator,fp.entries);G.FormData=FD;}\n"
+"if(!G.Intl){var opts=function(o){return o||{};},pad=function(n){return n<10?'0'+n:''+n;};\n"
+" var NF=function(loc,o){this._o=opts(o);};\n"
+" def(NF.prototype,'format',function(n){var o=this._o;n=+n;var min=o.minimumFractionDigits,max=o.maximumFractionDigits;\n"
+"  if(o.style==='percent')n*=100;if(max===undefined)max=o.style==='currency'?2:(o.style==='percent'?0:3);if(min===undefined)min=o.style==='currency'?2:0;if(max<min)max=min;\n"
+"  var s=n.toFixed(max);if(max>min)s=s.replace(new RegExp('0{1,'+(max-min)+'}$'),'').replace(/\\.$/,'');\n"
+"  var parts=s.split('.');if(o.useGrouping!==false)parts[0]=parts[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');s=parts.join('.');\n"
+"  if(o.style==='percent')s+='%';if(o.style==='currency'){var sym={USD:'$',EUR:'€',GBP:'£',JPY:'¥',SEK:'kr '}[o.currency]||(o.currency+' ');s=s.charAt(0)==='-'?'-'+sym+s.slice(1):sym+s;}\n"
+"  return s;});\n"
+" def(NF.prototype,'formatToParts',function(n){return [{type:'literal',value:this.format(n)}];});\n"
+" def(NF.prototype,'resolvedOptions',function(){return Object.assign({locale:'en-US',numberingSystem:'latn'},this._o);});\n"
+" var DF=function(loc,o){this._o=opts(o);};\n"
+" def(DF.prototype,'format',function(d){d=d===undefined?new Date():new Date(d);var o=this._o;\n"
+"  var M=['January','February','March','April','May','June','July','August','September','October','November','December'];\n"
+"  var W=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];var out=[];\n"
+"  if(o.weekday)out.push(o.weekday==='long'?W[d.getDay()]:W[d.getDay()].slice(0,3));\n"
+"  if(o.month==='long'||o.month==='short'){var m=o.month==='long'?M[d.getMonth()]:M[d.getMonth()].slice(0,3);out.push(m+(o.day?' '+d.getDate():'')+(o.year?', '+d.getFullYear():''));}\n"
+"  else if(o.year||o.month||o.day||(!o.hour&&!o.minute&&!o.timeStyle)){out.push((d.getMonth()+1)+'/'+d.getDate()+'/'+d.getFullYear());}\n"
+"  if(o.hour||o.minute||o.timeStyle){var h=d.getHours(),h12=o.hour12!==false&&o.hourCycle!=='h23';\n"
+"   out.push((h12?(h%12||12):pad(h))+':'+pad(d.getMinutes())+(o.second?':'+pad(d.getSeconds()):'')+(h12?(h<12?' AM':' PM'):''));}\n"
+"  return out.join(', ');});\n"
+" def(DF.prototype,'formatToParts',function(d){return [{type:'literal',value:this.format(d)}];});\n"
+" def(DF.prototype,'resolvedOptions',function(){return Object.assign({locale:'en-US',calendar:'gregory',numberingSystem:'latn',timeZone:'UTC'},this._o);});\n"
+" var CO=function(loc,o){this._o=opts(o);};\n"
+" def(CO.prototype,'compare',function(a,b){a=String(a);b=String(b);if(this._o.sensitivity==='base'||this._o.sensitivity==='accent'){a=a.toLowerCase();b=b.toLowerCase();}\n"
+"  if(this._o.numeric){var na=parseFloat(a),nb=parseFloat(b);if(!isNaN(na)&&!isNaN(nb)&&na!==nb)return na<nb?-1:1;}return a<b?-1:a>b?1:0;});\n"
+" def(CO.prototype,'resolvedOptions',function(){return {locale:'en-US',usage:'sort',sensitivity:'variant'};});\n"
+" var PR=function(loc,o){this._o=opts(o);};\n"
+" def(PR.prototype,'select',function(n){if(this._o.type==='ordinal'){var a=n%10,b=n%100;return a===1&&b!==11?'one':a===2&&b!==12?'two':a===3&&b!==13?'few':'other';}return n===1?'one':'other';});\n"
+" var RT=function(loc,o){this._o=opts(o);};\n"
+" def(RT.prototype,'format',function(v,u){u=String(u).replace(/s$/,'');var a=Math.abs(v),s=a+' '+u+(a===1?'':'s');return v<0?s+' ago':'in '+s;});\n"
+" var LF=function(loc,o){this._o=opts(o);};\n"
+" def(LF.prototype,'format',function(l){l=Array.from(l);var w=this._o.type==='disjunction'?'or':'and';return l.length<2?l.join(''):l.slice(0,-1).join(', ')+(l.length>2?',':'')+' '+w+' '+l[l.length-1];});\n"
+" var SG=function(loc,o){this._o=opts(o);};\n"
+" def(SG.prototype,'segment',function(s){s=String(s);var g=this._o.granularity||'grapheme',out=[],re=g==='word'?/\\w+|\\W/g:g==='sentence'?/[^.!?]+[.!?]*\\s*/g:null,m,i=0;\n"
+"  if(!re){var cs=Array.from(s);for(var k=0;k<cs.length;k++){out.push({segment:cs[k],index:i,input:s});i+=cs[k].length;}}\n"
+"  else while((m=re.exec(s))){out.push({segment:m[0],index:m.index,input:s,isWordLike:g==='word'?/\\w/.test(m[0]):undefined});}\n"
+"  return out;});\n"
+" var I={NumberFormat:NF,DateTimeFormat:DF,Collator:CO,PluralRules:PR,RelativeTimeFormat:RT,ListFormat:LF,Segmenter:SG,\n"
+"  getCanonicalLocales:function(l){return l===undefined?[]:[].concat(l);},supportedValuesOf:function(){return [];}};\n"
+" [NF,DF,CO,PR,RT,LF,SG].forEach(function(C){C.supportedLocalesOf=function(l){return l===undefined?[]:[].concat(l);};});\n"
+" G.Intl=I;}\n"
+"})();\n"
+/* prelude/dom.js */
+"(function(){\n"
+"var G=window,def=function(o,n,f){Object.defineProperty(o,n,{value:f,writable:true,configurable:true});},\n"
+" acc=function(o,n,g,s){Object.defineProperty(o,n,{get:g,set:s,configurable:true});};\n"
+"var NP=Node.prototype,EP=Element.prototype;\n"
+"var K={ELEMENT_NODE:1,ATTRIBUTE_NODE:2,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,\n"
+" DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11,DOCUMENT_POSITION_DISCONNECTED:1,DOCUMENT_POSITION_PRECEDING:2,\n"
+" DOCUMENT_POSITION_FOLLOWING:4,DOCUMENT_POSITION_CONTAINS:8,DOCUMENT_POSITION_CONTAINED_BY:16,DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC:32};\n"
+"for(var k in K){Object.defineProperty(Node,k,{value:K[k]});if(!(k in NP))Object.defineProperty(NP,k,{value:K[k]});}\n"
+"def(NP,'getRootNode',function(){var n=this;while(n.parentNode)n=n.parentNode;return n;});\n"
+"def(NP,'compareDocumentPosition',function(o){if(o===this)return 0;\n"
+" var chain=function(n){var a=[];while(n){a.unshift(n);n=n.parentNode;}return a;};var a=chain(this),b=chain(o);\n"
+" if(a[0]!==b[0])return 1|32|(a[0]<b[0]?2:4);var i=0;while(i<a.length&&i<b.length&&a[i]===b[i])i++;\n"
+" if(i===a.length)return 16|4;if(i===b.length)return 8|2;var p=a[i-1].childNodes;\n"
+" for(var j=0;j<p.length;j++){if(p[j]===a[i])return 4;if(p[j]===b[i])return 2;}return 4;});\n"
+"def(NP,'isSameNode',function(o){return this===o;});\n"
+"if(!NP.isEqualNode)def(NP,'isEqualNode',function(o){return !!o&&this.nodeType===o.nodeType&&(this.outerHTML!==undefined?this.outerHTML===o.outerHTML:this.textContent===o.textContent);});\n"
+"/* <template>.content: a fragment that holds the template's children */\n"
+"acc(EP,'content',function(){if(this.tagName!=='TEMPLATE')return this.getAttribute('content');\n"
+" var f=this.__mxContent;if(!f){f=document.createDocumentFragment();def(this,'__mxContent',f);}\n"
+" while(this.firstChild)f.appendChild(this.firstChild);return f;},function(v){if(this.tagName!=='TEMPLATE')this.setAttribute('content',v);});\n"
+"/* shadow roots: the host renders its shadow content in place of its children */\n"
+"var attach=EP.attachShadow;\n"
+"def(EP,'attachShadow',function(o){if(this.__mxShadow)throw new DOMException(\"Shadow root cannot be created on a host which already hosts a shadow tree.\",\"NotSupportedError\");\n"
+" var r=attach?attach.call(this,o):this;def(this,'__mxShadow',r);def(this,'__mxShadowMode',o&&o.mode||'open');return r;});\n"
+"acc(EP,'shadowRoot',function(){return this.__mxShadowMode==='open'?this.__mxShadow:null;});\n"
+"acc(EP,'host',function(){return this.__mxShadow===this?this:undefined;});\n"
+"acc(EP,'elements',function(){if(this.tagName!=='FORM'&&this.tagName!=='FIELDSET')return undefined;\n"
+" var l=this.querySelectorAll('input,select,textarea,button,fieldset,output,object');var me=this;\n"
+" Array.prototype.forEach.call(l,function(e){if(e.name&&!(e.name in l))l[e.name]=e;});l.namedItem=function(n){return l[n]||null;};return l;});\n"
+"if(typeof G.DOMException!=='function'){var DE=function(m,n){this.message=m||'';this.name=n||'Error';this.code=0;};DE.prototype=Object.create(Error.prototype);DE.prototype.constructor=DE;G.DOMException=DE;}\n"
+"/* CSS.escape */\n"
+"if(G.CSS)def(CSS,'escape',function(v){var s=String(v),out='';for(var i=0;i<s.length;i++){var c=s.charCodeAt(i),ch=s.charAt(i);\n"
+" if(c===0){out+='�';continue;}\n"
+" if((c>=1&&c<=31)||c===127||(i===0&&c>=48&&c<=57)||(i===1&&c>=48&&c<=57&&s.charCodeAt(0)===45)){out+='\\\\'+c.toString(16)+' ';continue;}\n"
+" if(i===0&&c===45&&s.length===1){out+='\\\\'+ch;continue;}\n"
+" if(c>=128||c===45||c===95||(c>=48&&c<=57)||(c>=65&&c<=90)||(c>=97&&c<=122)){out+=ch;continue;}out+='\\\\'+ch;}return out;});\n"
+"/* structuredClone with Map, Set, Date, RegExp, typed arrays and cycles */\n"
+"def(G,'structuredClone',function(v){var seen=new Map();var c=function(x){\n"
+" if(x===null||typeof x!=='object'){if(typeof x==='function'||typeof x==='symbol')throw new DOMException(String(x)+' could not be cloned.','DataCloneError');return x;}\n"
+" if(seen.has(x))return seen.get(x);var r;\n"
+" if(x instanceof Date)r=new Date(x.getTime());else if(x instanceof RegExp)r=new RegExp(x.source,x.flags);\n"
+" else if(x instanceof Map){r=new Map();seen.set(x,r);x.forEach(function(val,key){r.set(c(key),c(val));});return r;}\n"
+" else if(x instanceof Set){r=new Set();seen.set(x,r);x.forEach(function(val){r.add(c(val));});return r;}\n"
+" else if(typeof ArrayBuffer!=='undefined'&&ArrayBuffer.isView&&ArrayBuffer.isView(x))r=x.slice();\n"
+" else if(Array.isArray(x)){r=[];seen.set(x,r);for(var i=0;i<x.length;i++)r[i]=c(x[i]);return r;}\n"
+" else if(x instanceof Error){r=new Error(x.message);r.name=x.name;}\n"
+" else if(x.nodeType)throw new DOMException('Node could not be cloned.','DataCloneError');\n"
+" else{r={};seen.set(x,r);for(var k in x)if(Object.prototype.hasOwnProperty.call(x,k))r[k]=c(x[k]);return r;}\n"
+" seen.set(x,r);return r;};return c(v);});\n"
+"/* constructable stylesheets; adoptedStyleSheets become <style> elements in\n"
+" * <head> (:host is rewritten to the host's tag, as styles are global here) */\n"
+"if(!G.CSSStyleSheet){var SS=function(o){this._t='';this.cssRules=[];this.media=o&&o.media||'';this.disabled=false;this._owners=[];};\n"
+" var splitRules=function(t){var out=[],depth=0,start=0;for(var i=0;i<t.length;i++){var c=t.charAt(i);\n"
+"  if(c==='{')depth++;else if(c==='}'&&--depth===0){var r=t.slice(start,i+1).trim();if(r)out.push({cssText:r});start=i+1;}}return out;};\n"
+" var ssp=SS.prototype;\n"
+" def(ssp,'replaceSync',function(t){this._t=String(t);this.cssRules=splitRules(this._t);for(var i=0;i<this._owners.length;i++)adoptRefresh(this._owners[i]);});\n"
+" def(ssp,'replace',function(t){this.replaceSync(t);return Promise.resolve(this);});\n"
+" def(ssp,'insertRule',function(r,i){i=i||0;this.cssRules.splice(i,0,{cssText:String(r)});this.replaceSync(this.cssRules.map(function(x){return x.cssText;}).join('\\n'));return i;});\n"
+" def(ssp,'deleteRule',function(i){this.cssRules.splice(i,1);this.replaceSync(this.cssRules.map(function(x){return x.cssText;}).join('\\n'));});\n"
+" acc(ssp,'rules',function(){return this.cssRules;});\n"
+" G.CSSStyleSheet=SS;}\n"
+"var adoptRefresh=function(owner){var sheets=owner.__mxAdopted||[],el=owner.__mxAdoptStyle;\n"
+" if(!el){el=document.createElement('style');def(owner,'__mxAdoptStyle',el);(document.head||document.documentElement).appendChild(el);}\n"
+" var tag=owner.nodeType===1?owner.localName:null,text=sheets.map(function(x){return x._t||'';}).join('\\n');\n"
+" if(tag)text=text.replace(/:host\\(([^)]*)\\)/g,tag+'$1').replace(/:host\\b/g,tag);el.textContent=text;};\n"
+"var adoptAcc=function(o){acc(o,'adoptedStyleSheets',function(){return this.__mxAdopted||[];},function(v){var me=this,old=this.__mxAdopted||[];\n"
+" old.forEach(function(x){var i=x._owners?x._owners.indexOf(me):-1;if(i>=0)x._owners.splice(i,1);});\n"
+" var list=Array.from(v||[]);list.forEach(function(x){if(x._owners&&x._owners.indexOf(me)<0)x._owners.push(me);});\n"
+" def(this,'__mxAdopted',list);adoptRefresh(this);});};\n"
+"adoptAcc(Object.getPrototypeOf(document));adoptAcc(EP);\n"
+"/* DOMParser: parses into a detached <html> element and answers like a document */\n"
+"if(!G.DOMParser){var DP=function(){};def(DP.prototype,'parseFromString',function(str,type){\n"
+" var root=document.createElement('html');root.innerHTML=String(str);\n"
+" var head=root.querySelector('head'),body=root.querySelector('body');\n"
+" if(!body){body=document.createElement('body');var kids=Array.from(root.childNodes);for(var i=0;i<kids.length;i++)if(kids[i]!==head)body.appendChild(kids[i]);root.appendChild(body);}\n"
+" if(!head){head=document.createElement('head');root.insertBefore(head,root.firstChild);}\n"
+" var d={nodeType:9,nodeName:'#document',documentElement:root,head:head,body:body,contentType:type||'text/html',\n"
+"  childNodes:[root],firstChild:root,firstElementChild:root,children:[root],\n"
+"  querySelector:function(q){return root.querySelector(q);},querySelectorAll:function(q){return root.querySelectorAll(q);},\n"
+"  getElementById:function(id){return root.querySelector('[id=\"'+String(id).replace(/\"/g,'\\\\\"')+'\"]');},\n"
+"  getElementsByTagName:function(t){return root.getElementsByTagName(t);},getElementsByClassName:function(c){return root.getElementsByClassName(c);},\n"
+"  createElement:function(t){return document.createElement(t);},createTextNode:function(t){return document.createTextNode(t);},\n"
+"  importNode:function(n,deep){return n.cloneNode(deep);},adoptNode:function(n){return n;}};\n"
+" acc(d,'title',function(){var t=root.querySelector('title');return t?t.textContent.trim():'';});\n"
+" return d;});G.DOMParser=DP;}\n"
+"if(!G.XMLSerializer){var XS=function(){};def(XS.prototype,'serializeToString',function(n){return n.outerHTML!==undefined?n.outerHTML:(n.documentElement?n.documentElement.outerHTML:String(n.textContent||''));});G.XMLSerializer=XS;}\n"
+"/* MutationObserver: the engine hands over raw tree changes (__mxMODeliver) */\n"
+"var regs=[];\n"
+"var MO=function(cb){if(typeof cb!=='function')throw new TypeError(\"Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.\");this._cb=cb;this._q=[];};\n"
+"def(MO.prototype,'observe',function(target,o){o=Object.assign({},o||{});\n"
+" if((o.attributeOldValue||o.attributeFilter)&&o.attributes===undefined)o.attributes=true;\n"
+" if(o.characterDataOldValue&&o.characterData===undefined)o.characterData=true;\n"
+" if(!o.childList&&!o.attributes&&!o.characterData)throw new TypeError(\"The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.\");\n"
+" for(var i=0;i<regs.length;i++)if(regs[i].mo===this&&regs[i].target===target){regs[i].o=o;return;}\n"
+" regs.push({mo:this,target:target,o:o});__mxMOEnable(true);});\n"
+"def(MO.prototype,'disconnect',function(){var me=this;regs=regs.filter(function(r){return r.mo!==me;});this._q=[];if(!regs.length)__mxMOEnable(false);});\n"
+"def(MO.prototype,'takeRecords',function(){var q=this._q;this._q=[];return q;});\n"
+"var TYPES=['childList','childList','','attributes','characterData'];\n"
+"def(G,'__mxMODeliver',function(recs){var touched=[];\n"
+" for(var i=0;i<recs.length;i++){var r=recs[i],type=TYPES[r[0]],target=r[1];\n"
+"  for(var j=0;j<regs.length;j++){var g=regs[j],o=g.o;if(!o[type])continue;\n"
+"   if(target!==g.target&&!(o.subtree&&g.target.contains&&g.target.contains(target)))continue;\n"
+"   if(type==='attributes'&&o.attributeFilter&&o.attributeFilter.indexOf(r[3])<0)continue;\n"
+"   var keepOld=(type==='attributes'&&o.attributeOldValue)||(type==='characterData'&&o.characterDataOldValue);\n"
+"   g.mo._q.push({type:type,target:target,addedNodes:r[0]===0?[r[2]]:[],removedNodes:r[0]===1?[r[2]]:[],\n"
+"    previousSibling:r[5],nextSibling:r[6],attributeName:r[3],attributeNamespace:null,oldValue:keepOld?r[4]:null});\n"
+"   if(touched.indexOf(g.mo)<0)touched.push(g.mo);}}\n"
+" for(var t=0;t<touched.length;t++){var mo=touched[t],q=mo._q;mo._q=[];if(!q.length)continue;\n"
+"  try{mo._cb.call(mo,q,mo);}catch(e){console.error(e);}}});\n"
+"Object.defineProperty(G,'__mxMODeliver',{enumerable:false});Object.defineProperty(G,'__mxMOEnable',{enumerable:false});\n"
+"G.MutationObserver=MO;G.WebKitMutationObserver=MO;\n"
+"})();\n";
+/* END GENERATED PRELUDE */
+
+static void run_prelude_source(const char* source, size_t length) {
     char error[160];
     int line = 0;
     js_rt.steps = 0;
     js_rt.step_limit = 1000000;     /* enter() sets the real limit per script */
-    js_node* program = js_parse(js_prelude, sizeof(js_prelude) - 1, "prelude", error, sizeof(error), &line);
+    js_node* program = js_parse(source, length, "prelude", error, sizeof(error), &line);
     if (program) js_exec_program(program);
     if (js_rt.ctl == CTL_THROW) js_report_exception();
     js_rt.ctl = CTL_NONE;
     js_rt.steps = 0;
     js_rt.timed_out = 0;
+}
+
+static void run_prelude(void) {
+    run_prelude_source(js_lang_prelude, sizeof(js_lang_prelude) - 1);
+    run_prelude_source(js_prelude, sizeof(js_prelude) - 1);
 }
 
 void mx_js_begin(mx_document_t* doc, const char* url, const mx_js_host_t* host) {
@@ -3221,11 +3945,13 @@ void mx_js_begin(mx_document_t* doc, const char* url, const mx_js_host_t* host) 
     js_core_init();
     js_runtime_init();
     js_dom_init();
+    mx_dom_mutation_hook = dom_hook;
     run_prelude();
     active = 1;
 }
 
 void mx_js_end(void) {
+    mx_dom_mutation_hook = NULL;
     if (!active) return;
     for (mx_node_t* n = js_doc ? js_doc->root : NULL; n; n = mx_dom_next(js_doc->root, n)) {
         n->js_wrapper = NULL;

@@ -32,6 +32,7 @@ typedef struct mx_node {
     uint8_t dirty_style;
     uint8_t checked;        /* checkbox / radio state, <details open> */
     uint8_t devtools_open;  /* expanded in the Elements tree */
+    uint8_t ce_state;       /* custom element: 0 not upgraded, 1 upgraded, 2 failed */
     uint32_t serial;        /* creation order, for devtools */
     char* tag;              /* lower-case, elements only */
     char* text;             /* text and comment nodes */
@@ -90,6 +91,12 @@ void mx_dom_insert_before(mx_node_t* parent, mx_node_t* child,
                           mx_node_t* reference);
 void mx_dom_remove(mx_node_t* child);
 void mx_dom_remove_children(mx_node_t* node);
+
+/* Tree changes, for MutationObserver and custom elements (js_dom.c). */
+enum { MX_MUT_ADDED, MX_MUT_REMOVING, MX_MUT_REMOVED, MX_MUT_ATTR, MX_MUT_TEXT };
+typedef void (*mx_dom_mutation_fn)(int kind, mx_node_t* target, mx_node_t* node,
+                                   const char* name, const char* old_value);
+extern mx_dom_mutation_fn mx_dom_mutation_hook;
 mx_node_t* mx_dom_clone(mx_document_t* doc, mx_node_t* node, int deep);
 
 const char* mx_dom_attr(const mx_node_t* node, const char* name);

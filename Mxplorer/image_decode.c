@@ -696,45 +696,75 @@ static int jpeg_scan(jpeg_t* j, const uint8_t* sos, size_t len) {
 }
 
 /* cos((2x+1) u pi / 16) * C(u) / 2, in 1/4096 */
-static int idct_table[8][8];
+/* Separable integer IDCT (the formulation of stb_image's jidctint, public
+ * domain): ~20 multiplies per row/column instead of 64, and columns with
+ * only a DC coefficient (most of them) cost nothing. */
+#define F2F(x) ((int)((x) * 4096 + 0.5))
+#define FSH(x) ((x) * 4096)
+#define IDCT_1D(s0, s1, s2, s3, s4, s5, s6, s7)                                        \
+    int t0, t1, t2, t3, p1, p2, p3, p4, p5, x0, x1, x2, x3;                             \
+    p2 = s2; p3 = s6; p1 = (p2 + p3) * F2F(0.5411961f);                                 \
+    t2 = p1 + p3 * F2F(-1.847759065f); t3 = p1 + p2 * F2F(0.765366865f);              \
+    p2 = s0; p3 = s4; t0 = FSH(p2 + p3); t1 = FSH(p2 - p3);                            \
+    x0 = t0 + t3; x3 = t0 - t3; x1 = t1 + t2; x2 = t1 - t2;                            \
+    t0 = s7; t1 = s5; t2 = s3; t3 = s1;                                                 \
+    p3 = t0 + t2; p4 = t1 + t3; p1 = t0 + t3; p2 = t1 + t2;                            \
+    p5 = (p3 + p4) * F2F(1.175875602f);                                                 \
+    t0 = t0 * F2F(0.298631336f); t1 = t1 * F2F(2.053119869f);                          \
+    t2 = t2 * F2F(3.072711026f); t3 = t3 * F2F(1.501321110f);                          \
+    p1 = p5 + p1 * F2F(-0.899976223f); p2 = p5 + p2 * F2F(-2.562915447f);              \
+    p3 = p3 * F2F(-1.961570560f); p4 = p4 * F2F(-0.390180644f);                        \
+    t3 += p1 + p4; t2 += p2 + p3; t1 += p2 + p4; t0 += p1 + p3;
 
-static void idct_init(void) {
-    static const double cosk[9] = {1.0, 0.980785280, 0.923879533, 0.831469612, 0.707106781,
-                                   0.555570233, 0.382683432, 0.195090322, 0.0};
-    for (int x = 0; x < 8; x++)
-        for (int u = 0; u < 8; u++) {
-            int m = ((2 * x + 1) * u) % 32;
-            int sign = 1;
-            if (m > 16) m = 32 - m;
-            if (m > 8) { m = 16 - m; sign = -1; }
-            double v = sign * cosk[m] * (u ? 0.5 : 0.5 * 0.707106781);
-            idct_table[x][u] = (int)(v * 4096.0 + (v >= 0 ? 0.5 : -0.5));
-        }
+static inline uint8_t idct_clamp(int x) {
+    return (uint8_t)((unsigned)x > 255 ? (x < 0 ? 0 : 255) : x);
 }
 
 static void idct_block(const int16_t* in, const uint16_t* q, uint8_t* out, int stride) {
-    int64_t tmp[64];
-    int deq[64];
-    for (int i = 0; i < 64; i++) deq[i] = in[i] * q[i];
-    for (int u = 0; u < 8; u++)              /* columns: over v for each u */
-        for (int y = 0; y < 8; y++) {
-            int64_t s = 0;
-            for (int v = 0; v < 8; v++) s += (int64_t)deq[v * 8 + u] * idct_table[y][v];
-            tmp[y * 8 + u] = s;          /* scaled by 4096 */
+    int deq[64], val[64];
+    int ac = 0;
+    for (int i = 0; i < 64; i++) {
+        deq[i] = in[i] * q[i];
+        if (i) ac |= deq[i];
+    }
+    if (!ac) {   /* flat block */
+        uint8_t v = idct_clamp(((deq[0] + 4) >> 3) + 128);
+        for (int y = 0; y < 8; y++) memset(out + y * stride, v, 8);
+        return;
+    }
+    for (int i = 0; i < 8; i++) {   /* columns */
+        const int* d = deq + i;
+        int* v = val + i;
+        if (!(d[8] | d[16] | d[24] | d[32] | d[40] | d[48] | d[56])) {
+            int dc = d[0] * 4;
+            v[0] = v[8] = v[16] = v[24] = v[32] = v[40] = v[48] = v[56] = dc;
+            continue;
         }
-    for (int y = 0; y < 8; y++)
-        for (int x = 0; x < 8; x++) {
-            int64_t s = 0;
-            for (int u = 0; u < 8; u++) s += tmp[y * 8 + u] * idct_table[x][u];
-            int v = (int)((s + (1ll << 23)) >> 24) + 128;
-            out[y * stride + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
-        }
+        IDCT_1D(d[0], d[8], d[16], d[24], d[32], d[40], d[48], d[56])
+        x0 += 512; x1 += 512; x2 += 512; x3 += 512;
+        v[0] = (x0 + t3) >> 10; v[56] = (x0 - t3) >> 10;
+        v[8] = (x1 + t2) >> 10; v[48] = (x1 - t2) >> 10;
+        v[16] = (x2 + t1) >> 10; v[40] = (x2 - t1) >> 10;
+        v[24] = (x3 + t0) >> 10; v[32] = (x3 - t0) >> 10;
+    }
+    for (int i = 0; i < 8; i++) {   /* rows */
+        const int* v = val + i * 8;
+        uint8_t* o = out + i * stride;
+        IDCT_1D(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7])
+        x0 += 65536 + (128 << 17); x1 += 65536 + (128 << 17);
+        x2 += 65536 + (128 << 17); x3 += 65536 + (128 << 17);
+        o[0] = idct_clamp((x0 + t3) >> 17); o[7] = idct_clamp((x0 - t3) >> 17);
+        o[1] = idct_clamp((x1 + t2) >> 17); o[6] = idct_clamp((x1 - t2) >> 17);
+        o[2] = idct_clamp((x2 + t1) >> 17); o[5] = idct_clamp((x2 - t1) >> 17);
+        o[3] = idct_clamp((x3 + t0) >> 17); o[4] = idct_clamp((x3 - t0) >> 17);
+    }
 }
+#undef IDCT_1D
+#undef F2F
+#undef FSH
 
 static uint32_t* jpeg_decode(const uint8_t* d, size_t n, int* out_w, int* out_h, int* has_alpha,
                              const char** why) {
-    static int idct_ready;
-    if (!idct_ready) { idct_init(); idct_ready = 1; }
     jpeg_t* j = (jpeg_t*)calloc(1, sizeof(jpeg_t));
     uint32_t* px = NULL;
     if (!j) { *why = "not enough memory"; return NULL; }

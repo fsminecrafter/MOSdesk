@@ -12,9 +12,26 @@
 
 typedef struct js_str {
     uint32_t length;
-    uint32_t hash;
+    uint32_t hash;           /* read through js_str_hash(): may be stale */
+    uint32_t capacity;       /* bytes available in data[] (with the NUL) */
+    uint8_t hashed;          /* hash is up to date */
+    uint8_t owned;           /* string builder: only one variable holds it,
+                                so `s += x` may append in place */
+    uint8_t ascii;           /* 0 not checked yet, 1 all ASCII, 2 not */
     char data[];
 } js_str;
+
+uint32_t js_hash_bytes(const char* text, size_t length);
+/* code-point length / the bytes of character `index` (js_runtime.c) */
+uint32_t js_str_cp_length(js_str* s);
+int js_str_char_at(js_str* s, uint32_t index, uint32_t* start, uint32_t* end);
+static inline uint32_t js_str_hash(js_str* s) {
+    if (!s->hashed) {
+        s->hash = js_hash_bytes(s->data, s->length);
+        s->hashed = 1;
+    }
+    return s->hash;
+}
 
 typedef enum { JS_UNDEF, JS_NULL, JS_BOOL, JS_NUM, JS_STR, JS_OBJ } js_type;
 
@@ -46,7 +63,8 @@ typedef struct {
 typedef enum {
     CLS_OBJECT, CLS_ARRAY, CLS_FUNCTION, CLS_NATIVE, CLS_BOUND, CLS_ERROR,
     CLS_DATE, CLS_REGEXP, CLS_NODE, CLS_STYLE, CLS_CLASSLIST, CLS_DATASET,
-    CLS_PROMISE, CLS_BOXED, CLS_ARGUMENTS, CLS_MAP, CLS_SET
+    CLS_PROMISE, CLS_BOXED, CLS_ARGUMENTS, CLS_MAP, CLS_SET,
+    CLS_PROXY       /* Proxy of a non-function (function proxies are natives) */
 } js_class;
 
 struct js_func;
@@ -64,6 +82,13 @@ typedef struct js_obj {
     struct js_obj* proto;
     js_prop* props;
     uint32_t prop_count, prop_capacity;
+    /* hash index over props (built once an object has many properties):
+     * open addressing, slot = prop number + 1, 0 = empty */
+    uint32_t* prop_index;
+    uint32_t prop_index_cap;
+    /* Map/Set: hash index over items, same layout */
+    uint32_t* coll_index;
+    uint32_t coll_index_cap;
     /* arrays */
     js_val* items;
     uint32_t length, item_capacity;
@@ -252,6 +277,10 @@ void js_define_accessor(js_obj* obj, const char* key, js_native getter,
 int js_delete(js_val target, js_str* key);
 int js_has_property(js_val target, js_str* key);
 js_obj* js_own_keys(js_obj* obj, int include_hidden);
+/* Proxy: the target behind a proxy (NULL when obj is not one) */
+js_obj* js_proxy_target(js_obj* obj);
+js_val js_new_proxy(js_val target, js_val handler);
+void js_proxy_revoke(js_obj* proxy);
 
 /* conversions */
 int js_truthy(js_val v);
@@ -271,6 +300,10 @@ int js_array_index(js_str* key, uint32_t* index);
 /* calls and errors */
 js_val js_call(js_val fn, js_val self, js_val* args, int argc);
 js_val js_construct(js_val fn, js_val* args, int argc);
+/* custom element upgrades: the object js_construct() fills in, and the
+ * new.target a built-in base constructor sees from super() */
+extern js_obj* js_construct_this_override;
+extern js_obj* js_super_new_target;
 js_val js_throw(js_val value);
 js_val js_throw_error(const char* type, const char* message);
 js_val js_throw_type(const char* fmt, const char* detail);
@@ -300,7 +333,9 @@ void js_runtime_init(void);
 js_val js_regexp_create(js_str* pattern, js_str* flags);
 js_val js_promise_resolved(js_val value, int rejected);
 js_val js_promise_then(js_val promise, js_val on_ok, js_val on_err);
-int js_promise_state(js_val promise, js_val* value);   /* 0 pending, 1 ok, 2 err */
+int js_promise_state(js_val promise, js_val* value);
+js_obj* js_promise_new(void);
+void js_promise_settle(js_obj* p, js_val value, int rejected);   /* 0 pending, 1 ok, 2 err */
 
 /* dom.c */
 void js_dom_init(void);
