@@ -18,7 +18,6 @@
 #include "stdlib.h"
 
 js_rt_state js_rt;
-mx_arena_t js_heap;
 js_obj* js_global;
 js_obj* js_object_proto;
 js_obj* js_function_proto;
@@ -42,45 +41,7 @@ js_env* js_global_env;
 static char* scope_stack;
 static size_t scope_top;
 
-/* The heap starts with a soft limit and grows in steps for as long as the
- * machine keeps JS_HEAP_RESERVE free for the rest of the browser and the
- * system (pages, layout, images and other programs). */
-#define JS_HEAP_STEP (8u * 1024u * 1024u)
-#define JS_HEAP_RESERVE (96ull * 1024u * 1024u)
-
-#ifdef MX_HOST
-static int js_heap_may_grow(size_t size) {
-    return js_heap.total + size < (size_t)2048u * 1024u * 1024u;
-}
-#else
-#include "user_sysinfo.h"
-static int js_heap_may_grow(size_t size) {
-    uint64_t free_bytes = mos_sysinfo_ram_free();
-    return free_bytes > JS_HEAP_RESERVE + JS_HEAP_STEP + size;
-}
-#endif
-
-void* js_alloc(size_t size) {
-    void* p = mx_arena_alloc(&js_heap, size);
-    if (!p && js_heap.limit && js_heap_may_grow(size)) {
-        js_heap.limit += JS_HEAP_STEP + size;
-        js_heap.failed = 0;
-        p = mx_arena_alloc(&js_heap, size);
-    }
-    if (!p) {
-        /* Out of memory: flag it (the interpreter stops at the next
-         * statement) and keep handing out memory from a small extension so
-         * that half-finished operations stay valid. */
-        js_rt.out_of_memory = 1;
-        js_heap.limit += 4u * 1024u * 1024u;
-        p = mx_arena_alloc(&js_heap, size);
-        if (!p) {
-            js_heap.limit = 0;   /* the system itself is out of memory */
-            p = mx_arena_alloc(&js_heap, size);
-        }
-    }
-    return p;
-}
+/* js_alloc() and the garbage collector: js_gc.c */
 
 static void* scope_alloc(size_t size) {
     size = (size + 15u) & ~(size_t)15u;
@@ -3172,7 +3133,20 @@ static js_node* parse_statement(parser_t* p) {
     return n;
 }
 
+static js_node* js_parse_impl(const char* source, size_t length, const char* name,
+                              char* error, size_t error_capacity, int* error_line);
+
+/* The lexer keeps its tokens (and their strings) in malloc'd memory the
+ * collector does not see, so no collection runs while parsing. */
 js_node* js_parse(const char* source, size_t length, const char* name,
+                  char* error, size_t error_capacity, int* error_line) {
+    js_gc_inhibit(1);
+    js_node* program = js_parse_impl(source, length, name, error, error_capacity, error_line);
+    js_gc_inhibit(-1);
+    return program;
+}
+
+static js_node* js_parse_impl(const char* source, size_t length, const char* name,
                   char* error, size_t error_capacity, int* error_line) {
     lexer_t lx;
     memset(&lx, 0, sizeof(lx));
@@ -3611,6 +3585,7 @@ typedef struct js_coro {
     int depth_delta;
     const char* source;
     char* big_base;             /* the resumer's stack, for calls made from the body */
+    char* body_sp;              /* where the body's stack ends while it calls out */
     long big_limit;
     js_obj* promise;            /* async function: its result */
     agen_request* queue;        /* async generator: pending next() calls */
@@ -4040,6 +4015,7 @@ static js_val call_on_big_stack(js_coro* c, js_obj* fo, js_val self, js_val* arg
     /* the resumer waits inside js_coro_switch at caller_sp; below it is free */
     char* top = (char*)(((uintptr_t)c->caller_sp - 512u) & ~(uintptr_t)15u);
     long used_above = c->big_base > top ? (long)(c->big_base - top) : 0;
+    c->body_sp = (char*)&b;
     js_rt.stack_base = c->big_base;
     js_rt.stack_limit = c->big_limit;
     if (used_above >= c->big_limit) {
@@ -5890,4 +5866,40 @@ void js_core_reset_scope_stack(void) {
     scope_top = 0;
     scope_allowed = 0;
     current_label = NULL;
+}
+
+/* ---- garbage collector roots (see js_gc.c) ----
+ * The live part of every stack the interpreter runs on, the coroutines
+ * and the scope stack. */
+void js_core_gc_roots(void) {
+    char here;
+    char* sp = &here;
+    char* js_lo = NULL;
+    char* js_hi = NULL;
+    js_dom_stack_bounds(&js_lo, &js_hi);
+    int on_js = js_lo && sp >= js_lo && sp < js_hi;
+    char* js_low = on_js ? sp : NULL;   /* lowest live address on the script stack */
+#if JS_HAVE_CORO
+    js_coro* cur = current_coro && current_coro->running && on_coro_stack(current_coro) ? current_coro : NULL;
+    char* top = cur ? (char*)(((uintptr_t)(cur->stack + CORO_STACK_SIZE)) & ~(uintptr_t)15u)
+              : on_js ? js_hi : js_rt.stack_base;
+    for (js_coro* c = live_coros; c; c = c->next_live) {
+        js_gc_mark_range(c, (char*)c + sizeof(*c));
+        if (!c->stack || c->done) continue;
+        char* c_top = (char*)(((uintptr_t)(c->stack + CORO_STACK_SIZE)) & ~(uintptr_t)15u);
+        if (c->running) {
+            char* resumer = (char*)c->caller_sp;
+            if (js_lo && resumer >= js_lo && resumer < js_hi && (!js_low || resumer < js_low)) js_low = resumer;
+            if (c != cur && c->body_sp && c->body_sp >= c->stack && c->body_sp < c_top)
+                js_gc_mark_range(c->body_sp, c_top);
+        } else if (c->started && c->sp) {
+            js_gc_mark_range(c->sp, c_top);
+        }
+    }
+#else
+    char* top = on_js ? js_hi : js_rt.stack_base;
+#endif
+    if (top && top > sp) js_gc_mark_range(sp, top);
+    if (js_low && !on_js) js_gc_mark_range(js_low, js_hi);
+    if (scope_stack) js_gc_mark_range(scope_stack, scope_stack + scope_top);
 }

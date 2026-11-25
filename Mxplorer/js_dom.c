@@ -151,6 +151,20 @@ static void run_on_js_stack(void (*fn)(void*), void* arg) {
 #endif
 }
 
+void js_dom_stack_bounds(char** lo, char** hi) {
+    *lo = js_stack_memory;
+    *hi = js_stack_memory ? js_stack_memory + JS_STACK_SIZE : NULL;
+}
+
+/* The document's nodes (in its arena) hold their wrappers and listeners,
+ * including nodes that scripts removed but still use. */
+void js_dom_gc_roots(void) {
+    if (!js_doc) return;
+    size_t header = (sizeof(mx_arena_chunk_t) + 15u) & ~(size_t)15u;
+    for (mx_arena_chunk_t* c = js_doc->arena.head; c; c = c->next)
+        js_gc_mark_range((char*)c + header, (char*)c + header + c->used);
+}
+
 static void enter(char* stack_marker) {
     if (!js_running) {
         js_rt.stack_limit = on_js_stack ? (long)JS_STACK_SIZE - 96 * 1024 : 40 * 1024;
@@ -3938,7 +3952,12 @@ static void run_prelude(void) {
 void mx_js_begin(mx_document_t* doc, const char* url, const mx_js_host_t* host) {
     mx_js_end();
     memset(&js_rt, 0, sizeof(js_rt));
-    js_heap.limit = 32u * 1024u * 1024u;   /* soft: js_alloc() grows it */
+    /* setup and the preludes run right here, on the caller's stack: the
+     * collector scans it up to this frame */
+    char stack_marker;
+    js_rt.stack_base = &stack_marker;
+    js_rt.stack_limit = 40 * 1024;
+    js_gc_init();
     js_doc = doc;
     js_host = *host;
     mx_copy(page_url, sizeof(page_url), url ? url : "");
@@ -3947,6 +3966,8 @@ void mx_js_begin(mx_document_t* doc, const char* url, const mx_js_host_t* host) 
     js_dom_init();
     mx_dom_mutation_hook = dom_hook;
     run_prelude();
+    js_rt.stack_base = NULL;
+    js_rt.stack_limit = 0;
     active = 1;
 }
 
@@ -3957,7 +3978,7 @@ void mx_js_end(void) {
         n->js_wrapper = NULL;
         n->listeners = NULL;
     }
-    mx_arena_free_all(&js_heap);
+    js_gc_free_all();
     memset(&js_rt, 0, sizeof(js_rt));
     js_doc = NULL;
     js_global = NULL;
@@ -3971,7 +3992,7 @@ int mx_js_active(void) {
 }
 
 size_t mx_js_heap_bytes(void) {
-    return js_heap.total;
+    return js_gc_heap_bytes();
 }
 
 const char* js_page_url(void);

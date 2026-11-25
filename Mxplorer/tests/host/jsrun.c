@@ -29,5 +29,11 @@ int main(int argc, char** argv) {
         for (int r = 0; r < e->repeat; r++)
             { if (e->level == MX_LOG_ERROR) printf("ERROR %s:%d ", e->source, e->line); printf("%s\n", e->text); }
     }
+    if (getenv("MX_GC_REPORT")) {
+        extern unsigned js_gc_collections(void);
+        extern size_t js_gc_footprint(void);
+        fprintf(stderr, "gc: %u collections, live+new %zu KiB, memory held %zu KiB\n", js_gc_collections(),
+                mx_js_heap_bytes() / 1024, js_gc_footprint() / 1024);
+    }
     return 0;
 }
