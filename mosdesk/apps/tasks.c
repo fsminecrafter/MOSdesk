@@ -7,7 +7,9 @@
  * not ended.
  * Performance: a list on the left (CPU, Memory, GPU 0, each with a small
  * graph) and the one picked on the right: CPU use over the last minute
- * and per core; memory; the graphics card's engines (3D, Copy, Video
+ * or per core (right-click the graph: Overall utilization / Logical processors,
+ * each core with the two programs that used it most), the processor's details
+ * (SYS_TASK_CPU); memory; the graphics card's engines (3D, Copy, Video
  * Decode, Video Encode) and its dedicated memory (SYS_TASK_GPU).
  *
  * Keys: Up/Down select, Delete ends the selected program, Tab switches
@@ -53,6 +55,31 @@ typedef struct {
     uint64_t engine_jobs[SYS_GPU_ENGINES];
     uint64_t cpu_render_ns;
 } syscall_gpu_stats_t;
+#endif
+
+/* SYS_TASK_CPU, for SDKs from before it (the kernel refuses it then: usage per core only, no names). */
+#ifndef SYS_TASK_CPU
+#define SYS_TASK_CPU 4u
+#define SYS_CPU_TOP 4u
+#define SYS_CPU_MAX_CORES 64u
+#define SYS_CPU_FEAT_SSE42   (1u << 0)
+#define SYS_CPU_FEAT_AVX     (1u << 1)
+#define SYS_CPU_FEAT_AVX2    (1u << 2)
+#define SYS_CPU_FEAT_AVX512  (1u << 3)
+#define SYS_CPU_FEAT_AES     (1u << 4)
+#define SYS_CPU_FEAT_FMA     (1u << 5)
+#define SYS_CPU_FEAT_VM      (1u << 6)
+typedef struct { uint64_t pid; uint32_t percent; uint32_t reserved; char name[32]; } syscall_cpu_top_t;
+typedef struct { uint32_t usage; uint32_t top_count; syscall_cpu_top_t top[SYS_CPU_TOP]; } syscall_core_stats_t;
+typedef struct {
+    uint32_t size, cores;
+    char brand[52], vendor[16], hypervisor[16];
+    uint32_t family, model, stepping, base_mhz;
+    uint32_t l1d_kb, l1i_kb, l2_kb, l3_kb;
+    uint32_t features;
+    uint64_t uptime_ms;
+    syscall_core_stats_t core[SYS_CPU_MAX_CORES];
+} syscall_cpu_stats_t;
 #endif
 
 #define MAX_TASKS 256
@@ -151,6 +178,14 @@ static syscall_gpu_stats_t gpu_now, gpu_prev;
 static int gpu_ok, gpu_have_prev;
 static uint32_t gpu_jobs_per_s;
 static int perf_view;               // 0 CPU, 1 memory, 2 GPU
+// The CPU page: SYS_TASK_CPU (the processor, and per core its usage and busiest programs), a history per core,
+// and which graph shows (right-click menu, like Windows: one overall graph or one per logical processor).
+static syscall_cpu_stats_t cpu_stats;
+static int cpu_ok;
+static uint8_t core_hist[SYS_CPU_MAX_CORES][HISTORY];
+static int cpu_graph_mode;          // 0 overall utilization, 1 logical processors
+static int menu_open, menu_x, menu_y;
+static int cg_x, cg_y, cg_w, cg_h;   // where the CPU graph is (right-click opens the menu there)
 
 /* ------------------------------------------------------------ drawing */
 
@@ -331,16 +366,34 @@ static void refresh(uint64_t now) {
     }
     prev_sample_ms = now;
 
-    // History for the graphs.
+    // History for the graphs: when full, every graph moves one sample left.
     uint64_t cpu = mos_sysinfo_cpu_usage();
     uint64_t total = mos_sysinfo_ram_total(), used = mos_sysinfo_ram_used();
     if (hist_count == HISTORY) {
         memmove(cpu_hist, cpu_hist + 1, HISTORY - 1);
         memmove(mem_hist, mem_hist + 1, HISTORY - 1);
+        for (int e = 0; e < GE_COUNT; e++) memmove(gpu_hist[e], gpu_hist[e] + 1, HISTORY - 1);
+        memmove(vram_hist, vram_hist + 1, HISTORY - 1);
+        memmove(gpu_top_hist, gpu_top_hist + 1, HISTORY - 1);
+        for (uint32_t c = 0; c < SYS_CPU_MAX_CORES; c++) memmove(core_hist[c], core_hist[c] + 1, HISTORY - 1);
         hist_count--;
     }
     cpu_hist[hist_count] = (uint8_t)(cpu > 100 ? 100 : cpu);
     mem_hist[hist_count] = (uint8_t)(total ? used * 100 / total : 0);
+    // The cores: usage and their busiest programs (an older kernel: usage only, from SYS_SYSINFO).
+    memset(&cpu_stats.size, 0, sizeof cpu_stats.size);
+    cpu_stats.size = sizeof cpu_stats;
+    cpu_ok = mos_syscall(SYS_TASK, SYS_TASK_CPU, (uint64_t)(uintptr_t)&cpu_stats, 0) == SYS_SUCCESS;
+    if (!cpu_ok) {
+        cpu_stats.cores = cores > SYS_CPU_MAX_CORES ? SYS_CPU_MAX_CORES : cores;
+        for (uint32_t c = 0; c < cpu_stats.cores; c++) {
+            uint64_t u = mos_sysinfo_core_usage(c);
+            cpu_stats.core[c].usage = (uint32_t)(u > 100 ? 100 : u);
+            cpu_stats.core[c].top_count = 0;
+        }
+    }
+    for (uint32_t c = 0; c < cpu_stats.cores && c < SYS_CPU_MAX_CORES; c++)
+        core_hist[c][hist_count] = (uint8_t)(cpu_stats.core[c].usage > 100 ? 100 : cpu_stats.core[c].usage);
 
     // The graphics card: usage = busy time since the last refresh / the time between.
     uint8_t ge[GE_COUNT] = { 0 };
@@ -363,11 +416,6 @@ static void refresh(uint64_t now) {
         gpu_prev = g;
         gpu_have_prev = 1;
         gpu_now = g;
-    }
-    if (hist_count == HISTORY) {
-        for (int e = 0; e < GE_COUNT; e++) memmove(gpu_hist[e], gpu_hist[e] + 1, HISTORY - 1);
-        memmove(vram_hist, vram_hist + 1, HISTORY - 1);
-        memmove(gpu_top_hist, gpu_top_hist + 1, HISTORY - 1);
     }
     uint8_t top = 0;
     for (int e = 0; e < GE_COUNT; e++) {
@@ -611,6 +659,139 @@ static void draw_side(void) {
     }
 }
 
+/* What a core ran, as people read it: a program as the Processes list names it, a kernel task as
+ * "kernel <what>" ("usb_keyboard_update" -> "kernel usb keyboard"). */
+static void core_task_name(const syscall_cpu_top_t* t, char* out, size_t cap) {
+    for (int i = 0; i < task_count; i++) {
+        if (tasks[i].info.pid != t->pid) continue;
+        if (is_user(&tasks[i].info)) { tm_strncpy(out, tasks[i].label, cap - 1); out[cap - 1] = 0; return; }
+        break;
+    }
+    char raw[40];
+    size_t n = 0;
+    for (const char* s = t->name; *s && *s != '@' && *s != '[' && n < sizeof raw - 1; s++) raw[n++] = *s == '_' ? ' ' : *s;
+    while (n && raw[n - 1] == ' ') n--;
+    raw[n] = 0;
+    static const char* const tails[] = { " updater", " update", " worker", "updater", "update" };
+    for (unsigned k = 0; k < sizeof tails / sizeof tails[0]; k++) {
+        size_t l = strlen(tails[k]);
+        if (n > l && !strcmp(raw + n - l, tails[k])) { n -= l; raw[n] = 0; break; }
+    }
+    const char* what = raw;
+    if (!strncmp(what, "kernel", 6)) { what += 6; while (*what == ' ') what++; }
+    if (!strcmp(raw, "idle")) { tm_strncpy(out, "idle", cap - 1); out[cap - 1] = 0; return; }
+    out[0] = 0;
+    tm_strncat(out, "kernel ", cap - 1);
+    tm_strncat(out, *what ? what : raw, cap - 1 - strlen(out));
+}
+
+/* "Terminal (60%)  kernel keyboard (40%)": the two busiest of a core's last second. */
+static void core_top_line(uint32_t c, char* out, size_t cap) {
+    out[0] = 0;
+    if (c >= cpu_stats.cores) return;
+    const syscall_core_stats_t* cs = &cpu_stats.core[c];
+    if (!cpu_ok) { tm_strncat(out, "(a newer kernel names the programs)", cap - 1); return; }
+    if (!cs->top_count) { tm_strncat(out, "idle", cap - 1); return; }
+    for (uint32_t i = 0; i < cs->top_count && i < 2; i++) {
+        char name[40], pct[12];
+        core_task_name(&cs->top[i], name, sizeof name);
+        fmt_u(pct, cs->top[i].percent);
+        if (i) tm_strncat(out, "  ", cap - 1 - strlen(out));
+        tm_strncat(out, name, cap - 1 - strlen(out));
+        tm_strncat(out, " (", cap - 1 - strlen(out));
+        tm_strncat(out, pct, cap - 1 - strlen(out));
+        tm_strncat(out, "%)", cap - 1 - strlen(out));
+    }
+}
+
+/* A small graph for one core, with its number, usage and busiest programs. */
+static void core_tile(int x, int y, int w, int h, uint32_t c) {
+    round_rect(x, y, w, h, 6, C_BG);
+    char label[24], pct[12], line[96];
+    tm_strncpy(label, "CPU ", sizeof label - 1);
+    label[sizeof label - 1] = 0;
+    fmt_u(pct, c);
+    strcat(label, pct);
+    text(x + 8, y + 6, label, C_DIM);
+    fmt_u(pct, c < cpu_stats.cores ? cpu_stats.core[c].usage : 0);
+    strcat(pct, "%");
+    text(x + w - 8 - text_width(pct, 1), y + 6, pct, C_TEXT);
+    int th = text_height(1);
+    // The two busiest programs, a line each (name, then its share), under the graph.
+    const syscall_core_stats_t* cs = c < cpu_stats.cores ? &cpu_stats.core[c] : 0;
+    int lines = cs && cpu_ok && cs->top_count > 1 ? 2 : 1;
+    int gy = y + 10 + th, gh = h - 16 - th - lines * (th + 3);
+    if (gh >= 8) {
+        fill(x + 8, gy, w - 16, gh, C_PANEL);
+        int gw = w - 16;
+        for (int px = 0; px < gw && hist_count > 0; px++) {
+            int i = (HISTORY - 1) * px / (gw > 1 ? gw - 1 : 1) - (HISTORY - hist_count);
+            if (i < 0) continue;
+            int bar = core_hist[c][i] * gh / 100;
+            if (bar > 0) {
+                fill(x + 8 + px, gy + gh - bar, 1, bar, blend(C_PANEL, C_ACCENT, 80));
+                fill(x + 8 + px, gy + gh - bar, 1, 1, C_ACCENT);
+            }
+        }
+    }
+    int ly = y + h - lines * (th + 3) - 3;
+    if (!cs || !cpu_ok || !cs->top_count) {
+        core_top_line(c, line, sizeof line);
+        text_fit(x + 8, ly, line, w - 16, C_DIM);
+        return;
+    }
+    for (int i = 0; i < lines; i++) {
+        char name[40], share[12];
+        core_task_name(&cs->top[i], name, sizeof name);
+        fmt_u(share, cs->top[i].percent);
+        strcat(share, "%");
+        int sw = text_width(share, 1);
+        text_fit(x + 8, ly + i * (th + 3), name, w - 24 - sw, i ? C_DIM : C_TEXT);
+        text(x + w - 8 - sw, ly + i * (th + 3), share, C_DIM);
+    }
+}
+
+static void cpu_feature_text(char* out, size_t cap) {
+    static const struct { uint32_t bit; const char* name; } f[] = {
+        { SYS_CPU_FEAT_SSE42, "SSE4.2" }, { SYS_CPU_FEAT_AVX, "AVX" }, { SYS_CPU_FEAT_AVX2, "AVX2" },
+        { SYS_CPU_FEAT_AVX512, "AVX-512" }, { SYS_CPU_FEAT_FMA, "FMA" }, { SYS_CPU_FEAT_AES, "AES" },
+    };
+    out[0] = 0;
+    for (unsigned i = 0; i < sizeof f / sizeof f[0]; i++) {
+        if (!(cpu_stats.features & f[i].bit)) continue;
+        if (out[0]) tm_strncat(out, " ", cap - 1 - strlen(out));
+        tm_strncat(out, f[i].name, cap - 1 - strlen(out));
+    }
+    if (!out[0]) tm_strncat(out, "-", cap - 1);
+}
+
+static void fmt_cache(char* out, uint32_t kb) {
+    if (!kb) { strcpy(out, "-"); return; }
+    if (kb >= 1024 && kb % 1024 == 0) { fmt_u(out, kb / 1024); strcat(out, " MB"); return; }
+    fmt_u(out, kb); strcat(out, " KB");
+}
+
+/* The right-click menu over the CPU graph. */
+static rect_t menu_item(int i) {
+    rect_t r = { menu_x, menu_y + 6 + i * 26, 200, 26 };
+    if (r.x + r.w > (int)width - 4) r.x = (int)width - 4 - r.w;
+    if (menu_y + 64 > (int)height - 4) r.y -= menu_y + 64 - ((int)height - 4);
+    return r;
+}
+
+static void draw_graph_menu(void) {
+    static const char* const items[2] = { "Overall utilization", "Logical processors" };
+    rect_t a = menu_item(0);
+    round_rect(a.x - 2, a.y - 8, a.w + 4, 2 * 26 + 12, 6, C_LINE);
+    round_rect(a.x, a.y - 6, a.w, 2 * 26 + 8, 6, C_PANEL);
+    for (int i = 0; i < 2; i++) {
+        rect_t r = menu_item(i);
+        if (inside(r, mouse_x, mouse_y)) round_rect(r.x + 4, r.y + 1, r.w - 8, r.h - 2, 4, C_HOVER);
+        if (cpu_graph_mode == i) round_rect(r.x + 12, r.y + r.h / 2 - 3, 6, 6, 3, C_ACCENT);
+        text(r.x + 28, r.y + (r.h - text_height(1)) / 2, items[i], C_TEXT);
+    }
+}
+
 static void draw_system(int x0) {
     fill(x0, TAB_H, (int)width - x0, (int)height - TAB_H, C_BG);
     int pad = 12, y = TAB_H + pad;
@@ -637,56 +818,119 @@ static void draw_system(int x0) {
         }
         return;
     }
-    // CPU: the graph, then cores and figures.
-    int half = (w - pad) / 2;
+    // CPU: one graph for the whole processor, or one per logical processor (right-click to choose), then
+    // the processor's details and the figures.
     int gh = ((int)height - y - pad) * 55 / 100;
     if (gh < 120) gh = 120;
-    fmt_u(v, hist_count ? cpu_hist[hist_count - 1] : 0);
-    strcat(v, " %");
-    graph(x0 + pad, y, w, gh, cpu_hist, hist_count, C_ACCENT, "CPU", v);
+    uint32_t n = cpu_stats.cores ? cpu_stats.cores : (cores ? cores : 1);
+    if (n > SYS_CPU_MAX_CORES) n = SYS_CPU_MAX_CORES;
+    cg_x = x0 + pad; cg_y = y; cg_w = w; cg_h = gh;
+    if (cpu_graph_mode == 0) {
+        fmt_u(v, hist_count ? cpu_hist[hist_count - 1] : 0);
+        strcat(v, " %");
+        graph(x0 + pad, y, w, gh, cpu_hist, hist_count, C_ACCENT, "CPU  -  overall utilization", v);
+    } else {
+        round_rect(x0 + pad, y, w, gh, 8, C_PANEL);
+        text(x0 + pad + 14, y + 10, "CPU  -  logical processors", C_DIM);
+        // Tiles wide enough for two program names (about 240 px), as tall as the rows allow (at least
+        // about 70 px, else more columns).
+        int ax = x0 + pad + 10, ay = y + 30, aw = w - 20, ah = gh - 40;
+        int cols = aw / 240;
+        if (cols < 1) cols = 1;
+        if (cols > (int)n) cols = (int)n;
+        int max_rows = ah / 70 > 0 ? ah / 70 : 1;
+        if (((int)n + cols - 1) / cols > max_rows) cols = ((int)n + max_rows - 1) / max_rows;
+        int rows = ((int)n + cols - 1) / cols;
+        int tw = (aw - (cols - 1) * 8) / cols, tht = (ah - (rows - 1) * 8) / rows;
+        for (uint32_t c = 0; c < n; c++)
+            core_tile(ax + (int)(c % (uint32_t)cols) * (tw + 8), ay + (int)(c / (uint32_t)cols) * (tht + 8), tw, tht, c);
+    }
+    const char* hint = "Right-click the graph to change it";
+    text(x0 + pad + w - 14 - text_width(hint, 1), y + 10, hint, C_DIM);
     y += gh + pad;
     int ph = (int)height - y - pad;
     if (ph < 40) return;
+    // The processor (where the per-core bars were).
+    int half = (w - pad) * 58 / 100;
     int px = x0 + pad;
     round_rect(px, y, half, ph, 8, C_PANEL);
-    text(px + 14, y + 10, "Cores", C_DIM);
-    uint32_t n = cores ? cores : 1;
-    int cols = n > 8 ? 2 : 1;
-    int per_col = (int)((n + (uint32_t)cols - 1) / (uint32_t)cols);
-    int bar_w = (half - 28 - (cols - 1) * 12) / cols;
-    int row_h = per_col ? (ph - 36) / per_col : 0;
-    if (row_h > 22) row_h = 22;
-    for (uint32_t c = 0; c < n && row_h >= 8; c++) {
-        int cx = px + 14 + (int)(c / (uint32_t)per_col) * (bar_w + 12);
-        int cy = y + 32 + (int)(c % (uint32_t)per_col) * row_h;
-        uint64_t u = mos_sysinfo_core_usage(c);
-        if (u > 100) u = 100;
-        char label[16];
-        fmt_u(label, c);
-        text(cx, cy + (row_h - text_height(1)) / 2, label, C_DIM);
-        int bx = cx + 26, bw = bar_w - 26 - 44;
-        if (bw < 10) continue;
-        round_rect(bx, cy + row_h / 2 - 4, bw, 8, 4, C_BG);
-        int fw = (int)(u * (uint64_t)bw / 100);
-        if (fw > 0) round_rect(bx, cy + row_h / 2 - 4, fw < 8 ? 8 : fw, 8, 4, C_ACCENT);
-        fmt_u(label, u);
-        strcat(label, "%");
-        text(bx + bw + 8, cy + (row_h - text_height(1)) / 2, label, C_TEXT);
+    text(px + 14, y + 10, "Processor", C_DIM);
+    struct { const char* k; char v[72]; } info[9];
+    int ni = 0;
+    char tmp[32];
+    info[ni].k = "Name"; tm_strncpy(info[ni].v, cpu_ok && cpu_stats.brand[0] ? cpu_stats.brand : "unknown", 71); info[ni].v[71] = 0; ni++;
+    if (cpu_ok) {
+        info[ni].k = "Vendor"; tm_strncpy(info[ni].v, cpu_stats.vendor, 71); info[ni].v[71] = 0; ni++;
+        info[ni].k = "Family"; strcpy(info[ni].v, "family "); fmt_u(tmp, cpu_stats.family); strcat(info[ni].v, tmp);
+        strcat(info[ni].v, ", model "); fmt_u(tmp, cpu_stats.model); strcat(info[ni].v, tmp);
+        strcat(info[ni].v, ", stepping "); fmt_u(tmp, cpu_stats.stepping); strcat(info[ni].v, tmp); ni++;
+        info[ni].k = "Base speed";
+        if (cpu_stats.base_mhz) {
+            fmt_u(info[ni].v, cpu_stats.base_mhz / 1000); strcat(info[ni].v, ".");
+            fmt_u(tmp, cpu_stats.base_mhz % 1000 / 10 + 100); strcat(info[ni].v, tmp + 1); strcat(info[ni].v, " GHz");
+        } else strcpy(info[ni].v, "unknown");
+        ni++;
     }
+    info[ni].k = "Logical processors"; fmt_u(info[ni].v, n); ni++;
+    if (cpu_ok) {
+        info[ni].k = "Caches";
+        info[ni].v[0] = 0;
+        strcat(info[ni].v, "L1 "); fmt_cache(tmp, cpu_stats.l1d_kb + cpu_stats.l1i_kb); strcat(info[ni].v, tmp);
+        strcat(info[ni].v, "  L2 "); fmt_cache(tmp, cpu_stats.l2_kb); strcat(info[ni].v, tmp);
+        strcat(info[ni].v, "  L3 "); fmt_cache(tmp, cpu_stats.l3_kb); strcat(info[ni].v, tmp);
+        ni++;
+        info[ni].k = "Instructions"; cpu_feature_text(info[ni].v, sizeof info[ni].v); ni++;
+        info[ni].k = "Virtual machine";
+        if (cpu_stats.features & SYS_CPU_FEAT_VM) { strcpy(info[ni].v, "yes"); if (cpu_stats.hypervisor[0]) { strcat(info[ni].v, " ("); tm_strncat(info[ni].v, cpu_stats.hypervisor, 40); strcat(info[ni].v, ")"); } }
+        else strcpy(info[ni].v, "no");
+        ni++;
+    }
+    int kw = 0;
+    for (int i = 0; i < ni; i++) { int tw2 = text_width(info[i].k, 1); if (tw2 > kw) kw = tw2; }
+    for (int i = 0; i < ni; i++) {
+        int ry = y + 32 + i * 20;
+        if (ry + 18 > y + ph) break;
+        text(px + 14, ry, info[i].k, C_DIM);
+        text_fit(px + 14 + kw + 16, ry, info[i].v, half - 28 - kw - 16, C_TEXT);
+    }
+    // Figures.
     int fx = px + half + pad, fw = w - half - pad;
     round_rect(fx, y, fw, ph, 8, C_PANEL);
-    struct { const char* k; char v[48]; } rows[4];
+    struct { const char* k; char v[48]; } rows[5];
     int count = 0;
+    rows[count].k = "Utilization"; fmt_u(rows[count].v, hist_count ? cpu_hist[hist_count - 1] : 0); strcat(rows[count].v, " %"); count++;
     rows[count].k = "Up time"; fmt_duration(rows[count].v, mos_sysinfo_uptime_ms()); count++;
     rows[count].k = "Tasks"; fmt_u(rows[count].v, (uint64_t)task_count); count++;
-    rows[count].k = "Cores"; fmt_u(rows[count].v, n); count++;
+    // The busiest core and what kept it busy.
+    uint32_t busiest = 0;
+    for (uint32_t c = 1; c < n && c < cpu_stats.cores; c++)
+        if (cpu_stats.core[c].usage > cpu_stats.core[busiest].usage) busiest = c;
+    rows[count].k = "Busiest core"; strcpy(rows[count].v, "CPU "); fmt_u(tmp, busiest); strcat(rows[count].v, tmp);
+    strcat(rows[count].v, "  "); fmt_u(tmp, busiest < cpu_stats.cores ? cpu_stats.core[busiest].usage : 0); strcat(rows[count].v, tmp); strcat(rows[count].v, "%");
+    count++;
     for (int i = 0; i < count; i++) {
         int ry = y + 12 + i * 22;
         if (ry + 18 > y + ph) break;
         text(fx + 14, ry, rows[i].k, C_DIM);
         text(fx + fw - 14 - text_width(rows[i].v, 1), ry, rows[i].v, C_TEXT);
     }
+    // What kept it busy: its two programs, a line each.
+    if (busiest < cpu_stats.cores && cpu_ok && cpu_stats.core[busiest].top_count) {
+        const syscall_core_stats_t* cs = &cpu_stats.core[busiest];
+        for (uint32_t i = 0; i < cs->top_count && i < 2; i++) {
+            int ry = y + 12 + (count + (int)i) * 22;
+            if (ry + 18 > y + ph) break;
+            char name[40];
+            core_task_name(&cs->top[i], name, sizeof name);
+            fmt_u(tmp, cs->top[i].percent);
+            strcat(tmp, "%");
+            int sw = text_width(tmp, 1);
+            text_fit(fx + 26, ry, name, fw - 52 - sw, C_DIM);
+            text(fx + fw - 14 - sw, ry, tmp, C_DIM);
+        }
+    }
 }
+
 
 static void draw_gpu(int x0) {
     fill(x0, TAB_H, (int)width - x0, (int)height - TAB_H, C_BG);
@@ -758,6 +1002,7 @@ static void draw(void) {
     draw_tabs();
     if (page == 0) draw_processes();
     else draw_performance();
+    if (menu_open) draw_graph_menu();
     mos_window_present(window_id, pixels, width * 4, 0, 0, width, height);
 }
 
@@ -796,6 +1041,12 @@ static void move_selection(int delta) {
 }
 
 static void click(int x, int y, uint64_t now) {
+    if (menu_open) {
+        for (int i = 0; i < 2; i++)
+            if (inside(menu_item(i), x, y)) cpu_graph_mode = i;
+        menu_open = 0;
+        return;
+    }
     for (int i = 0; i < 2; i++)
         if (inside(tab_rect(i), x, y)) { page = i; confirm = 0; return; }
     if (page == 1) {
@@ -822,6 +1073,15 @@ static void click(int x, int y, uint64_t now) {
     if (y >= top && y < top + list_rows() * ROW_H) {
         int i = scroll + (y - top) / ROW_H;
         if (i < shown_count) { selected_pid = shown[i].info.pid; confirm = 0; }
+    }
+}
+
+static void right_click(int x, int y) {
+    menu_open = 0;
+    if (page == 1 && perf_view == 0 && x >= cg_x && y >= cg_y && x < cg_x + cg_w && y < cg_y + cg_h) {
+        menu_open = 1;
+        menu_x = x;
+        menu_y = y;
     }
 }
 
@@ -859,6 +1119,7 @@ int main(void) {
                     uint32_t pressed = ev.buttons & ~buttons_down;
                     buttons_down = ev.buttons;
                     if (pressed & SYSCALL_MOUSE_BTN_LEFT) click(ev.x, ev.y, now);
+                    if (pressed & SYSCALL_MOUSE_BTN_RIGHT) right_click(ev.x, ev.y);
                     break;
                 }
                 case SYSCALL_WINDOW_EVENT_FOCUS_LOST:
@@ -886,7 +1147,7 @@ int main(void) {
                         if (confirm) end_selected(now); else ask_end(now);
                     }
                     else if (confirm && key == 40) end_selected(now);                   // Enter
-                    else if (key == 41) confirm = 0;                                    // Escape
+                    else if (key == 41) { confirm = 0; menu_open = 0; }                 // Escape
                     break;
                 }
                 default:
